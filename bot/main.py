@@ -21,7 +21,7 @@ from bot.jobs.main import setup_scheduler
 from bot.handlers.monitor_callbacks import (monitor_close_callback, monitor_close_confirm_callback,
                                              monitor_close_cancel_callback, monitor_stats_callback)
 from bot.handlers.paper import paper_handler, paper_callback
-from bot.handlers.automode import automode_handler
+from bot.handlers.automode import automode_callback, automode_handler
 from bot.handlers.pin import pin_handler
 
 logging.basicConfig(
@@ -144,6 +144,8 @@ def main():
     app.add_handler(CallbackQueryHandler(paper_callback, pattern="^paper_reset"))
     app.add_handler(CommandHandler("automode", automode_handler))
     app.add_handler(CommandHandler("pin", pin_handler))
+
+    app.add_handler(CallbackQueryHandler(automode_callback, pattern=r"^automode_"))
 
     app.add_handler(CallbackQueryHandler(open_callback, pattern=r"^open_"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^balance_"))

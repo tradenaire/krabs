@@ -53,6 +53,13 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = context.bot_data.get("exchange")
     app = context.application
 
+    # Auto Scan wizard has priority over free-form NLP so numeric answers like
+    # "30" are treated as settings input, not as a chat command.
+    if context.user_data.get("automode_wizard") is not None:
+        from bot.handlers.automode import handle_automode_wizard_text
+        if await handle_automode_wizard_text(update, context):
+            return
+
     # ── Avg wizard (sequential settings dialog) ───────────────────
     wizard = context.user_data.get("avg_wizard")
     if wizard is not None:
