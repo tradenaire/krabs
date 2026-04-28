@@ -83,7 +83,8 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
 
     side_icon = "🔴⬇️" if side == "short" else "🟢⬆️"
 
-    header_parts = [f"{coin} {side_icon} {lev}x ${margin:.2f}", re_label]
+    lev_label = f"x{lev}/{max_lev}" if max_lev and max_lev != lev else f"x{lev}"
+    header_parts = [f"{coin} {side_icon} {lev_label} ${margin:.2f}", re_label]
     if re_rec and abs(reopen_margin - margin) > 1e-9:
         header_parts.append(f"${reopen_margin:.2f}")
     header = " · ".join(header_parts)
