@@ -354,6 +354,10 @@ async def averaging_job(app):
                 try:
                     await client.set_tp_sl(symbol, tp_price=_new_tp, sl_price=_new_sl, pos_data=pos)
                     _profit_locked.add(symbol)
+                    # Persistent flag в БД: гарантирует re-entry даже если бот рестартанёт
+                    # или was_closed_by_tp потеряет trigger_price из-за rate-limit.
+                    # См. reentry_job:_apply_profit_lock_override.
+                    db_mod.set_reentry_profit_locked(symbol, True)
                     _pl_coin = symbol.split("/")[0]
                     await _notify_all(app,
                         f"🔒 *{_pl_coin}* SL перемещён в профит\n"
@@ -517,6 +521,20 @@ async def averaging_job(app):
                         if new_sl:
                             parts.append(f"SL: `{new_sl:.6g}`")
                         tp_sl_text = "\n🔄 " + ", ".join(parts) + f" (avg: `{new_entry:.6g}`)"
+                        # После докупки новый SL пересчитывается по обычной формуле
+                        # _calc_sl_price (loss-зона относительно нового entry).
+                        # Если профит-лок ранее поднял флаг — сбрасываем, иначе при
+                        # срабатывании этого SL мы ложно re-enter на убыточном close.
+                        # averaging_job снова дождётся pnl_pct ≥ trigger и снова
+                        # поднимет флаг + переставит SL в новую профит-зону.
+                        if new_sl is not None:
+                            sl_in_profit = (
+                                (new_sl < new_entry) if p_side == "short"
+                                else (new_sl > new_entry)
+                            )
+                            if not sl_in_profit:
+                                db_mod.set_reentry_profit_locked(symbol, False)
+                                _profit_locked.discard(symbol)
                 except Exception as e:
                     logger.warning("TP/SL recalc for %s: %s", symbol, e)
 
@@ -585,6 +603,29 @@ async def _resolve_close_reason(client, symbol: str, pos_side_str: str,
             logger.debug("_resolve_close_reason price fallback %s: %s", symbol, e)
 
     return is_tp, profitable_sl, exit_price
+
+
+def _apply_profit_lock_override(closed_by_tp: bool | None, profitable_sl: bool,
+                                re_cfg: dict) -> tuple[bool | None, bool]:
+    """Forces profitable_sl=True если для symbol установлен флаг profit_locked в БД.
+
+    Зачем: averaging_job устанавливает profit_locked=1 в БД когда переставляет SL в
+    профит-зону. После закрытия позиции по такому SL `_resolve_close_reason` может
+    вернуть `profitable_sl=False` если `was_closed_by_tp` потеряла trigger_price из-за
+    rate-limit MEXC, лага plan-orders или рестарта бота. Без этого override
+    позиция выпала бы в loss-SL ветку и re-entry бы не случился.
+
+    Условия применения:
+      - closed_by_tp is False — резолв определил что был SL, но не уверен profit/loss.
+        НЕ переопределяем None (неопределённость = ждём следующий тик).
+      - profitable_sl is False — иначе и так re-enter, override не нужен.
+      - re_cfg['profit_locked'] truthy — флаг был поднят averaging_job.
+
+    Возвращает (closed_by_tp, profitable_sl) с возможной коррекцией profitable_sl.
+    """
+    if closed_by_tp is False and not profitable_sl and bool(re_cfg.get("profit_locked")):
+        return closed_by_tp, True
+    return closed_by_tp, profitable_sl
 
 
 async def reentry_job(app):
@@ -660,8 +701,14 @@ async def reentry_job(app):
             human = format_close_pnl(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin)
             return f" {human}" if human else "", pnl_usdt
 
+        # Сохраняем факт profit-lock ДО override чтобы потом различить "natural TP"
+        # vs "forced via flag" в сообщении re-entry. После override это значение
+        # становится частью profitable_sl и его уже не отличить.
+        was_profit_locked = bool(re_cfg.get("profit_locked"))
+
         if max_cycles == 0:
             closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
+            closed_by_tp, profitable_sl = _apply_profit_lock_override(closed_by_tp, profitable_sl, re_cfg)
             if closed_by_tp is None:
                 continue
             close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
@@ -677,6 +724,7 @@ async def reentry_job(app):
         if cycle_count >= max_cycles:
             logger.info("Re-entry: %s exhausted (%d/%d cycles)", symbol, cycle_count, max_cycles)
             closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
+            closed_by_tp, profitable_sl = _apply_profit_lock_override(closed_by_tp, profitable_sl, re_cfg)
             if closed_by_tp is None:
                 continue
             close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
@@ -703,8 +751,16 @@ async def reentry_job(app):
 
         logger.info("Re-entry #%d %s %s $%.2f", cycle_count + 1, symbol, side, margin)
 
-        # Determine close reason: TP or profitable-SL → re-enter, loss-SL → skip
+        # Determine close reason: TP or profitable-SL → re-enter, loss-SL → skip.
+        # Override: если re_cfg.profit_locked=1 (averaging_job переставлял SL в профит)
+        # и резолв вернул closed_by_tp=False, profitable_sl=False — форсим
+        # profitable_sl=True, потому что мы УВЕРЕНЫ что SL был в плюсе.
+        # Это страхует от потери trigger_price из-за rate-limit MEXC.
         closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
+        _orig_profitable_sl = profitable_sl
+        closed_by_tp, profitable_sl = _apply_profit_lock_override(closed_by_tp, profitable_sl, re_cfg)
+        if was_profit_locked and profitable_sl and not _orig_profitable_sl:
+            logger.info("Re-entry %s: profit-lock SL override applied (resolved as loss-SL but flag was set)", symbol)
 
         if closed_by_tp is None:
             logger.info("Re-entry: %s close reason unknown, retrying next cycle", symbol)
@@ -749,14 +805,27 @@ async def reentry_job(app):
             result = await execute_open(client, app, symbol, side, margin, leverage,
                                         tp_pct=tp_pct, sl_pct=sl_pct)
             new_cycle = db_mod.increment_reentry_cycle(symbol)
+            # Сброс profit_locked флага: новая позиция начинает с чистым флагом.
+            # averaging_job снова дождётся pnl_pct ≥ trigger и снова поднимет флаг
+            # вместе с переустановкой SL в новую профит-зону.
+            # Также синхронизируем runtime _profit_locked set (используется самим
+            # averaging_job для пред-проверки `symbol not in _profit_locked`).
+            db_mod.set_reentry_profit_locked(symbol, False)
+            _profit_locked: set = app.bot_data.setdefault("_profit_locked", set())
+            _profit_locked.discard(symbol)
             db_mod.log_trade(symbol, "reentry", amount=margin, note=f"cycle {new_cycle}")
             # Clear exhausted flag so new cycle gets fresh averaging tracking
             notified_exhausted: set = app.bot_data.setdefault("_avg_notified_exhausted", set())
             notified_exhausted.discard(symbol)
-            # Профит/убыток ПРЕДЫДУЩЕГО цикла (закрытия) — pnl_text. На re-entry
-            # сообщении показываем его в скобках чтобы пользователь сразу видел "сколько
-            # принёс закрывшийся цикл". Формат "✅ X в профит +$2.34 → перезаход #N/M".
-            head = f"✅ *{coin}* в профит{pnl_text} → перезаход #{new_cycle}/{max_cycles}"
+            # Различаем head в зависимости от того, был ли это profit-lock close.
+            # Если флаг был поднят (was_profit_locked=True), показываем 🔒 и явно
+            # говорим "по profit-lock SL" — это интуитивнее чем "в профит" когда
+            # позиция закрылась по ползущему SL. Если flag не был поднят — обычный
+            # формат TP/profitable-SL.
+            if was_profit_locked:
+                head = f"🔒 *{coin}* закрыта по profit-lock SL{pnl_text} → перезаход #{new_cycle}/{max_cycles}"
+            else:
+                head = f"✅ *{coin}* в профит{pnl_text} → перезаход #{new_cycle}/{max_cycles}"
             msg = (
                 f"{head}\n"
                 f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']}\n"
