@@ -94,8 +94,16 @@ def _cancel_other(context: ContextTypes.DEFAULT_TYPE, keep_prefix: str) -> None:
 
 def start_wizard(context: ContextTypes.DEFAULT_TYPE, prefix: str,
                  *, initial_values: Optional[dict] = None) -> dict:
-    """Create + return wizard state dict; cancels any other active wizard."""
+    """Create + return wizard state dict; cancels any other active wizard
+    AND очищает pending-state из assistant_handler (pending_transfer,
+    pending_mexc, pending_set, _mexc_secret), чтобы они не перехватывали
+    ввод пользователя в визарде. Без этого баг: пользователь раньше открывал
+    /balance перевод или /setmexc, не закончил, и затем открыл /avg —
+    его «100» уходило в pending_transfer как сумма перевода вместо плеча."""
     _cancel_other(context, prefix)
+    for stale_key in ("pending_transfer", "pending_mexc", "pending_set", "_mexc_secret",
+                      "_close_choices"):
+        context.user_data.pop(stale_key, None)
     wizard = {
         "step": 0,
         "values": dict(initial_values or {}),

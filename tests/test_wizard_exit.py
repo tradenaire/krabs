@@ -120,3 +120,33 @@ async def test_exit_when_wizard_already_gone(wizard_registered):
     await _exit_wizard(ctx, "test_exit", chat_id=42, reply=reply)
     finish.assert_not_called()
     reply.assert_not_called()
+
+
+# ── start_wizard очищает stale pending_X state ────────────────────
+
+
+def test_start_wizard_clears_pending_states(wizard_registered):
+    """Регрессия: пользователь раньше открыл /balance->перевод (pending_transfer)
+    или /setmexc (pending_mexc), не закончил, потом открыл /avg. Раньше его
+    «100» съедал pending_transfer как сумма перевода. Теперь start_wizard
+    атомарно зачищает все pending state."""
+    from bot.handlers.wizard import start_wizard
+    ctx = MagicMock()
+    ctx.user_data = {
+        "pending_transfer": {"dir": "s2f", "avail": 100.0},
+        "pending_mexc": {"step": "secret"},
+        "_mexc_secret": "leftover-secret",
+        "pending_set": "bet",
+        "_close_choices": [("BTC", "BTC")],
+    }
+    ctx.bot_data = {}
+    start_wizard(ctx, "test_exit")
+
+    # Все stale state должны быть очищены
+    assert "pending_transfer" not in ctx.user_data
+    assert "pending_mexc" not in ctx.user_data
+    assert "_mexc_secret" not in ctx.user_data
+    assert "pending_set" not in ctx.user_data
+    assert "_close_choices" not in ctx.user_data
+    # А wizard state создан
+    assert "test_exit_wizard" in ctx.user_data

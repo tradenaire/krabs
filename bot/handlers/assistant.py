@@ -47,14 +47,20 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if f"@{bot_username}" not in update.message.text:
             return
 
+    # Wizard приоритетнее pending_transfer/pending_mexc — если пользователь
+    # сейчас в визарде (/avg, /automode, /short и т.д.), его ввод должен идти
+    # туда, не в случайно повисшие state. start_wizard теперь чистит pending_X
+    # при старте, но дополнительно страхуемся здесь: если wizard активен, он
+    # перехватывает ввод раньше всех остальных state-машин.
+    if await wizard.handle_text(update, context):
+        return
+
     msg = update.message.text.strip()
     lo = msg.lower()
 
     # ── pending_transfer: ввод суммы для USDT spot↔futures перевода ─
     # Активируется кнопкой в /balance (см. handlers/balance.py transfer_*).
     # Состояние одноразовое: получили сумму → выполнили перевод → очистили.
-    # Должно перехватывать ввод ДО wizard.handle_text, иначе цифру съест wizard
-    # если он случайно активирован.
     pending_transfer = context.user_data.get("pending_transfer")
     if pending_transfer:
         context.user_data.pop("pending_transfer", None)
@@ -175,9 +181,9 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Active wizard claims free-text input first.
-    if await wizard.handle_text(update, context):
-        return
+    # (wizard.handle_text был перенесён в начало функции — wizard приоритетнее
+    # pending_transfer/pending_mexc, чтобы ввод '100' на шаге плеча не уходил
+    # как сумма перевода или MEXC secret.)
 
     client = context.bot_data.get("exchange")
 
