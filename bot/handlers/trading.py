@@ -241,14 +241,17 @@ async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Avg wizard ────────────────────────────────────────────────────
 
 AVG_WIZARD_STEPS = [
-    ("bet",       "default_trade_usdt",   float, "Маржа на сделку",   "$"),
-    ("leverage",  "default_leverage",     int,   "Плечо (0=макс)",    "#"),
-    ("tp",        "tp_pct",               float, "Тейкпрофит",        "%"),
-    ("sl",        "sl_pct",               float, "Стоплосс",          "%"),
-    ("threshold", "averaging_threshold",  float, "Докупка при PnL",   "%"),
-    ("amount",    "averaging_amount",     float, "Сумма докупки",     "$"),
-    ("maxavg",    "max_averaging_count",  int,   "Макс докупок",      "#"),
-    ("reentry",   "max_reentry_cycles",   int,   "Перезаходов макс",  "#"),
+    ("bet",          "default_trade_usdt",              float, "Маржа на сделку",          "$"),
+    ("leverage",     "default_leverage",                int,   "Плечо (0=макс)",           "#"),
+    ("tp",           "tp_pct",                          float, "Тейкпрофит",               "%"),
+    ("sl",           "sl_pct",                          float, "Стоплосс",                 "%"),
+    ("threshold",    "averaging_threshold",             float, "Докупка при PnL",          "%"),
+    ("amount",       "averaging_amount",                float, "Сумма докупки",            "$"),
+    ("maxavg",       "max_averaging_count",             int,   "Макс докупок",             "#"),
+    ("reentry",      "max_reentry_cycles",              int,   "Перезаходов макс",         "#"),
+    ("lock_trigger", "averaging_profit_lock_trigger",   float, "Локк SL при профите ≥",   "%"),
+    ("lock_sl",      "averaging_profit_lock_sl_pct",    float, "Поставить SL на PnL",     "%"),
+    ("scan_cap",     "auto_scan_capital_pct",            float, "Авто-капитал риск",       "%"),
 ]
 
 
@@ -277,7 +280,34 @@ async def send_avg_wizard_step(bot, chat_id: int, step_idx: int, config) -> None
     )
 
 
-def _build_avg_text(config) -> str:
+def _build_avg_text(config, free_balance: float | None = None, open_count: int = 0) -> str:
+    lock_trig = float(getattr(config, "averaging_profit_lock_trigger", 0))
+    lock_sl = float(getattr(config, "averaging_profit_lock_sl_pct", 0))
+    lock_line = (f"  Профит-локк: при `+{lock_trig:.0f}%` → SL в `+{lock_sl:.0f}%`"
+                 if lock_trig > 0 else "  Профит-локк: выкл")
+    scan_risk = float(getattr(config, "auto_scan_capital_pct", 0))
+    avg_count = int(getattr(config, "max_averaging_count", 100))
+    avg_amt = float(getattr(config, "averaging_amount", 0.5))
+    bet = float(getattr(config, "default_trade_usdt", 0.2))
+    sl_f = float(getattr(config, "sl_pct", 500))
+    lock_trig_f = float(getattr(config, "averaging_profit_lock_trigger", 0))
+    base_bud = avg_count * avg_amt + bet
+    full_budget = base_bud if lock_trig_f > 0 else base_bud * (sl_f / 100.0)
+    min_dep = full_budget * (1 - scan_risk / 100)
+    lock_note = " (lock)" if lock_trig_f > 0 else f" (×SL{sl_f:.0f}%)"
+    if free_balance is not None:
+        total_avail = free_balance + open_count * bet
+        total_needed = full_budget * (open_count + 1) * (1.0 - scan_risk / 100.0)
+        ok = "✅" if total_avail >= total_needed else "❌"
+        pos_label = f"{open_count + 1} поз" if open_count else "1 поз"
+        scan_risk_line = (
+            f"  Авто-капитал: `{scan_risk:.0f}%` → `${total_needed:.2f}` ({pos_label}×`${full_budget:.2f}`){lock_note}"
+            f" | фьюч `${free_balance:.2f}` {ok}"
+        )
+    else:
+        scan_risk_line = (
+            f"  Авто-капитал: `{scan_risk:.0f}%` → нужно `${min_dep:.2f}`/поз{lock_note}"
+        )
     lines = [
         "*Торговые настройки*",
         "",
@@ -292,6 +322,8 @@ def _build_avg_text(config) -> str:
         f"  Сумма:   `${config.averaging_amount:.2f}`",
         f"  Макс:    `{config.max_averaging_count}` докупок",
         f"  Интервал:`{config.averaging_interval}s`",
+        lock_line,
+        scan_risk_line,
     ]
     return "\n".join(lines)
 
@@ -302,10 +334,26 @@ async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
 
     if not args:
+        client = context.bot_data.get("exchange")
+        free_balance: float | None = None
+        open_count = 0
+        if client:
+            try:
+                free_balance = await client.get_free_futures_balance()
+            except Exception:
+                pass
+            pos_cache = context.bot_data.get("_pos_cache")
+            if pos_cache is not None:
+                open_count = len(pos_cache)
+            else:
+                try:
+                    open_count = len(await client.get_positions())
+                except Exception:
+                    pass
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✏️ Изменить", callback_data="avg_edit"),
         ]])
-        await update.message.reply_text(_build_avg_text(config),
+        await update.message.reply_text(_build_avg_text(config, free_balance, open_count),
                                         parse_mode="Markdown", reply_markup=kb)
         return
 
@@ -325,19 +373,22 @@ async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     field_map = {
-        "bet":       ("default_trade_usdt", float),
-        "leverage":  ("default_leverage", int),
-        "tp":        ("tp_pct", float),
-        "sl":        ("sl_pct", float),
-        "threshold": ("averaging_threshold", float),
-        "amount":    ("averaging_amount", float),
-        "interval":  ("averaging_interval", int),
-        "maxavg":    ("max_averaging_count", int),
+        "bet":          ("default_trade_usdt", float),
+        "leverage":     ("default_leverage", int),
+        "tp":           ("tp_pct", float),
+        "sl":           ("sl_pct", float),
+        "threshold":    ("averaging_threshold", float),
+        "amount":       ("averaging_amount", float),
+        "interval":     ("averaging_interval", int),
+        "maxavg":       ("max_averaging_count", int),
+        "lock_trigger": ("averaging_profit_lock_trigger", float),
+        "lock_sl":      ("averaging_profit_lock_sl_pct", float),
+        "scan_cap":     ("auto_scan_capital_pct", float),
     }
     if param not in field_map:
         await update.message.reply_text(
             f"Неизвестный параметр: `{param}`\n"
-            "Доступны: `bet`, `leverage`, `tp`, `sl`, `threshold`, `amount`, `interval`, `maxavg`",
+            "Доступны: `bet`, `leverage`, `tp`, `sl`, `threshold`, `amount`, `interval`, `maxavg`, `lock_trigger`, `lock_sl`, `scan_cap`",
             parse_mode="Markdown"
         )
         return
@@ -509,3 +560,16 @@ async def setkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         setattr(config, key, value)
     await update.message.reply_text(f"✅ Сохранено: `{key}` = `{value}`", parse_mode="Markdown")
+
+
+async def setmexc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setmexc — двухшаговая замена MEXC ключей с проверкой."""
+    context.user_data["pending_mexc"] = {"step": "secret"}
+    context.user_data.pop("_mexc_secret", None)
+    await update.message.reply_text(
+        "🔐 *Замена MEXC ключей*\n\n"
+        "Шаг 1/2 — введи *secret* (из настроек MEXC API).\n\n"
+        "_Сообщение с ключом удалю сразу после получения._\n"
+        "Напиши `отмена` чтобы прервать.",
+        parse_mode="Markdown",
+    )

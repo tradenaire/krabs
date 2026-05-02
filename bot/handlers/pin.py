@@ -16,10 +16,10 @@ _PIN_MSG_KEY  = "pin_message_id"
 async def _build_pin_text(client, context) -> str:
     from bot.handlers.balance import _fetch_all, _build_balance_text
     try:
-        futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache = \
+        futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
             await _fetch_all(client, context)
         text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs,
-                                   config, daily_stats, lev_cache)
+                                   config, daily_stats, lev_cache, spot_bal)
     except Exception as e:
         text = f"❌ Ошибка загрузки баланса: {e}"
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")

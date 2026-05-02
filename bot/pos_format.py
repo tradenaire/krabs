@@ -17,7 +17,7 @@ def _fmt_funding(rate: float, lev: int, margin: float, next_ts: str | None = Non
         return ""
     from datetime import datetime, timezone
     pct = rate * 100
-    daily_usdt = abs(rate) * 3 * lev * margin
+    daily_usdt = abs(rate) * 3 * lev * margin  # 3 periods × leverage × margin
     sign = "+" if rate > 0 else ""
     icon = "💰" if rate > 0 else ("⚠️" if rate > -0.001 else "🚨")
     line = f"{icon} Фандинг `{sign}{pct:.4f}%`/8h · ~`${daily_usdt:.4f}`/день"
@@ -55,56 +55,67 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     pct = float(pos.get("percentage", 0))
     margin = float(pos.get("margin", 0))
 
+    # Re-entry info (always shown)
     cycle_count = int(re_rec.get("cycle_count", 0)) if re_rec else 0
     max_cycles = int(re_rec.get("max_cycles", 3)) if re_rec else (
         int(getattr(config, "max_reentry_cycles", 3)) if config else 3
     )
-    reopen_margin = float(re_rec.get("margin", margin)) if re_rec else margin
-    re_label = f"RE {cycle_count}/{max_cycles}"
+    re_label = f"RE{cycle_count}/{max_cycles}"
 
+    # PnL indicator
     pnl_icon = "🟢" if pnl >= 0 else "🔴"
 
+    # Liq distance
     dist_str = ""
     if liq > 0 and mark > 0:
         dist = abs(mark - liq) / mark * 100
-        dist_str = f" ({dist:.1f}%.)"
+        dist_str = f" ({dist:.1f}% до ликв.)"
 
+    # TP/SL from stored pcts
     stored = tp_sl_pcts.get(symbol, {})
     tp_pct_val = stored.get("tp_pct") or (db_rec.get("tp_pct") if db_rec else None) or 500.0
     sl_pct_val = stored.get("sl_pct") or (db_rec.get("sl_pct") if db_rec else None) or 500.0
     tp_price = _calc_tp_price(entry, lev, tp_pct_val, side)
     sl_price = _calc_sl_price(entry, lev, sl_pct_val, side)
 
+    # Averaging info
+    threshold = float(getattr(config, "averaging_threshold", -100)) if config else -100
     avg_amount = float(getattr(config, "averaging_amount", 0.1)) if config else 0.1
     avg_count = int(db_rec.get("averaging_count", 0)) if db_rec else 0
     max_avg = int(getattr(config, "max_averaging_count", 100)) if config else 100
     invested = float(db_rec.get("total_invested", margin)) if db_rec else margin
-    budget = float(getattr(config, "averaging_budget", 0)) if config else 0
+    # Re-entry reopen margin
+    reopen_margin = float(re_rec.get("margin", margin)) if re_rec else margin
 
     side_icon = "🔴⬇️" if side == "short" else "🟢⬆️"
-
-    lev_label = f"x{lev}/{max_lev}" if max_lev and max_lev != lev else f"x{lev}"
-    header_parts = [f"{coin} {side_icon} {lev_label} ${margin:.2f}", re_label]
-    if re_rec and abs(reopen_margin - margin) > 1e-9:
-        header_parts.append(f"${reopen_margin:.2f}")
-    header = " · ".join(header_parts)
-
     lines = [
-        header,
-        f"  ▶️ {entry:.6g}",
-        f"  {pnl_icon} {fmt_usd(pnl)} ({fmt_pct(pct)})",
+        f"{coin} {side_icon} {lev}x ${margin:.2f} {re_label}",
+        f"▶️ {entry:.6g}",
+        f"{pnl_icon} {fmt_usd(pnl)} ({fmt_pct(pct)})",
     ]
     if liq > 0:
-        lines.append(f"  ☠️ {liq:.6g}{dist_str}")
-    lines.append(f"  🛑 SL {sl_price:.6g} (-{sl_pct_val:.0f}%)")
-    lines.append(f"  🎯 TP {tp_price:.6g} (+{tp_pct_val:.0f}%)")
+        lines.append(f"☠️ {liq:.6g}{dist_str}")
+    lines.append(f"SL:{sl_price:.6g} (-{sl_pct_val:.0f}%)")
+    lines.append(f"TP:{tp_price:.6g} (+{tp_pct_val:.0f}%)")
 
-    budget_str = f"${invested:.2f}/${budget:.2f}" if budget else f"${invested:.2f}"
+    # Max leverage / position limit (if provided)
+    if max_lev > 0 or max_pos_usdt > 0:
+        extra = []
+        if max_lev > 0:
+            extra.append(f"макс ×{max_lev}")
+        if max_pos_usdt > 0:
+            extra.append(f"лимит ${max_pos_usdt:,.0f}")
+        lines.append("⚙️ " + " · ".join(extra))
+
     lines.append(
-        f"  💸 +${avg_amount:.2f} · 🦶{avg_count}/{max_avg} · 💰 {budget_str}"
+        f"🔁 Докупка: при PnL ≤ {threshold:.0f}% · +${avg_amount:.2f}"
+        f" · шагов {avg_count}/{max_avg} · вложено ${invested:.2f}"
     )
-
+    lines.append(
+        f"🔄 Перезаход: после TP +{tp_pct_val:.0f}%"
+        f" → reopen ${reopen_margin:.2f} · циклов {cycle_count}/{max_cycles}"
+    )
     funding_str = _fmt_funding(funding_rate, lev, margin, funding_next_ts)
     if funding_str:
-        lines.append(f"  {funding_str}")
+        lines.append(funding_str)
     return "\n".join(lines)

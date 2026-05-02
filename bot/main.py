@@ -14,14 +14,15 @@ from bot.handlers.scan import scan_handler, open_callback
 from bot.handlers.balance import balance_handler, balance_callback
 from bot.handlers.positions import positions_handler, positions_callback
 from bot.handlers.trading import (short_handler, close_handler, avg_handler, setkey_handler,
-                                   setbet_handler, setstop_handler, settp_handler, avg_callback)
+                                   setbet_handler, setstop_handler, settp_handler, avg_callback,
+                                   setmexc_handler)
 from bot.handlers.assistant import assistant_handler, nlp_close_callback
 from bot.handlers.stats import stats_handler
 from bot.jobs.main import setup_scheduler
 from bot.handlers.monitor_callbacks import (monitor_close_callback, monitor_close_confirm_callback,
                                              monitor_close_cancel_callback, monitor_stats_callback)
 from bot.handlers.paper import paper_handler, paper_callback
-from bot.handlers.automode import automode_callback, automode_handler
+from bot.handlers.automode import automode_handler
 from bot.handlers.pin import pin_handler
 
 logging.basicConfig(
@@ -115,6 +116,7 @@ def main():
             BotCommand("paper", "Бумажный портфель $500"),
             BotCommand("automode", "Авто-скан и открытие позиций"),
             BotCommand("pin", "Закрепить баланс (авто-обновление)"),
+            BotCommand("setmexc", "Заменить MEXC ключи (с проверкой)"),
         ])
         logger.info("Bot started.")
 
@@ -135,6 +137,7 @@ def main():
     app.add_handler(CommandHandler("avg", avg_handler))
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("setkey", setkey_handler))
+    app.add_handler(CommandHandler("setmexc", setmexc_handler))
     app.add_handler(CommandHandler("setbet", setbet_handler))
     app.add_handler(CommandHandler("setstop", setstop_handler))
     app.add_handler(CommandHandler("setstops", setstop_handler))
@@ -144,8 +147,6 @@ def main():
     app.add_handler(CallbackQueryHandler(paper_callback, pattern="^paper_reset"))
     app.add_handler(CommandHandler("automode", automode_handler))
     app.add_handler(CommandHandler("pin", pin_handler))
-
-    app.add_handler(CallbackQueryHandler(automode_callback, pattern=r"^automode_"))
 
     app.add_handler(CallbackQueryHandler(open_callback, pattern=r"^open_"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^balance_"))
@@ -158,6 +159,7 @@ def main():
     app.add_handler(CallbackQueryHandler(monitor_stats_callback, pattern=r"^mon_stats$"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^bal_close_confirm_"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^bal_close_cancel$"))
+    app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^transfer_"))
 
     app.add_handler(CallbackQueryHandler(avg_callback, pattern=r"^avg_"))
     app.add_handler(CallbackQueryHandler(nlp_close_callback, pattern=r"^nlp_close_"))

@@ -127,6 +127,15 @@ class ExchangeClient:
     async def get_spot_balance(self) -> dict:
         return await self._spot.fetch_balance()
 
+    async def transfer_usdt(self, amount: float, direction: str) -> None:
+        """Transfer USDT between spot and futures. direction: 's2f' or 'f2s'."""
+        if direction in ("s2f", "spot2fut"):
+            await self._exchange.transfer("USDT", amount, "spot", "swap")
+        elif direction in ("f2s", "fut2spot"):
+            await self._exchange.transfer("USDT", amount, "swap", "spot")
+        else:
+            raise ValueError(f"Unknown transfer direction: {direction}")
+
     # ── Market data ──────────────────────────────────────────────────
 
     async def get_ticker(self, symbol: str) -> dict:
@@ -522,10 +531,9 @@ class ExchangeClient:
             return 0
 
     async def was_closed_by_tp(self, symbol: str, pos_side: str,
-                               opened_at_ms: int | None = None) -> bool | None:
-        """Check recent executed plan orders to determine if position closed by TP (True),
-        SL (False), or unknown (None).
-        opened_at_ms: epoch-ms of position open — ignores older executed orders."""
+                               opened_at_ms: int | None = None) -> tuple[bool | None, float | None]:
+        """Check recent executed plan orders to determine if position closed by TP.
+        Returns (is_tp, trigger_price): True/False/None, and the price that fired."""
         try:
             sym = self.futures_symbol(symbol)
             await self._exchange.load_markets()
@@ -537,7 +545,6 @@ class ExchangeClient:
             data = result.get("data") or {}
             orders = (data.get("resultList") or data.get("result_list") or []) \
                 if isinstance(data, dict) else (data or [])
-            # Find executed orders (state=3) that are newer than position open time
             executed = [
                 o for o in orders
                 if int(o.get("state", 0) or 0) == 3
@@ -545,16 +552,17 @@ class ExchangeClient:
                      or int(o.get("createTime", 0) or 0) >= opened_at_ms)
             ]
             if not executed:
-                return None
+                return None, None
             latest = max(executed, key=lambda o: int(o.get("createTime", 0) or 0))
             trigger_type = int(latest.get("triggerType", 0) or 0)
+            trigger_price = float(latest.get("triggerPrice", 0) or 0) or None
             # For short: TP=triggerType 2 (price ≤), SL=triggerType 1 (price ≥)
             # For long:  TP=triggerType 1 (price ≥), SL=triggerType 2 (price ≤)
             tp_type = 1 if pos_side == "long" else 2
-            return trigger_type == tp_type
+            return trigger_type == tp_type, trigger_price
         except Exception as e:
             logger.warning("was_closed_by_tp(%s): %s", symbol, e)
-            return None
+            return None, None
 
     @_with_retry()
     async def get_tp_sl_orders(self, symbol: str | None = None) -> list[dict]:

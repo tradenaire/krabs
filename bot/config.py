@@ -20,10 +20,12 @@ class Config:
     sl_pct: float = 500.0
 
     # Averaging
-    averaging_threshold: float = -100.0   # trigger at PnL ≤ this %
-    averaging_amount: float = 0.50        # add per step
-    averaging_interval: int = 10          # seconds
-    max_averaging_count: int = 100        # hard cap
+    averaging_threshold: float = -100.0          # trigger at PnL ≤ this %
+    averaging_amount: float = 0.50               # add per step
+    averaging_interval: int = 10                 # seconds
+    max_averaging_count: int = 100               # hard cap
+    averaging_profit_lock_trigger: float = 0.0   # move SL to profit when PnL ≥ this % (0=off)
+    averaging_profit_lock_sl_pct: float = 0.0    # lock SL at this PnL % (e.g. 100 = lock at +100%)
 
     # Re-entry
     max_reentry_cycles: int = 3
@@ -33,6 +35,7 @@ class Config:
     auto_scan_interval_min: int = 30
     auto_scan_max_positions: int = 3
     auto_scan_max_risk: int = 7
+    auto_scan_capital_pct: float = 0.0  # 0=require full budget, 100=always open
 
     # Paper trading
     paper_enabled: bool = True

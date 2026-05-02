@@ -1,4 +1,5 @@
 """/balance — полный баланс с деталями по каждой позиции."""
+import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -11,7 +12,8 @@ _SEP = "─" * 20
 def _build_balance_text(futures_raw: dict, positions: list[dict],
                         tp_sl_pcts: dict, db_map: dict, re_map: dict,
                         config, daily_stats: dict,
-                        lev_cache: dict | None = None) -> str:
+                        lev_cache: dict | None = None,
+                        spot_raw: dict | None = None) -> str:
     from bot.pos_format import format_position_block
 
     free = float(futures_raw.get("free", {}).get("USDT", 0) or 0)
@@ -22,6 +24,11 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
     lines = ["*Баланс💰*",
              f"Фьючерсы: `${total:.2f}`",
              f"└ Свободно: `${free:.2f}` · Avail: `${avail_open:.2f}`"]
+
+    if spot_raw:
+        spot_free = float((spot_raw.get("free") or {}).get("USDT", 0) or 0)
+        spot_total = float((spot_raw.get("total") or {}).get("USDT", 0) or 0)
+        lines.append(f"Спот: `${spot_total:.2f}` · Свободно: `${spot_free:.2f}`")
 
     # Daily stats
     realized = float(daily_stats.get("realized_pnl", 0))
@@ -61,7 +68,6 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
 
 def _build_close_kb(positions: list[dict]) -> InlineKeyboardMarkup:
     rows = []
-    total = len(positions)
     from bot.fmt import fmt_pct, fmt_usd
     for i, pos in enumerate(positions, 1):
         coin = pos["symbol"].split("/")[0]
@@ -72,7 +78,10 @@ def _build_close_kb(positions: list[dict]) -> InlineKeyboardMarkup:
             f"{i}. {icon} {coin}  {fmt_pct(pct)}  {fmt_usd(pnl)}",
             callback_data=f"bal_close_{pos['symbol']}"
         )])
-    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="balance_refresh")])
+    rows.append([
+        InlineKeyboardButton("🔄 Обновить", callback_data="balance_refresh"),
+        InlineKeyboardButton("💱 Перевести", callback_data="transfer_start"),
+    ])
     rows.append([InlineKeyboardButton("📊 Позиции", callback_data="positions_show")])
     return InlineKeyboardMarkup(rows)
 
@@ -96,8 +105,18 @@ async def _fetch_all(client, context):
     from bot import db as db_mod
     from datetime import date
 
-    futures_bal = await client.get_futures_balance()
-    positions = await client.get_positions()
+    futures_bal, spot_bal, positions = await asyncio.gather(
+        client.get_futures_balance(),
+        client.get_spot_balance(),
+        client.get_positions(),
+        return_exceptions=True,
+    )
+    if isinstance(futures_bal, Exception):
+        raise futures_bal
+    if isinstance(positions, Exception):
+        raise positions
+    if isinstance(spot_bal, Exception):
+        spot_bal = None
 
     db_recs = {r["symbol"]: r for r in db_mod.get_open_positions()}
     re_recs = {r["symbol"]: r for r in db_mod.get_all_reentry()}
@@ -106,19 +125,19 @@ async def _fetch_all(client, context):
     daily_stats = db_mod.get_daily_stats(date.today().isoformat())
     lev_cache = await _fetch_lev_cache(client, positions)
 
-    return futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache
+    return futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal
 
 
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = context.bot_data["exchange"]
     try:
-        futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache = \
+        futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
             await _fetch_all(client, context)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
         return
 
-    text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache)
+    text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
     kb = _build_close_kb(positions)
     # Split if Telegram limit exceeded (4096 chars)
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
@@ -182,12 +201,12 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data in ("balance_refresh", "balance_futures"):
         client = context.bot_data["exchange"]
         try:
-            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache = \
+            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
                 await _fetch_all(client, context)
         except Exception as e:
             await q.answer(f"Ошибка: {e}", show_alert=True)
             return
-        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache)
+        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
         kb = _build_close_kb(positions)
         chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
         try:
@@ -210,3 +229,53 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "positions_show":
         from bot.handlers.positions import _send_positions
         await _send_positions(q.message, context, edit=False)
+
+    if q.data == "transfer_start":
+        client = context.bot_data["exchange"]
+        try:
+            futures_bal, spot_bal = await asyncio.gather(
+                client.get_futures_balance(),
+                client.get_spot_balance(),
+                return_exceptions=True,
+            )
+            fut_free = float(futures_bal.get("free", {}).get("USDT", 0) or 0) if not isinstance(futures_bal, Exception) else 0.0
+            spot_free = float((spot_bal.get("free") or {}).get("USDT", 0) or 0) if not isinstance(spot_bal, Exception) else 0.0
+        except Exception:
+            fut_free = spot_free = 0.0
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"Спот→Фьючи (${spot_free:.2f})", callback_data="transfer_dir_s2f"),
+            InlineKeyboardButton(f"Фьючи→Спот (${fut_free:.2f})", callback_data="transfer_dir_f2s"),
+        ], [
+            InlineKeyboardButton("✖ Отмена", callback_data="balance_refresh"),
+        ]])
+        await q.edit_message_text("💱 *Перевод USDT*\nВыбери направление:", parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if q.data in ("transfer_dir_s2f", "transfer_dir_f2s"):
+        direction = q.data.replace("transfer_dir_", "")
+        client = context.bot_data["exchange"]
+        try:
+            if direction == "s2f":
+                bal = await client.get_spot_balance()
+                avail = float((bal.get("free") or {}).get("USDT", 0) or 0)
+                label = "Спот → Фьючерсы"
+            else:
+                bal = await client.get_futures_balance()
+                raw = bal.get("_raw", {})
+                # transferable = min(availableBalance, cashBalance) — MEXC reserves maintenance margin
+                cash = float(raw.get("cashBalance", raw.get("availableBalance", 0)) or 0)
+                avail_raw = float(bal.get("free", {}).get("USDT", 0) or 0)
+                avail = min(avail_raw, cash)
+                # floor to 2 decimals to avoid MEXC exact-boundary rejection
+                import math
+                avail = math.floor(avail * 100) / 100
+                label = "Фьючерсы → Спот"
+        except Exception:
+            avail = 0.0
+            label = "Спот → Фьючерсы" if direction == "s2f" else "Фьючерсы → Спот"
+        context.user_data["pending_transfer"] = {"dir": direction, "avail": avail}
+        await q.edit_message_text(
+            f"💱 *{label}*\nДоступно: `${avail:.2f}`\n\nВведи сумму USDT:",
+            parse_mode="Markdown",
+        )
+        return

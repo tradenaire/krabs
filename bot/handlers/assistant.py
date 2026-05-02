@@ -53,13 +53,6 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = context.bot_data.get("exchange")
     app = context.application
 
-    # Auto Scan wizard has priority over free-form NLP so numeric answers like
-    # "30" are treated as settings input, not as a chat command.
-    if context.user_data.get("automode_wizard") is not None:
-        from bot.handlers.automode import handle_automode_wizard_text
-        if await handle_automode_wizard_text(update, context):
-            return
-
     # ── Avg wizard (sequential settings dialog) ───────────────────
     wizard = context.user_data.get("avg_wizard")
     if wizard is not None:
@@ -95,6 +88,116 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wizard["step"] = next_step
             await send_avg_wizard_step(context.bot, update.message.chat_id, next_step, config)
         return
+
+    # ── Transfer dialog ──────────────────────────────────────────────
+    pending_transfer = context.user_data.get("pending_transfer")
+    if pending_transfer:
+        context.user_data.pop("pending_transfer", None)
+        try:
+            amount = float(msg.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("Не похоже на число. Перевод отменён.")
+            return
+        direction = pending_transfer.get("dir", "s2f")
+        avail = pending_transfer.get("avail", 0.0)
+        if amount <= 0:
+            await update.message.reply_text("Сумма должна быть больше нуля.")
+            return
+        if amount > avail:
+            await update.message.reply_text(f"❌ Недостаточно средств. Доступно: `${avail:.2f}`", parse_mode="Markdown")
+            return
+        client = context.bot_data.get("exchange")
+        if not client:
+            await update.message.reply_text("❌ Клиент биржи недоступен.")
+            return
+        label = "Спот → Фьючерсы" if direction == "s2f" else "Фьючерсы → Спот"
+        try:
+            await client.transfer_usdt(amount, direction)
+            await update.message.reply_text(
+                f"✅ *{label}*: `${amount:.2f}` USDT переведено.", parse_mode="Markdown"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка перевода: {e}")
+        return
+
+    # ── MEXC keys two-step dialog ─────────────────────────────────
+    pending_mexc = context.user_data.get("pending_mexc")
+    if pending_mexc:
+        if lo in ("отмена", "cancel", "стоп", "выход"):
+            context.user_data.pop("pending_mexc", None)
+            context.user_data.pop("_mexc_secret", None)
+            await update.message.reply_text("✖ Замена ключей отменена.")
+            return
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        chat_id = update.effective_chat.id
+        step = pending_mexc.get("step")
+
+        if step == "secret":
+            context.user_data["_mexc_secret"] = msg
+            pending_mexc["step"] = "api_key"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="✅ Secret получен (твоё сообщение удалено).\n\nШаг 2/2 — теперь введи *API key*:",
+                parse_mode="Markdown",
+            )
+            return
+
+        if step == "api_key":
+            api_key = msg
+            secret = context.user_data.pop("_mexc_secret", None)
+            context.user_data.pop("pending_mexc", None)
+
+            if not secret:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Внутренняя ошибка: secret потерян. Запусти /setmexc заново.",
+                )
+                return
+
+            await context.bot.send_message(chat_id=chat_id, text="⏳ Проверяю ключи на MEXC…")
+
+            from bot.exchange.client import ExchangeClient
+            test_client = ExchangeClient(api_key, secret)
+            try:
+                bal = await test_client.get_futures_balance()
+            except Exception as e:
+                try:
+                    await test_client.close()
+                except Exception:
+                    pass
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Ключи не работают: `{type(e).__name__}: {e}`\n\nЗапусти /setmexc заново.",
+                    parse_mode="Markdown",
+                )
+                return
+
+            from bot import db as db_mod
+            db_mod.set_config("mexc_api_key", api_key)
+            db_mod.set_config("mexc_secret", secret)
+            config = context.bot_data.get("config")
+            if config is not None:
+                config.mexc_api_key = api_key
+                config.mexc_secret = secret
+
+            context.bot_data["exchange"] = test_client
+
+            free = float(bal.get("free", {}).get("USDT", 0) or 0)
+            total = float(bal.get("total", {}).get("USDT", 0) or 0)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "✅ *MEXC ключи обновлены и работают.*\n\n"
+                    f"Баланс: free `{free:.2f}` / equity `{total:.2f}` USDT"
+                ),
+                parse_mode="Markdown",
+            )
+            return
 
     # ── Pending input state (two-step dialog) ─────────────────────
     _TRIGGER_WORDS = ("setbet", "сетбет", "setstop", "setstops", "сетстоп", "settp", "settakes", "сеттп",
