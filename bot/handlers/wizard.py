@@ -222,6 +222,13 @@ async def render_step(bot, chat_id: int, prefix: str, step_idx: int,
             extra_rows.append([
                 InlineKeyboardButton(label, callback_data=f"{prefix}_pick_{step_idx}_{value}"),
             ])
+    elif step.kind == "bool":
+        # Удобный одноклик для bool-шагов вместо ввода 'вкл'/'выкл' текстом.
+        # Каст 'true'/'false' → bool делается в handle_callback ветке pick_.
+        extra_rows.append([
+            InlineKeyboardButton("✅ ВКЛ",  callback_data=f"{prefix}_pick_{step_idx}_true"),
+            InlineKeyboardButton("⛔ ВЫКЛ", callback_data=f"{prefix}_pick_{step_idx}_false"),
+        ])
 
     kb = build_wizard_kb(prefix, step_idx, optional=step.optional, extra_rows=extra_rows)
 
@@ -231,7 +238,8 @@ async def render_step(bot, chat_id: int, prefix: str, step_idx: int,
         cur_line = f"\nСейчас: `{format_value(step, cur)}`"
 
     total = len(steps)
-    hint = "" if step.kind == "choice" else "\nВведи новое значение:"
+    # 'choice' и 'bool' выбираются кнопкой — просить ввести текст не нужно.
+    hint = "" if step.kind in ("choice", "bool") else "\nВведи новое значение:"
     text = f"*{step.prompt}* ({step_idx + 1}/{total}){cur_line}{hint}"
 
     await bot.send_message(
@@ -394,8 +402,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except ValueError:
             return True
         step = spec.steps[step_idx]
-        wizard.setdefault("values", {})[step.key] = value
-        wizard.setdefault("changed", {})[step.key] = value
+        # Для bool-шагов кнопки шлют 'true'/'false' строкой — кастуем в bool
+        # чтобы _apply_changes (Config.from_dict / setattr) получил правильный тип.
+        # Choice-шаги остаются строкой как раньше.
+        cast_value: Any = value
+        if step.kind == "bool":
+            try:
+                cast_value = parse_step_value(step, value)
+            except ValueError:
+                cast_value = value.lower() == "true"
+        wizard.setdefault("values", {})[step.key] = cast_value
+        wizard.setdefault("changed", {})[step.key] = cast_value
         wizard["step"] = step_idx
         await _advance(context, prefix, chat_id)
         return True
