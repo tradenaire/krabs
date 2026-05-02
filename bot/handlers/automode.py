@@ -5,18 +5,27 @@ from telegram.ext import ContextTypes
 
 from bot import db as db_mod
 from bot.config import Config
+from bot.handlers import wizard
+from bot.handlers.wizard import Step
 from bot.jobs.main import reschedule_auto_scan, SCHEDULER
 
 logger = logging.getLogger(__name__)
 
-_HELP = (
-    "*Auto Scan — автоматический поиск и открытие шортов*\n\n"
-    "`/automode on` — включить\n"
-    "`/automode off` — выключить\n"
-    "`/automode interval 30` — сканировать раз в 30 мин\n"
-    "`/automode maxpos 3` — макс. позиций (если больше — не открывать)\n"
-    "`/automode maxrisk 7` — только если RISK ≤ 7/10\n"
-)
+
+AUTOMODE_STEPS: list[Step] = [
+    Step(key="auto_scan_enabled",       attr="auto_scan_enabled",
+         prompt="Auto Scan включён?",       kind="bool"),
+    Step(key="auto_scan_interval_min",  attr="auto_scan_interval_min",
+         prompt="Интервал скана, минут",     kind="int:1:1440"),
+    Step(key="auto_scan_max_positions", attr="auto_scan_max_positions",
+         prompt="Макс. открытых позиций",    kind="int:1:20"),
+    Step(key="auto_scan_max_risk",      attr="auto_scan_max_risk",
+         prompt="Макс. риск для авто-открытия", kind="int:1:10"),
+]
+
+
+def _save(key: str, value) -> None:
+    db_mod.set_config(key, str(value))
 
 
 def _status_text(config: Config) -> str:
@@ -35,12 +44,56 @@ def _status_text(config: Config) -> str:
     if job and job.next_run_time:
         local_next = job.next_run_time.astimezone(_dt.timezone.utc).astimezone()
         lines.append(f"Следующий скан: *{local_next.strftime('%H:%M')}*")
-    lines.append("\n" + _HELP)
     return "\n".join(lines)
 
 
-def _save(key: str, value) -> None:
-    db_mod.set_config(key, str(value))
+def _intro(context: ContextTypes.DEFAULT_TYPE) -> str:
+    config = context.bot_data.get("config")
+    if config is None:
+        return ""
+    return _status_text(config)
+
+
+def _apply_changes(config: Config, values: dict) -> None:
+    for attr, value in values.items():
+        setattr(config, attr, value)
+        if isinstance(value, bool):
+            _save(attr, "true" if value else "false")
+        else:
+            _save(attr, value)
+    if "auto_scan_interval_min" in values or values.get("auto_scan_enabled") is True:
+        interval = int(getattr(config, "auto_scan_interval_min", 30))
+        reschedule_auto_scan(interval)
+
+
+async def _finish(context: ContextTypes.DEFAULT_TYPE, chat_id: int, wizard_state: dict) -> None:
+    config: Config = context.bot_data["config"]
+    values = wizard_state.get("changed", {}) or {}
+    if not values:
+        await context.bot.send_message(chat_id=chat_id, text="Ничего не изменено.")
+        return
+
+    _apply_changes(config, values)
+
+    labels = {s.key: s.prompt for s in AUTOMODE_STEPS}
+    lines = ["✅ *Auto Scan обновлён:*", ""]
+    for attr, value in values.items():
+        step = next((s for s in AUTOMODE_STEPS if s.key == attr), None)
+        if step is None:
+            continue
+        lines.append(f"{labels[attr]}: `{wizard.format_value(step, value)}`")
+    lines.append("")
+    lines.append(_status_text(config))
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+
+
+wizard.register("automode", AUTOMODE_STEPS, _finish, intro=_intro)
+
+
+async def _start(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    wizard.start_wizard(context, "automode")
+    await wizard.send_intro(context.bot, chat_id, "automode", context)
+    await wizard.render_step(context.bot, chat_id, "automode", 0, context)
 
 
 async def automode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -48,7 +101,7 @@ async def automode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
 
     if not args:
-        await update.message.reply_text(_status_text(config), parse_mode="Markdown")
+        await _start(context, update.message.chat_id)
         return
 
     cmd = args[0].lower()
@@ -113,5 +166,9 @@ async def automode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Unknown sub-command
-    await update.message.reply_text(_HELP, parse_mode="Markdown")
+    # Unknown sub-command → wizard.
+    await _start(context, update.message.chat_id)
+
+
+async def automode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await wizard.handle_callback(update, context, "automode")

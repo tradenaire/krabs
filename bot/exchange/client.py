@@ -605,8 +605,18 @@ class ExchangeClient:
                 break
         return parsed
 
+    # Возвращаемые значения cancel_tp_sl_orders:
+    #   N > 0  — успешно отменено N orders
+    #   0      — не было активных orders / транзитная ошибка
+    #   -1     — контракт делистнут (Contract does not exist, code 1001).
+    #            Только tpsl_enforce_job использует -1 как сигнал чтобы помечать
+    #            позицию как закрытую в DB. Остальные callers просто игнорируют
+    #            return value (если делистнут — закрывать TP/SL и так нечего).
+    CANCEL_DELISTED = -1
+
     async def cancel_tp_sl_orders(self, symbol: str) -> int:
-        """Cancel all active plan (TP/SL trigger) orders for a symbol. Returns count cancelled."""
+        """Cancel all active plan (TP/SL trigger) orders for a symbol.
+        Returns count cancelled, 0 on transient error, -1 if contract delisted."""
         sym = self.futures_symbol(symbol)
         try:
             await self._exchange.load_markets()
@@ -622,6 +632,13 @@ class ExchangeClient:
             await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
             logger.info("cancel_tp_sl_orders %s: CancelAll sent (had %d orders)", symbol, before_count)
         except Exception as e:
+            err_text = str(e).lower()
+            # MEXC возвращает code:1001 + "Contract does not exist" когда фьючерс
+            # делистнут. Любой повтор будет давать ту же ошибку — сигнализируем
+            # вызывающему чтобы он перевёл позицию в closed.
+            if "1001" in err_text or "contract does not exist" in err_text:
+                logger.info("cancel_tp_sl_orders %s: contract delisted (1001)", symbol)
+                return self.CANCEL_DELISTED
             logger.warning("cancel_tp_sl_orders %s: CancelAll failed: %s", symbol, e)
             return 0
 

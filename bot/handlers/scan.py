@@ -6,38 +6,32 @@ from telegram.ext import ContextTypes
 from bot.ai.scanner import scan_overbought, analyze_single_coin, mexc_find_futures_symbol, format_coin_card
 from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks, extract_sentiment,
                              format_usage_footer, DEFAULT_MODEL, FALLBACK_MODEL)
+from bot.handlers import wizard
+from bot.handlers.wizard import Step
 
 logger = logging.getLogger(__name__)
 
 
-async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _run_scan(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int) -> None:
     config = context.bot_data["config"]
     client = context.bot_data["exchange"]
 
-    # Parse optional count: /scan 10
-    args = context.args or []
-    try:
-        n = max(1, min(int(args[0]), 20)) if args else 5
-    except (ValueError, IndexError):
-        n = 5
-
     api_key = config.openrouter_api_key
     if not api_key:
-        await update.message.reply_text(
-            "Нет OpenRouter ключа. Добавь через /setkey openrouter_api_key sk-or-..."
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Нет OpenRouter ключа. Добавь через /setkey openrouter_api_key sk-or-...",
         )
         return
 
-    status = await update.message.reply_text("🧠 Думаю...")
+    status = await context.bot.send_message(chat_id=chat_id, text="🧠 Думаю...")
 
-    # Stage 1: local technical scan (context for AI)
     try:
         local_results, _total = await scan_overbought(client, 65.0, 10.0)
     except Exception as e:
         logger.warning("Local scan failed: %s", e)
         local_results = []
 
-    # Stage 2: AI analyst
     model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
     await status.edit_text(f"🔍 Анализирую через {model}...")
 
@@ -61,7 +55,6 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Stage 3: verify on MEXC + pull live technicals
     await status.edit_text(f"✅ AI выдал {len(picks)} монет. Проверяю MEXC...")
 
     try:
@@ -102,14 +95,16 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not validated:
         summary = ", ".join(f"{t} ({r})" for t, r in skipped[:5])
-        await update.message.reply_text(f"Ничего не прошло проверку MEXC.\nПропущено: {summary}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Ничего не прошло проверку MEXC.\nПропущено: {summary}",
+        )
         return
 
-    # Header
     header = f"*🎯 AI top-{len(validated)} шорт ({ai_result.model})*"
     if skipped:
         header += f"\n_пропущено: {', '.join(t for t, _ in skipped[:5])}_"
-    await update.message.reply_text(header, parse_mode="Markdown")
+    await context.bot.send_message(chat_id=chat_id, text=header, parse_mode="Markdown")
 
     default_bet = float(getattr(config, "default_trade_usdt", 0.20))
 
@@ -118,7 +113,6 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = r.get("direction", "short")
         side_code = "sell" if direction == "short" else "buy"
 
-        # Fetch leverage first — needed for both card and button
         try:
             sym_max = await client.get_max_leverage(sym)
         except Exception:
@@ -141,22 +135,56 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         ]])
         try:
-            await update.message.reply_text(card, parse_mode="Markdown", reply_markup=kb)
+            await context.bot.send_message(chat_id=chat_id, text=card,
+                                           parse_mode="Markdown", reply_markup=kb)
         except Exception:
-            await update.message.reply_text(card, reply_markup=kb)
+            await context.bot.send_message(chat_id=chat_id, text=card, reply_markup=kb)
 
-    # Sentiment + cost footer
     tail = []
     sentiment = extract_sentiment(ai_result.text)
     if sentiment:
         tail.append(f"📝 _{sentiment}_")
     tail.append(format_usage_footer(ai_result))
     try:
-        await update.message.reply_text("\n\n".join(tail), parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text="\n\n".join(tail),
+                                       parse_mode="Markdown")
     except Exception:
-        await update.message.reply_text("\n\n".join(tail))
+        await context.bot.send_message(chat_id=chat_id, text="\n\n".join(tail))
 
     context.bot_data["last_scan"] = validated
+
+
+SCAN_STEPS: list[Step] = [
+    Step(key="count", prompt="Сколько монет искать? (1–20, SKIP = 5)",
+         kind="int:1:20", optional=True),
+]
+
+
+async def _scan_finish(context, chat_id: int, wizard_state: dict) -> None:
+    values = wizard_state.get("values", {}) or {}
+    n = int(values.get("count", 5)) if "count" in values else 5
+    await _run_scan(context, chat_id, n)
+
+
+wizard.register("scan", SCAN_STEPS, _scan_finish)
+
+
+async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if args:
+        try:
+            n = max(1, min(int(args[0]), 20))
+        except ValueError:
+            n = 5
+        await _run_scan(context, update.message.chat_id, n)
+        return
+
+    wizard.start_wizard(context, "scan")
+    await wizard.render_step(context.bot, update.message.chat_id, "scan", 0, context)
+
+
+async def scan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await wizard.handle_callback(update, context, "scan")
 
 
 async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

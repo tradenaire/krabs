@@ -104,6 +104,63 @@ async def mexc_find_futures_symbol(exchange, ticker: str) -> str | None:
     return None
 
 
+async def mexc_suggest_tickers(exchange, ticker: str, n: int = 3) -> list[str]:
+    """Найти N похожих активных USDT-фьючерсов для опечатки/неточного ввода.
+
+    Покрывает 4 случая:
+      1. Полное вхождение ticker внутрь base (FART → FARTCOIN3L) — топ приоритет.
+      2. base начинается с ticker (FART → FARTBOY).
+      3. ticker начинается с base (FARTCOIN → FART) — частая опечатка пользователя.
+      4. Фоллбэк: difflib similarity ≥ 0.6.
+
+    Возвращает список base-тикеров (BTC, FART, ...), не market-symbols.
+    Используется в assistant.py и trading.py для подсказки при не-найденном тикере.
+    """
+    try:
+        await exchange._exchange.load_markets()
+    except Exception:
+        return []
+    ticker_u = ticker.upper().strip()
+    if not ticker_u:
+        return []
+    bases: list[str] = []
+    for sym, m in exchange._exchange.markets.items():
+        if not (m.get("active") and m.get("type") == "swap" and m.get("settle") == "USDT"):
+            continue
+        mid = m.get("id", "")
+        if mid.endswith("_USDT"):
+            bases.append(mid.removesuffix("_USDT"))
+    if not bases:
+        return []
+
+    seen: set[str] = set()
+    out: list[str] = []
+    def _add(b: str) -> None:
+        if b and b not in seen:
+            seen.add(b)
+            out.append(b)
+
+    # Приоритет 1: полное вхождение ticker внутри base или наоборот.
+    for b in bases:
+        if ticker_u in b or b in ticker_u:
+            _add(b)
+        if len(out) >= n:
+            return out[:n]
+    # Приоритет 2: общий префикс ≥ 3 символов (FART vs FARMING).
+    if len(ticker_u) >= 3:
+        prefix = ticker_u[:3]
+        for b in bases:
+            if b.startswith(prefix):
+                _add(b)
+            if len(out) >= n:
+                return out[:n]
+    # Приоритет 3: difflib similarity.
+    import difflib
+    for b in difflib.get_close_matches(ticker_u, bases, n=n, cutoff=0.6):
+        _add(b)
+    return out[:n]
+
+
 def _deep_analyze(symbol: str, ohlcv: list, ticker: dict, daily_change: float,
                   min_score: int = 20) -> dict | None:
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
