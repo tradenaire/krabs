@@ -182,7 +182,11 @@ def build_wizard_kb(prefix: str, step_idx: int, *, optional: bool,
     nav = [InlineKeyboardButton("◀️", callback_data=f"{prefix}_back")]
     if optional:
         nav.append(InlineKeyboardButton("⏭ SKIP", callback_data=f"{prefix}_skip_{step_idx}"))
-    nav.append(InlineKeyboardButton("✖️ EXIT", callback_data=f"{prefix}_cancel"))
+    # ✅ Готово = «применить уже введённое и выйти». Если ничего не изменено —
+    # эквивалентно отмене (см. handle_callback ветка cancel). Имя кнопки выбрано
+    # так, чтобы пользователь не боялся жать её посреди визарда: его ввод не
+    # пропадёт. Старое название '✖️ EXIT' смущало (звучало как «отменить»).
+    nav.append(InlineKeyboardButton("✅ Готово", callback_data=f"{prefix}_cancel"))
     rows.append(nav)
     return InlineKeyboardMarkup(rows)
 
@@ -276,6 +280,36 @@ async def _advance(context: ContextTypes.DEFAULT_TYPE, prefix: str,
         await render_step(context.bot, chat_id, prefix, next_idx, context)
 
 
+async def _exit_wizard(context: ContextTypes.DEFAULT_TYPE, prefix: str,
+                       chat_id: int, reply: Any) -> None:
+    """Apply-if-changed exit: спасает накопленные изменения если пользователь
+    нажал ✅ Готово / написал 'отмена' посреди визарда.
+
+    Поведение:
+      - есть `wizard["changed"]` непустой → call spec.finish (как при дойдe до конца),
+        он применит изменения, отправит сводку и pop'нет state.
+      - changed пуст → обычная отмена, pop state, короткое подтверждение.
+
+    `reply` — callable (text -> awaitable). Используется для вывода «Отменено» в обоих
+    путях вызова (callback edit_message_text vs text reply_text), чтобы код был общий.
+    """
+    wizard = context.user_data.get(_wizard_key(prefix))
+    if wizard is None:
+        return
+    spec = _REGISTRY[prefix]
+    changed = wizard.get("changed") or {}
+    if changed:
+        # Apply path: то же что и при достижении конца визарда.
+        pop_wizard(context, prefix)
+        await spec.finish(context, chat_id, wizard)
+    else:
+        pop_wizard(context, prefix)
+        try:
+            await reply("✖️ Отменено.")
+        except Exception:
+            pass
+
+
 # ── Text router ──────────────────────────────────────────────────
 
 _CANCEL_WORDS = {"отмена", "стоп", "cancel", "выход", "x", "exit", "✖", "✖️"}
@@ -294,8 +328,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     lo = msg.lower()
 
     if lo in _CANCEL_WORDS:
-        pop_wizard(context, prefix)
-        await update.message.reply_text("✖️ Отменено.")
+        # Apply-if-changed: пользователь мог ввести что-то и потом передумать
+        # отвечать на ВСЕ оставшиеся шаги. Если у него есть накопленные изменения —
+        # применяем их, не теряем работу. Если ничего не введено — обычная отмена.
+        await _exit_wizard(context, prefix, update.message.chat_id, update.message.reply_text)
         return True
 
     step_idx = int(wizard.get("step", 0))
@@ -345,11 +381,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if suffix == "cancel":
         await q.answer()
-        pop_wizard(context, prefix)
+        # Тот же механизм apply-if-changed как в text router. Пользователь нажал
+        # ✅ Готово (бывший ✖️ EXIT) — если что-то изменено, применяем; иначе отмена.
+        # edit_message_text используем для обычного «Отменено» (заменяем prompt на
+        # короткое подтверждение). Для apply-ветки spec.finish сам шлёт сообщение
+        # через bot.send_message — кнопочный prompt оставим (или можно убрать
+        # клавиатуру edit_message_reply_markup). Делаем убрать, чтобы пользователь
+        # не путался.
         try:
-            await q.edit_message_text("✖️ Отменено.")
+            await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
+        async def _reply(text, **_):
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        await _exit_wizard(context, prefix, chat_id, _reply)
         return True
 
     wizard = context.user_data.get(_wizard_key(prefix))
