@@ -190,6 +190,47 @@ async def _open_short(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         await context.bot.send_message(chat_id=chat_id, text=funding_warn,
                                        parse_mode="Markdown")
 
+    # Budget check: (margin + avg_budget) * sl_pct/100 = worst-case capital at risk
+    try:
+        free = await client.get_free_futures_balance()
+    except Exception:
+        free = float(context.bot_data.get("_bal_cache", 0.0))
+    avg_amount = float(getattr(config, "averaging_amount", 0.10))
+    avg_budget = float(getattr(config, "averaging_budget", 5.00))
+    profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
+    base_budget = margin + avg_budget
+    full_budget = base_budget if profit_lock_trigger > 0 else base_budget * (sl_pct / 100.0)
+    max_steps = int(avg_budget / avg_amount) if avg_amount > 0 else 0
+    if free < margin:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Недостаточно баланса: `${free:.2f}` < маржа `${margin:.2f}`",
+            parse_mode="Markdown"
+        )
+        return
+    if free < full_budget:
+        positions_possible = int(free / full_budget) if full_budget > 0 else 0
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        margin_milli = int(margin * 1000)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"⚠️ Открыть ({positions_possible} полных поз доступно)",
+                callback_data=f"open_confirm_sell_{margin_milli}_{sym}"
+            )
+        ]])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ *{coin}* SHORT: недостаточный бюджет\n"
+                f"Свободно `${free:.2f}` · нужно `${full_budget:.2f}` на 1 поз\n"
+                f"_(маржа+докупки `${base_budget:.2f}` × SL {sl_pct:.0f}%)_\n"
+                f"Хватит на `{positions_possible}` полных позиций. Открыть всё равно?"
+            ),
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
     await context.bot.send_message(chat_id=chat_id,
                                    text=f"🔻 Открываю SHORT `{coin}` ${margin:g}...",
                                    parse_mode="Markdown")

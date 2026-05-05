@@ -140,19 +140,6 @@ def init_db():
             if col not in existing:
                 conn.execute(f"ALTER TABLE position_history ADD COLUMN {col} {coldef}")
 
-    # Migrate reentry — add profit_locked flag (1 если для symbol сработал
-    # profit-lock SL в averaging_job, и при следующем close мы должны re-enter
-    # независимо от того, как _resolve_close_reason интерпретирует close).
-    # См. set_reentry_profit_locked / Notes/temp-docs/2026-05-02-profit-lock-reentry.md.
-    _re_cols = [
-        ("profit_locked", "INTEGER DEFAULT 0"),
-    ]
-    with _connect() as conn:
-        existing = {r[1] for r in conn.execute("PRAGMA table_info(reentry)").fetchall()}
-        for col, coldef in _re_cols:
-            if col not in existing:
-                conn.execute(f"ALTER TABLE reentry ADD COLUMN {col} {coldef}")
-
 
 def get_all_config() -> dict[str, str]:
     with _connect() as conn:
@@ -276,27 +263,24 @@ def delete_reentry(symbol: str):
         conn.execute("DELETE FROM reentry WHERE symbol=?", (symbol,))
 
 
+def set_reentry_profit_locked(symbol: str, locked: bool):
+    with _connect() as conn:
+        try:
+            conn.execute(
+                "ALTER TABLE reentry ADD COLUMN profit_locked INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
+        conn.execute(
+            "UPDATE reentry SET profit_locked=? WHERE symbol=?",
+            (1 if locked else 0, symbol)
+        )
+
+
 def get_all_reentry() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute("SELECT * FROM reentry").fetchall()
     return [dict(r) for r in rows]
-
-
-def set_reentry_profit_locked(symbol: str, value: bool) -> None:
-    """Установить флаг profit_locked для symbol (1=True, 0=False).
-
-    Идемпотентна: повторный вызов с тем же значением — no-op эффект.
-    Если для symbol нет записи в reentry — UPDATE затрагивает 0 строк (no-op).
-    Используется:
-      - averaging_job: после успешного set_tp_sl для перемещения SL в профит-зону → True
-      - averaging_job: после докупки если новый SL вне профит-зоны → False (важно!)
-      - reentry_job: после успешного re-entry → False (новый цикл с чистым флагом)
-    """
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE reentry SET profit_locked=? WHERE symbol=?",
-            (1 if value else 0, symbol),
-        )
 
 
 def dedupe_open_positions():
@@ -580,3 +564,21 @@ def get_paper_stats() -> dict:
         elif a == "avg":
             stats["avg_count"] = r["cnt"]
     return stats
+
+
+# ── min_order_cache ───────────────────────────────────────────────
+
+def get_min_order_cache() -> dict:
+    """Load persisted MEXC minimum notional cache {symbol: min_usdt_notional}."""
+    raw = get_config("_min_order_cache_json", "{}")
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def set_min_order_notional(symbol: str, min_notional: float):
+    """Persist minimum USDT notional for symbol (survives restarts)."""
+    cache = get_min_order_cache()
+    cache[symbol] = min_notional
+    set_config("_min_order_cache_json", json.dumps(cache))

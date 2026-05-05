@@ -406,15 +406,14 @@ async def averaging_job(app):
         old_contracts = int(round(float(pos.get("contracts", 0) or 0)))
         old_pnl_usd = float(pos.get("unrealized_pnl", 0) or 0)
 
-        # Check minimum contract cost — use it if larger than configured amount
-        try:
-            min_cost = await client.get_min_order_usdt(symbol, avg_lev)
-        except Exception:
-            min_cost = 0.0
-        actual_amount = max(amount, min_cost) if min_cost > 0 else amount
-        if min_cost > amount:
-            logger.info("Avg %s: min contract $%.2f > amount $%.2f, using min",
-                        symbol, min_cost, amount)
+        _min_order_cache: dict = app.bot_data.setdefault("_min_order_cache", {})
+        cached_min_notional = _min_order_cache.get(symbol, 0)
+        if cached_min_notional > 0 and amount * max(avg_lev, 1) <= cached_min_notional:
+            actual_amount = cached_min_notional / max(avg_lev, 1) * 1.05
+            logger.info("Avg %s: upgrading amount $%.2f -> $%.2f (min notional $%.0f)",
+                        symbol, amount, actual_amount, cached_min_notional)
+        else:
+            actual_amount = amount
 
         if free_balance < actual_amount:
             coin = symbol.split("/")[0]
@@ -436,17 +435,38 @@ async def averaging_job(app):
                                                                 margin_mode=avg_mm)
             except Exception as e:
                 err_msg = str(e).lower()
-                logger.error("Averaging order FAILED for %s: %s", symbol, e)
+                raw_err = str(e)
+                # Reset timestamp so next run can retry (we did not place an order)
+                _avg_ts.pop(symbol, None)
                 # Position limit hit — mute this symbol until position closes
                 _POS_LIMIT_KEYWORDS = ("exceed", "position size", "max position",
                                        "position limit", "risk limit", "too large")
+                _MIN_ORDER_KEYWORDS = ("minimum order amount", "min order", "7008", "less than the minimum")
                 if any(kw in err_msg for kw in _POS_LIMIT_KEYWORDS):
                     notified_exhausted.add(symbol)
                     coin = symbol.split("/")[0]
+                    logger.error("Averaging order FAILED for %s: %s", symbol, e)
                     await _notify_all(app,
                         f"🚫 *Докупки закончились* `{coin}`\n"
                         f"Биржа отклонила: лимит позиции достигнут\n"
                         f"Позиция закроется по TP, SL или вручную `/close {coin}`")
+                elif any(kw in err_msg for kw in _MIN_ORDER_KEYWORDS):
+                    import re as _re
+                    m = _re.search(r'(?i)"value"\s*:\s*(\d+(?:\.\d+)?)', raw_err)
+                    min_usdt_notional = float(m.group(1)) if m else 5.0
+                    # Cache so next cycle uses correct margin automatically
+                    _min_order_cache[symbol] = min_usdt_notional
+                    try:
+                        from bot import db as _db_c
+                        _db_c.set_min_order_notional(symbol, min_usdt_notional)
+                    except Exception:
+                        pass
+                    min_margin = min_usdt_notional / max(avg_lev, 1) * 1.05
+                    coin = symbol.split("/")[0]
+                    logger.info("Avg %s: cached min notional $%.1f -> next avg $%.3f (auto-upgrade)",
+                                symbol, min_usdt_notional, min_margin)
+                else:
+                    logger.error("Averaging order FAILED for %s: %s", symbol, e)
                 continue
 
         new_total = total_invested + actual_amount
@@ -866,6 +886,35 @@ async def balance_alert_job(app):
             app.bot_data["_bal_alert_sent"] = True
         elif pct > 20.0 and was_alerted:
             app.bot_data["_bal_alert_sent"] = False  # сбросить при восстановлении
+
+        # Alert when free balance can't cover averaging budgets for all open positions
+        try:
+            from bot import db as db_mod
+            n_pos = len(db_mod.get_open_positions())
+            if n_pos > 0:
+                config = app.bot_data.get("config")
+                _avg_amount = float(getattr(config, "averaging_amount", 0.10)) if config else 0.10
+                _max_cnt = int(getattr(config, "max_averaging_count", 100)) if config else 100
+                _sl_pct = float(getattr(config, "sl_pct", 500)) if config else 500.0
+                _profit_lock = float(getattr(config, "averaging_profit_lock_trigger", 0)) if config else 0
+                avg_budget_eff = _max_cnt * _avg_amount
+                _sl_mult = 1.0 if _profit_lock > 0 else (_sl_pct / 100.0)
+                risk_per_pos = avg_budget_eff * _sl_mult
+                total_needed = n_pos * risk_per_pos
+                _margin_alert_ts = app.bot_data.get("_margin_alert_ts", 0)
+                if free < total_needed and time.time() - _margin_alert_ts >= 120:
+                    can_for = int(free / risk_per_pos) if risk_per_pos > 0 else 0
+                    _sl_label = "profit-lock" if _profit_lock > 0 else f"SL {_sl_pct:.0f}%"
+                    await _notify_all(app,
+                        f"🚨 *Не хватает маржи для докупок!*\n"
+                        f"Позиций: `{n_pos}` · нужно `${total_needed:.2f}` "
+                        f"(по `${risk_per_pos:.2f}` на каждую, {_max_cnt}×${_avg_amount:.2f} × {_sl_label})\n"
+                        f"Свободно `${free:.2f}` — хватит на `{can_for}` из `{n_pos}` поз\n"
+                        f"Пополни баланс или закрой часть позиций")
+                    app.bot_data["_margin_alert_ts"] = time.time()
+        except Exception as _me:
+            logger.debug("balance_alert_job margin check: %s", _me)
+
     except Exception as e:
         logger.debug("balance_alert_job: %s", e)
 
@@ -1072,17 +1121,33 @@ async def auto_scan_job(app):
     scan_risk_pct = float(getattr(config, "auto_scan_capital_pct", 0.0))
     profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
     base_budget = max_avg_count * avg_amount + margin
-    # Multiply by SL factor unless profit-lock SL is set (position won't reach full loss)
-    if profit_lock_trigger > 0:
-        full_budget = base_budget
-    else:
-        full_budget = base_budget * (sl_pct / 100.0)
+    full_budget = base_budget * (sl_pct / 100.0)
     min_balance = full_budget * (1.0 - scan_risk_pct / 100.0)
 
     try:
         free_balance = await client.get_free_futures_balance()
     except Exception:
         free_balance = 0.0
+
+    # Compute actual remaining risk for existing open positions (mirrors balance.py logic)
+    _existing_risk = 0.0
+    try:
+        from bot import db as _db_scan
+        _min_cache_scan = app.bot_data.get("_min_order_cache", {})
+        for _ep in positions:
+            _esym = _ep.get("symbol", "")
+            _elev = int(_ep.get("leverage") or 1)
+            _erec = _db_scan.get_open_position(_esym)
+            _einv = float((_erec or {}).get("total_invested") or margin)
+            _ecnt = int((_erec or {}).get("averaging_count") or 0)
+            _erem = max(0, max_avg_count - _ecnt)
+            _enotional = _min_cache_scan.get(_esym, 0)
+            _eeff = (max(avg_amount, _enotional / max(_elev, 1) * 1.05)
+                     if _enotional > 0 else avg_amount)
+            _existing_risk += (_einv + _erem * _eeff) * (sl_pct / 100.0)
+    except Exception:
+        _existing_risk = 0.0
+    _opened_risk = 0.0  # accumulates risk of positions opened in this scan run
 
     from bot.handlers.trading import execute_open
     opened = 0
@@ -1112,14 +1177,52 @@ async def auto_scan_job(app):
             sym_max = 100
         leverage = min(user_lev, sym_max) if user_lev > 0 else sym_max
 
-        # Capital check: total balance must cover full_budget for ALL positions (existing + new)
-        current_open = initial_open_count + opened
-        total_available = free_balance + current_open * margin
-        min_total = full_budget * (current_open + 1) * (1.0 - scan_risk_pct / 100.0)
-        if min_total > 0 and total_available < min_total:
+        # Pre-fetch live min notional from MEXC (populate cache before skip/budget checks)
+        try:
+            _live_min = await client.get_min_order_usdt(fut_sym, leverage)
+            if _live_min > 0:
+                _live_notional = _live_min * max(leverage, 1)
+                _ao_cache = app.bot_data.setdefault("_min_order_cache", {})
+                if _live_notional > _ao_cache.get(fut_sym, 0):
+                    _ao_cache[fut_sym] = _live_notional
+                    try:
+                        from bot import db as _db_ao
+                        _db_ao.set_min_order_notional(fut_sym, _live_notional)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Per-symbol effective avg amount and budget
+        _ao_notional = app.bot_data.get("_min_order_cache", {}).get(fut_sym, 0)
+        _ao_eff_avg = (max(avg_amount, _ao_notional / max(leverage, 1) * 1.05)
+                       if _ao_notional > 0 else avg_amount)
+        _sym_base = max_avg_count * _ao_eff_avg + margin
+        _sym_full = _sym_base * (sl_pct / 100.0)
+
+        # Capital check: free balance must cover existing risk + new position full risk
+        _total_risk = _existing_risk + _opened_risk + _sym_full
+        _needed = _total_risk * (1.0 - scan_risk_pct / 100.0)
+        if _needed > 0 and free_balance < _needed:
             skipped.append(f"{ticker}(мало депа)")
-            logger.info("AutoScan: skip %s — total $%.2f < required $%.2f (%d poз × $%.2f, risk=%d%%)",
-                        ticker, total_available, min_total, current_open + 1, full_budget, int(scan_risk_pct))
+            _surplus = free_balance - _existing_risk - _opened_risk
+            logger.info("AutoScan: skip %s — surplus $%.2f < needed $%.2f (existing $%.2f, new $%.2f, risk=%d%%)",
+                        ticker, _surplus, _sym_full, _existing_risk + _opened_risk, _sym_full, int(scan_risk_pct))
+            continue
+
+        # Skip only if averaging is fundamentally impossible:
+        # avg_amount * leverage must cover the MEXC minimum notional.
+        # The 5% buffer is applied at order-placement time, not here.
+        _cached_min_notional = app.bot_data.get("_min_order_cache", {}).get(fut_sym, 0)
+        if _cached_min_notional > 0 and avg_amount * max(leverage, 1) < _cached_min_notional:
+            _min_avg_margin = _cached_min_notional / max(leverage, 1) * 1.05
+            skipped.append(f"{ticker}(мин докупка ${_min_avg_margin:.2f})")
+            logger.info("AutoScan: skip %s — avg $%.2f x %d = $%.2f < min notional $%.1f",
+                        ticker, avg_amount, leverage, avg_amount * leverage, _cached_min_notional)
+            await _notify_all(app,
+                f"🚫 *AutoScan* `{ticker}` — открытие пропущено\n"
+                f"Мин. ордер MEXC `${_cached_min_notional:.0f}` при ×{leverage}: нужна маржа `${_min_avg_margin:.2f}`\n"
+                f"Настройка `averaging_amount=${avg_amount:.2f}` недостаточна")
             continue
 
         try:
@@ -1145,6 +1248,7 @@ async def auto_scan_job(app):
         open_coins.add(ticker)
         opened_names.append(coin)
         opened += 1
+        _opened_risk += _sym_full
 
     # Summary
     summary_lines = [f"🤖 *AutoScan* {now_str}"]

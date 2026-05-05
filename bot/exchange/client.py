@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import logging
+import math
 import time
 import uuid
 import aiohttp
@@ -300,7 +301,7 @@ class ExchangeClient:
             leverage = max_lev
 
         amount_base = (amount_usdt * leverage) / price
-        contracts = max(1, round(amount_base / contract_size))
+        contracts = max(1, math.ceil(amount_base / contract_size))
 
         logger.info("Futures order: %s %s contracts=%d lev=%dx margin=$%.2f",
                     side.upper(), sym, contracts, leverage, amount_usdt)
@@ -665,15 +666,25 @@ class ExchangeClient:
             return 100
 
     async def get_min_order_usdt(self, symbol: str, leverage: int) -> float:
-        """Return actual USDT margin for 1 contract at given leverage."""
+        """Return minimum USDT margin needed for an order at given leverage.
+
+        Uses exchange minimum notional (limits.cost.min) when available,
+        which is what MEXC actually enforces (e.g. 5 USDT for DASH).
+        Falls back to 1-contract margin calculation.
+        """
         sym = self.futures_symbol(symbol)
         try:
             await self._exchange.load_markets()
             market = self._exchange.market(sym)
+            # MEXC enforces minimum notional (position value), not margin
+            min_notional = float((market.get("limits") or {}).get("cost", {}).get("min", 0) or 0)
+            if min_notional > 0:
+                return min_notional / max(leverage, 1)
+            # Fallback: margin for 1 contract
             contract_size = float(market.get("contractSize", 0.0001))
             ticker = await self.get_ticker(sym)
             price = float(ticker["last"])
-            return contract_size * price / leverage
+            return contract_size * price / max(leverage, 1)
         except Exception:
             return 0.0
 

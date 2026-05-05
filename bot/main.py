@@ -12,7 +12,8 @@ from bot.handlers import wizard as wizard_mod
 from bot import db as db_mod
 from bot.config import Config
 from bot.exchange.client import ExchangeClient
-from bot.handlers.scan import scan_handler, open_callback
+from bot.handlers.scan import (scan_handler, open_callback, open_confirm_callback,
+                               open_anyway_callback, scan_avg_callback, avg_force_callback)
 from bot.handlers.balance import balance_handler, balance_callback
 from bot.handlers.positions import positions_handler, positions_callback
 from bot.handlers.trading import (short_handler, close_handler, avg_handler, setkey_handler,
@@ -89,6 +90,8 @@ def main():
             for p in db_mod.get_open_positions()
         }
         application.bot_data["tp_sl_pcts"] = tp_sl_pcts
+        # Restore min_order_cache from DB (persisted MEXC minimum notionals)
+        application.bot_data["_min_order_cache"] = db_mod.get_min_order_cache()
         setup_scheduler(application)
 
         # Deduplicate + sync DB with exchange on startup
@@ -180,6 +183,10 @@ def main():
     for _p in ("short", "close", "scan", "setbet", "setstop", "settp", "setkey"):
         app.add_handler(CallbackQueryHandler(_wiz_cb(_p), pattern=fr"^{_p}_"))
 
+    app.add_handler(CallbackQueryHandler(open_confirm_callback, pattern=r"^open_confirm_"))
+    app.add_handler(CallbackQueryHandler(open_anyway_callback, pattern=r"^open_anyway_"))
+    app.add_handler(CallbackQueryHandler(scan_avg_callback, pattern=r"^scan_avg_"))
+    app.add_handler(CallbackQueryHandler(avg_force_callback, pattern=r"^avg_force_"))
     app.add_handler(CallbackQueryHandler(open_callback, pattern=r"^open_"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^balance_"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^bal_close_"))
