@@ -409,7 +409,9 @@ async def averaging_job(app):
         _min_order_cache: dict = app.bot_data.setdefault("_min_order_cache", {})
         cached_min_notional = _min_order_cache.get(symbol, 0)
         if cached_min_notional > 0 and amount * max(avg_lev, 1) <= cached_min_notional:
-            actual_amount = cached_min_notional / max(avg_lev, 1) * 1.05
+            actual_amount = await client.get_min_order_usdt(
+                symbol, avg_lev, min_notional=cached_min_notional
+            ) or (cached_min_notional / max(avg_lev, 1) * 1.05)
             logger.info("Avg %s: upgrading amount $%.2f -> $%.2f (min notional $%.0f)",
                         symbol, amount, actual_amount, cached_min_notional)
         else:
@@ -450,6 +452,7 @@ async def averaging_job(app):
                         f"🚫 *Докупки закончились* `{coin}`\n"
                         f"Биржа отклонила: лимит позиции достигнут\n"
                         f"Позиция закроется по TP, SL или вручную `/close {coin}`")
+                    continue
                 elif any(kw in err_msg for kw in _MIN_ORDER_KEYWORDS):
                     import re as _re
                     m = _re.search(r'(?i)"value"\s*:\s*(\d+(?:\.\d+)?)', raw_err)
@@ -461,15 +464,34 @@ async def averaging_job(app):
                         _db_c.set_min_order_notional(symbol, min_usdt_notional)
                     except Exception:
                         pass
-                    min_margin = min_usdt_notional / max(avg_lev, 1) * 1.05
+                    min_margin = await client.get_min_order_usdt(
+                        symbol, avg_lev, min_notional=min_usdt_notional
+                    ) or (min_usdt_notional / max(avg_lev, 1) * 1.05)
                     coin = symbol.split("/")[0]
                     logger.info("Avg %s: cached min notional $%.1f -> next avg $%.3f (auto-upgrade)",
                                 symbol, min_usdt_notional, min_margin)
+                    if min_margin > actual_amount and free_balance >= min_margin:
+                        try:
+                            order_result = await client.place_futures_order(
+                                symbol, avg_side, min_margin, avg_lev, margin_mode=avg_mm
+                            )
+                            actual_amount = min_margin
+                            logger.info("Avg %s: retry succeeded at MEXC min margin $%.3f",
+                                        symbol, actual_amount)
+                        except Exception as retry_e:
+                            logger.error("Averaging retry FAILED for %s at $%.3f: %s",
+                                         symbol, min_margin, retry_e)
+                            continue
+                    else:
+                        continue
                 else:
                     logger.error("Averaging order FAILED for %s: %s", symbol, e)
-                continue
+                    continue
 
         new_total = total_invested + actual_amount
+        if order_result and order_result.get("margin"):
+            actual_amount = max(actual_amount, float(order_result["margin"]))
+            new_total = total_invested + actual_amount
         new_count = avg_count + 1
         free_balance -= actual_amount
 

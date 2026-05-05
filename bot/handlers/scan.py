@@ -22,8 +22,21 @@ def _get_min_notional(symbol: str, bot_data: dict) -> float:
 
 
 def _get_min_avg_margin(symbol: str, leverage: int, bot_data: dict) -> float:
-    """Actual margin to use for averaging (with 5% buffer for contract rounding)."""
+    """Fallback min averaging margin when live market metadata is unavailable."""
     return _get_min_notional(symbol, bot_data) / max(leverage, 1) * 1.05
+
+
+async def _get_live_min_avg_margin(client, symbol: str, leverage: int, bot_data: dict) -> float:
+    """Contract-rounded MEXC min margin, falling back to cached notional math."""
+    fallback = _get_min_avg_margin(symbol, leverage, bot_data)
+    cached_notional = bot_data.get("_min_order_cache", {}).get(symbol)
+    try:
+        live = await client.get_min_order_usdt(
+            symbol, leverage, min_notional=cached_notional
+        )
+        return live or fallback
+    except Exception:
+        return fallback
 
 
 def _can_avg_at_configured(symbol: str, leverage: int, averaging_amount: float, bot_data: dict) -> bool:
@@ -128,6 +141,11 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing_picks: list[tuple[str, dict]] = []  # (fut_sym, pick) for already-open coins
     skipped: list[tuple[str, str]] = []
     seen: set[str] = set()
+    local_by_coin = {
+        str(r.get("symbol", "")).split("/")[0].upper(): r
+        for r in local_results
+        if r.get("symbol")
+    }
 
     for pick in picks:
         ticker = pick["ticker"].upper()
@@ -135,7 +153,8 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         seen.add(ticker)
 
-        fut_sym = await mexc_find_futures_symbol(client, ticker)
+        local_tech = local_by_coin.get(ticker)
+        fut_sym = local_tech.get("symbol") if local_tech else await mexc_find_futures_symbol(client, ticker)
         if not fut_sym:
             skipped.append((ticker, "нет на MEXC"))
             continue
@@ -145,7 +164,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             existing_picks.append((fut_sym, pick))
             continue
 
-        tech = await analyze_single_coin(client, fut_sym)
+        tech = dict(local_tech) if local_tech else await analyze_single_coin(client, fut_sym)
         if not tech:
             skipped.append((ticker, "нет OHLCV"))
             continue
@@ -186,9 +205,9 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_lev = int(getattr(config, "default_leverage", 0) or 0)
         lev_eff = min(user_lev, sym_max) if user_lev > 0 else sym_max
         tech["_lev_eff"] = lev_eff
-        min_avg = _get_min_avg_margin(sym, lev_eff, context.bot_data)
+        min_avg = await _get_live_min_avg_margin(client, sym, lev_eff, context.bot_data)
         tech["_min_avg"] = min_avg
-        tech["_avg_ok"] = _can_avg_at_configured(sym, lev_eff, averaging_amount, context.bot_data)
+        tech["_avg_ok"] = averaging_amount + 0.001 >= min_avg
 
     # Sort: OK averaging first, risky (impossible to avg at configured amount) last
     validated.sort(key=lambda t: (0 if t["_avg_ok"] else 1))
@@ -270,7 +289,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 avg_count = db_rec.get("averaging_count", 0)
             max_count = int(getattr(config, "max_averaging_count", 100))
 
-            min_avg = _get_min_avg_margin(fut_sym, lev, context.bot_data)
+            min_avg = await _get_live_min_avg_margin(client, fut_sym, lev, context.bot_data)
             step = max(averaging_amount, min_avg)
             step_note = f" (мин MEXC)" if min_avg > averaging_amount else ""
 
@@ -349,22 +368,7 @@ async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         free = float(context.bot_data.get("_bal_cache", 0.0))
     _cfg_avg = float(getattr(config, "averaging_amount", 0.10))
     _lev_for_chk = int(getattr(config, "default_leverage", 10) or 10)
-    # Pre-fetch live min notional from MEXC so cache is accurate before first order
-    try:
-        _live_min_margin = await client.get_min_order_usdt(symbol, _lev_for_chk)
-        if _live_min_margin > 0:
-            _live_notional = _live_min_margin * max(_lev_for_chk, 1)
-            _cache = context.bot_data.setdefault("_min_order_cache", {})
-            if _live_notional > _cache.get(symbol, 0):
-                _cache[symbol] = _live_notional
-                try:
-                    from bot import db as db_mod
-                    db_mod.set_min_order_notional(symbol, _live_notional)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    _min_avg_open = _get_min_avg_margin(symbol, _lev_for_chk, context.bot_data)
+    _min_avg_open = await _get_live_min_avg_margin(client, symbol, _lev_for_chk, context.bot_data)
     _eff_avg = max(_cfg_avg, _min_avg_open)
     budget = _check_budget(free, margin, config, eff_avg_amount=_eff_avg)
 
@@ -480,19 +484,8 @@ async def open_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         sym_max = 100
     leverage = min(user_lev, sym_max) if user_lev > 0 else sym_max
 
-    # Cache the minimum so averaging_job uses correct amount from first attempt
-    min_avg = _get_min_avg_margin(symbol, leverage, context.bot_data)
-    # The min notional to cache (reverse from margin)
-    min_notional = min_avg * max(leverage, 1) / 1.05
-    cache = context.bot_data.setdefault("_min_order_cache", {})
-    cache[symbol] = min_notional
-    try:
-        from bot import db as db_mod
-        db_mod.set_min_order_notional(symbol, min_notional)
-    except Exception:
-        pass
-    logger.info("open_anyway: cached min notional $%.1f for %s (avg will use $%.3f)",
-                min_notional, symbol, min_avg)
+    min_avg = await _get_live_min_avg_margin(client, symbol, leverage, context.bot_data)
+    logger.info("open_anyway: %s avg will use MEXC min margin $%.3f", symbol, min_avg)
 
     coin = symbol.split("/")[0]
     side_ru = "SHORT" if side == "sell" else "LONG"
@@ -549,7 +542,7 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     avg_side = "sell" if side == "short" else "buy"
     margin_mode = pos.get("margin_mode")
 
-    min_avg = _get_min_avg_margin(symbol, lev, context.bot_data)
+    min_avg = await _get_live_min_avg_margin(client, symbol, lev, context.bot_data)
     step = max(averaging_amount, min_avg)
 
     # Check free balance
@@ -569,7 +562,8 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(f"⏳ Докупаю `{coin}` +`${step:.2f}`...", parse_mode="Markdown")
 
     try:
-        await client.place_futures_order(symbol, avg_side, step, lev, margin_mode=margin_mode)
+        order_result = await client.place_futures_order(symbol, avg_side, step, lev, margin_mode=margin_mode)
+        step = max(step, float(order_result.get("margin") or 0))
     except Exception as e:
         await q.message.reply_text(f"❌ Ошибка докупки {coin}: {e}")
         return
@@ -628,7 +622,7 @@ async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     avg_side = "sell" if side == "short" else "buy"
     margin_mode = pos.get("margin_mode")
 
-    min_avg = _get_min_avg_margin(symbol, lev, context.bot_data)
+    min_avg = await _get_live_min_avg_margin(client, symbol, lev, context.bot_data)
 
     await q.message.reply_text(
         f"⏳ Принудительная докупка `{coin}` +`${min_avg:.2f}` (мин MEXC)...",
@@ -636,7 +630,8 @@ async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     try:
-        await client.place_futures_order(symbol, avg_side, min_avg, lev, margin_mode=margin_mode)
+        order_result = await client.place_futures_order(symbol, avg_side, min_avg, lev, margin_mode=margin_mode)
+        min_avg = max(min_avg, float(order_result.get("margin") or 0))
     except Exception as e:
         await q.message.reply_text(f"❌ Ошибка докупки {coin}: {e}")
         return

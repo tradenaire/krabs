@@ -4,6 +4,7 @@ Scan is used as decision support for real futures trades, so LLM output is
 never enough by itself. The helpers below keep the MEXC-derived trend/MSB/risk
 facts next to each candidate and let the Telegram handler block weak picks.
 """
+import asyncio
 import logging
 import pandas as pd
 import pandas_ta as ta
@@ -106,10 +107,6 @@ def _risk_score(analysis: dict) -> int:
     elif funding > 0.0003:
         score -= 1
 
-    if not analysis.get("trend_change_short"):
-        score += 1
-    if not analysis.get("msb_short"):
-        score += 1
     if analysis.get("ema_trend") == "бычий":
         score += 1
     if float(analysis.get("vol_spike", 1) or 1) > 3:
@@ -125,10 +122,6 @@ def validate_short_pick(analysis: dict | None) -> tuple[str, list[str]]:
     reasons: list[str] = []
     if analysis.get("direction") != "short":
         reasons.append("локальный сигнал не SHORT")
-    if not analysis.get("trend_change_short"):
-        reasons.append("смена тренда вниз не подтверждена")
-    if not analysis.get("msb_short"):
-        reasons.append("bearish MSB не подтверждён")
     if int(analysis.get("risk_score", 10) or 10) > 7:
         reasons.append(f"risk {analysis.get('risk_score')}/10 выше лимита")
     if float(analysis.get("price", 0) or 0) <= 0:
@@ -138,10 +131,11 @@ def validate_short_pick(analysis: dict | None) -> tuple[str, list[str]]:
     return "VALIDATED", []
 
 
-async def _enrich_multi_timeframe(exchange, symbol: str, analysis: dict) -> dict:
+async def _enrich_multi_timeframe(exchange, symbol: str, analysis: dict,
+                                  one_h_ohlcv: list | None = None) -> dict:
     """Attach 4h/1d MEXC facts to a candidate without trusting LLM claims."""
-    timeframes = {"1h": None, "4h": None, "1d": None}
-    for tf in timeframes:
+    timeframes = {"1h": _ohlcv_df(one_h_ohlcv) if one_h_ohlcv else None, "4h": None, "1d": None}
+    for tf in ("4h", "1d"):
         try:
             ohlcv = await exchange._exchange.fetch_ohlcv(symbol, tf, limit=100)
             timeframes[tf] = _ohlcv_df(ohlcv)
@@ -173,6 +167,13 @@ async def _enrich_multi_timeframe(exchange, symbol: str, analysis: dict) -> dict
     analysis["timeframes"] = tf_summary
     analysis["trend_change_short"] = trend_votes >= 1
     analysis["msb_short"] = msb_votes >= 1
+    confirmation_bonus = 0
+    if analysis["trend_change_short"]:
+        confirmation_bonus += 8
+    if analysis["msb_short"]:
+        confirmation_bonus += 8
+    analysis["confirmation_bonus"] = confirmation_bonus
+    analysis["score"] = int(analysis.get("score", 0) or 0) + confirmation_bonus
     analysis["risk_score"] = _risk_score(analysis)
     status, errors = validate_short_pick(analysis)
     analysis["validation_status"] = status
@@ -182,7 +183,7 @@ async def _enrich_multi_timeframe(exchange, symbol: str, analysis: dict) -> dict
 
 async def scan_overbought(exchange, rsi_threshold: float = 65.0,
                           daily_change_threshold: float = 10.0,
-                          max_symbols: int = 80) -> tuple[list[dict], int]:
+                          max_symbols: int = 40) -> tuple[list[dict], int]:
     await exchange._exchange.load_markets()
 
     tradeable_symbols: set[str] = set()
@@ -214,36 +215,41 @@ async def scan_overbought(exchange, rsi_threshold: float = 65.0,
     candidates = [
         (sym, ticker, float(ticker.get("percentage", 0) or 0))
         for sym, ticker in all_tickers.items()
-        if abs(float(ticker.get("percentage", 0) or 0)) >= daily_change_threshold
+        if float(ticker.get("percentage", 0) or 0) >= daily_change_threshold
         and float(ticker.get("quoteVolume", 0) or 0) >= 10_000_000
     ]
-    candidates.sort(key=lambda x: abs(x[2]), reverse=True)
+    candidates.sort(key=lambda x: x[2], reverse=True)
     candidates = candidates[:max_symbols]
 
-    results = []
-    for sym, ticker, daily_change in candidates:
-        try:
-            ohlcv = await exchange._exchange.fetch_ohlcv(sym, "1h", limit=100)
-            if not ohlcv or len(ohlcv) < 30:
-                continue
-        except Exception:
-            continue
-        analysis = _deep_analyze(sym, ohlcv, ticker, daily_change)
-        if analysis:
-            results.append(analysis)
+    sem = asyncio.Semaphore(5)
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    async def _analyze_candidate(sym: str, ticker: dict, daily_change: float) -> tuple[dict, list] | None:
+        try:
+            async with sem:
+                ohlcv = await exchange._exchange.fetch_ohlcv(sym, "1h", limit=100)
+            if not ohlcv or len(ohlcv) < 30:
+                return None
+        except Exception:
+            return None
+        analysis = _deep_analyze(sym, ohlcv, ticker, daily_change)
+        if not analysis or analysis.get("direction") != "short":
+            return None
+        return analysis, ohlcv
+
+    analyzed = await asyncio.gather(*(_analyze_candidate(*c) for c in candidates))
+    results = [item for item in analyzed if item]
+
+    results.sort(key=lambda x: x[0]["score"], reverse=True)
 
     verified = []
-    for r in results:
+    for r, one_h_ohlcv in results:
         if len(verified) >= 10:
             break
         try:
             ob = await exchange._exchange.fetch_order_book(r["symbol"], limit=5)
             if ob.get("bids") and ob.get("asks"):
-                enriched = await _enrich_multi_timeframe(exchange, r["symbol"], r)
-                if enriched.get("direction") == "short":
-                    verified.append(enriched)
+                enriched = await _enrich_multi_timeframe(exchange, r["symbol"], r, one_h_ohlcv)
+                verified.append(enriched)
         except Exception:
             pass
 
@@ -263,7 +269,7 @@ async def analyze_single_coin(exchange, symbol: str) -> dict | None:
     analysis = _deep_analyze(symbol, ohlcv, ticker, daily_change, min_score=0)
     if not analysis:
         return None
-    return await _enrich_multi_timeframe(exchange, symbol, analysis)
+    return await _enrich_multi_timeframe(exchange, symbol, analysis, ohlcv)
 
 
 async def mexc_find_futures_symbol(exchange, ticker: str) -> str | None:
@@ -514,6 +520,7 @@ def format_coin_card(r: dict, index: int, ai_note: str = "",
         smart_line = "\n   🧠 MEXC: " + " | ".join(tf_bits[:3])
     gate_line = (
         f"\n   ✅ Gate: `{r.get('validation_status', 'UNKNOWN')}` · "
+        f"trend `{bool(r.get('trend_change_short'))}` · "
         f"MSB `{bool(r.get('msb_short'))}` · риск `{r.get('risk_score', '?')}/10`"
     )
     return (
