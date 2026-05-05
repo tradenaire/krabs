@@ -37,6 +37,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# python-telegram-bot uses httpx; INFO logs include full Telegram API URLs with
+# the bot token in the path. Keep HTTP client logs out of production bot.log.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 async def start_handler(update: Update, context):
     await update.message.reply_text(
@@ -180,7 +185,9 @@ def main():
             await wizard_mod.handle_callback(update, context, prefix)
         return handler
 
-    for _p in ("short", "close", "scan", "setbet", "setstop", "settp", "setkey"):
+    # /scan no longer uses wizard callbacks; keeping ^scan_ here intercepts
+    # scan_avg_* buttons before scan_avg_callback can handle them.
+    for _p in ("short", "close", "setbet", "setstop", "settp", "setkey"):
         app.add_handler(CallbackQueryHandler(_wiz_cb(_p), pattern=fr"^{_p}_"))
 
     app.add_handler(CallbackQueryHandler(open_confirm_callback, pattern=r"^open_confirm_"))

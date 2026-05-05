@@ -1,9 +1,183 @@
-"""Technical coin scanner — RSI, MACD, BB, Stoch, EMA, volume."""
+"""Technical coin scanner — RSI, MACD, BB, Stoch, EMA, volume.
+
+Scan is used as decision support for real futures trades, so LLM output is
+never enough by itself. The helpers below keep the MEXC-derived trend/MSB/risk
+facts next to each candidate and let the Telegram handler block weak picks.
+"""
 import logging
 import pandas as pd
 import pandas_ta as ta
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        v = float(value)
+        if pd.isna(v):
+            return default
+        return v
+    except (TypeError, ValueError):
+        return default
+
+
+def _rsi_last(df: pd.DataFrame) -> float | None:
+    rsi = ta.rsi(df["close"], length=14)
+    if rsi is None or rsi.empty or pd.isna(rsi.iloc[-1]):
+        return None
+    return float(rsi.iloc[-1])
+
+
+def _ema_trend(df: pd.DataFrame) -> str:
+    ema20 = ta.ema(df["close"], length=20)
+    ema50 = ta.ema(df["close"], length=50)
+    if ema20 is None or ema50 is None or ema20.empty or ema50.empty:
+        return "UNKNOWN"
+    if pd.isna(ema20.iloc[-1]) or pd.isna(ema50.iloc[-1]):
+        return "UNKNOWN"
+    return "BEARISH" if float(ema20.iloc[-1]) < float(ema50.iloc[-1]) else "BULLISH"
+
+
+def _ohlcv_df(ohlcv: list) -> pd.DataFrame | None:
+    if not ohlcv or len(ohlcv) < 30:
+        return None
+    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df
+
+
+def _detect_bearish_msb(df: pd.DataFrame) -> bool:
+    """Small deterministic bearish market-structure-break detector.
+
+    We do not try to be a full TA engine here. For scan safety we only require
+    a simple pattern: recent lower-high plus close below a recent swing low with
+    non-trivial volume. If data is noisy, return False and the candidate becomes
+    WATCHLIST/REJECTED instead of actionable.
+    """
+    if len(df) < 24:
+        return False
+    recent = df.tail(24).reset_index(drop=True)
+    highs = recent["high"]
+    lows = recent["low"]
+    closes = recent["close"]
+    volumes = recent["volume"]
+
+    first_high = float(highs.iloc[:12].max())
+    second_high = float(highs.iloc[12:20].max())
+    prior_swing_low = float(lows.iloc[6:20].min())
+    last_close = float(closes.iloc[-1])
+    median_vol = float(volumes.iloc[:-1].median()) or 0.0
+    last_vol = float(volumes.iloc[-1])
+
+    lower_high = second_high < first_high * 0.998
+    broke_low = last_close < prior_swing_low
+    volume_ok = median_vol <= 0 or last_vol >= median_vol * 1.1
+    return lower_high and broke_low and volume_ok
+
+
+def _trend_change_short(df: pd.DataFrame) -> bool:
+    if len(df) < 55:
+        return False
+    rsi = ta.rsi(df["close"], length=14)
+    ema20 = ta.ema(df["close"], length=20)
+    ema50 = ta.ema(df["close"], length=50)
+    if rsi is None or ema20 is None or ema50 is None:
+        return False
+    if rsi.empty or ema20.empty or ema50.empty:
+        return False
+
+    rsi_now = _safe_float(rsi.iloc[-1], 50)
+    rsi_prev = _safe_float(rsi.iloc[-4], rsi_now) if len(rsi) >= 4 else rsi_now
+    ema_bearish = _safe_float(ema20.iloc[-1]) < _safe_float(ema50.iloc[-1])
+    price_below_ema20 = _safe_float(df["close"].iloc[-1]) < _safe_float(ema20.iloc[-1])
+    return sum((rsi_prev >= 68 and rsi_now < rsi_prev, ema_bearish, price_below_ema20)) >= 2
+
+
+def _risk_score(analysis: dict) -> int:
+    score = 5
+    funding = float(analysis.get("funding_rate", 0) or 0)
+    if funding < -0.0005:
+        score += 2
+    elif funding < 0:
+        score += 1
+    elif funding > 0.0003:
+        score -= 1
+
+    if not analysis.get("trend_change_short"):
+        score += 1
+    if not analysis.get("msb_short"):
+        score += 1
+    if analysis.get("ema_trend") == "бычий":
+        score += 1
+    if float(analysis.get("vol_spike", 1) or 1) > 3:
+        score += 1
+
+    return max(1, min(10, score))
+
+
+def validate_short_pick(analysis: dict | None) -> tuple[str, list[str]]:
+    """Return scan validation status and human-readable blocking reasons."""
+    if not analysis:
+        return "UNKNOWN", ["нет технических данных"]
+    reasons: list[str] = []
+    if analysis.get("direction") != "short":
+        reasons.append("локальный сигнал не SHORT")
+    if not analysis.get("trend_change_short"):
+        reasons.append("смена тренда вниз не подтверждена")
+    if not analysis.get("msb_short"):
+        reasons.append("bearish MSB не подтверждён")
+    if int(analysis.get("risk_score", 10) or 10) > 7:
+        reasons.append(f"risk {analysis.get('risk_score')}/10 выше лимита")
+    if float(analysis.get("price", 0) or 0) <= 0:
+        reasons.append("нет live price MEXC")
+    if reasons:
+        return "REJECTED", reasons
+    return "VALIDATED", []
+
+
+async def _enrich_multi_timeframe(exchange, symbol: str, analysis: dict) -> dict:
+    """Attach 4h/1d MEXC facts to a candidate without trusting LLM claims."""
+    timeframes = {"1h": None, "4h": None, "1d": None}
+    for tf in timeframes:
+        try:
+            ohlcv = await exchange._exchange.fetch_ohlcv(symbol, tf, limit=100)
+            timeframes[tf] = _ohlcv_df(ohlcv)
+        except Exception as e:
+            logger.info("%s %s OHLCV failed: %s", symbol, tf, e)
+
+    tf_summary: dict[str, dict] = {}
+    trend_votes = 0
+    msb_votes = 0
+    for tf, df in timeframes.items():
+        if df is None:
+            tf_summary[tf] = {"rsi": None, "ema_trend": "UNKNOWN", "msb_short": False}
+            continue
+        rsi = _rsi_last(df)
+        ema_trend = _ema_trend(df)
+        msb_short = _detect_bearish_msb(df)
+        trend_short = _trend_change_short(df)
+        if trend_short:
+            trend_votes += 1
+        if msb_short:
+            msb_votes += 1
+        tf_summary[tf] = {
+            "rsi": None if rsi is None else round(rsi, 1),
+            "ema_trend": ema_trend,
+            "msb_short": msb_short,
+            "trend_change_short": trend_short,
+        }
+
+    analysis["timeframes"] = tf_summary
+    analysis["trend_change_short"] = trend_votes >= 1
+    analysis["msb_short"] = msb_votes >= 1
+    analysis["risk_score"] = _risk_score(analysis)
+    status, errors = validate_short_pick(analysis)
+    analysis["validation_status"] = status
+    analysis["validation_errors"] = errors
+    return analysis
 
 
 async def scan_overbought(exchange, rsi_threshold: float = 65.0,
@@ -67,7 +241,9 @@ async def scan_overbought(exchange, rsi_threshold: float = 65.0,
         try:
             ob = await exchange._exchange.fetch_order_book(r["symbol"], limit=5)
             if ob.get("bids") and ob.get("asks"):
-                verified.append(r)
+                enriched = await _enrich_multi_timeframe(exchange, r["symbol"], r)
+                if enriched.get("direction") == "short":
+                    verified.append(enriched)
         except Exception:
             pass
 
@@ -84,7 +260,10 @@ async def analyze_single_coin(exchange, symbol: str) -> dict | None:
         logger.info("analyze_single_coin(%s): %s", symbol, e)
         return None
     daily_change = float(ticker.get("percentage", 0) or 0)
-    return _deep_analyze(symbol, ohlcv, ticker, daily_change, min_score=0)
+    analysis = _deep_analyze(symbol, ohlcv, ticker, daily_change, min_score=0)
+    if not analysis:
+        return None
+    return await _enrich_multi_timeframe(exchange, symbol, analysis)
 
 
 async def mexc_find_futures_symbol(exchange, ticker: str) -> str | None:
@@ -322,10 +501,25 @@ def format_coin_card(r: dict, index: int, ai_note: str = "",
     if max_lev > 0 and margin > 0:
         notional = margin * max_lev
         lev_line = f"\n   ⚙️ Плечо `×{max_lev}` | Маржа `${margin:.2f}` | Поза `~${notional:.0f}`"
+    tf = r.get("timeframes", {}) or {}
+    tf_bits = []
+    for name in ("1h", "4h", "1d"):
+        item = tf.get(name) or {}
+        rsi = item.get("rsi")
+        trend = item.get("ema_trend", "?")
+        if rsi is not None:
+            tf_bits.append(f"{name}: RSI {rsi}, {trend}")
+    smart_line = ""
+    if tf_bits:
+        smart_line = "\n   🧠 MEXC: " + " | ".join(tf_bits[:3])
+    gate_line = (
+        f"\n   ✅ Gate: `{r.get('validation_status', 'UNKNOWN')}` · "
+        f"MSB `{bool(r.get('msb_short'))}` · риск `{r.get('risk_score', '?')}/10`"
+    )
     return (
         f"{index}. {dir_emoji} *{coin}*\n"
         f"   RSI `{r['rsi']}` | 24ч `{r['daily_change_pct']:+.1f}%` | Объём `{vol_str}`\n"
         f"   Тренд: {r['ema_trend']} | BB: `{r['bb_position']:.0%}`{note_line}"
-        f"{lev_line}\n"
+        f"{smart_line}{gate_line}{lev_line}\n"
         f"   *Почему:*\n{reasons_text}"
     )

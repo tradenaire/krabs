@@ -17,11 +17,24 @@ OPENROUTER_PRICES = {
 DEFAULT_MODEL = "x-ai/grok-4-fast:online"
 FALLBACK_MODEL = "google/gemini-3.1-pro-preview-customtools:online"
 
+
+def _normalize_coin(value: str) -> str:
+    ticker = (value or "").strip().upper()
+    ticker = re.split(r"[/_\-\s]", ticker, maxsplit=1)[0]
+    return re.sub(r"[^A-Z0-9]", "", ticker)
+
 SYSTEM_PROMPT = """# ROLE
 Ты — старший аналитик отдела количественного анализа в крупном хедж-фонде. Специализация — поиск активов с высоким потенциалом падения (Short opportunities).
 
 # TASK
 Проведи комплексное исследование текущего состояния рынка на {today} и выдели РОВНО {n} монет для шорта.
+
+# HARD DATA RULES
+- Выбирай ТОЛЬКО из MEXC futures-кандидатов, которые пользователь передал в сообщении.
+- Не придумывай тикеры вне списка и не меняй написание COIN.
+- Цена, RSI, funding, trend/MSB и risk из локального MEXC snapshot имеют приоритет над твоей оценкой.
+- Если у монеты нет подтверждения смены тренда/MSB, не ставь её выше монеты с подтверждением.
+- Если данных не хватает, напиши это в TECH/FUNDING, но формат не ломай.
 
 # ANALYSIS ALGORITHM
 Для каждой монеты проанализируй:
@@ -93,8 +106,14 @@ def parse_analyst_blocks(text: str, n: int = 20) -> list[dict]:
             m = re.match(r"\s*(COIN|PRICE|TECH|FUND|FUNDING|ENTRY|SL|RISK)\s*:\s*(.+)", line, re.IGNORECASE)
             if m:
                 fields[m.group(1).upper()] = m.group(2).strip()
-        ticker = fields.get("COIN", "").strip().upper()
+        ticker = _normalize_coin(fields.get("COIN", ""))
         if not ticker:
+            continue
+        risk_text = fields.get("RISK", "")
+        risk_match = re.search(r"(\d+)", risk_text)
+        risk_num = int(risk_match.group(1)) if risk_match else None
+        if risk_num is not None and not 1 <= risk_num <= 10:
+            logger.info("skip LLM candidate %s: risk out of range: %s", ticker, risk_text)
             continue
         parsed.append({
             "ticker":   ticker,
@@ -104,7 +123,8 @@ def parse_analyst_blocks(text: str, n: int = 20) -> list[dict]:
             "funding":  fields.get("FUNDING", ""),
             "entry":    fields.get("ENTRY", ""),
             "sl":       fields.get("SL", ""),
-            "risk":     fields.get("RISK", ""),
+            "risk":     risk_text,
+            "risk_num": risk_num,
         })
     return parsed[:n]
 
@@ -136,12 +156,31 @@ def _build_user_msg(candidates: list[dict], n: int = 5) -> str:
             ticker = c.get("symbol", "").split("/")[0]
             funding = c.get("funding_rate", 0) or 0
             funding_str = f", funding={funding*100:+.4f}%" if funding != 0 else ""
+            tf = c.get("timeframes", {}) or {}
+            tf_parts = []
+            for name in ("1h", "4h", "1d"):
+                item = tf.get(name) or {}
+                if item.get("rsi") is not None:
+                    tf_parts.append(
+                        f"{name}:RSI={item.get('rsi')},EMA={item.get('ema_trend')},"
+                        f"MSB={item.get('msb_short')}"
+                    )
+            tf_str = "; ".join(tf_parts) if tf_parts else "tf=нет"
+            reasons = "; ".join((c.get("reasons") or [])[:3])
             rows.append(
-                f"- {ticker}: RSI={c.get('rsi', 0)}, 24h={c.get('daily_change_pct', 0):+.1f}%{funding_str}"
+                f"- {ticker}: mexc_symbol={c.get('symbol')}, price={c.get('price')}, "
+                f"score={c.get('score')}, gate={c.get('validation_status', 'UNKNOWN')}, "
+                f"risk={c.get('risk_score', '?')}/10, trend_change={c.get('trend_change_short')}, "
+                f"msb={c.get('msb_short')}, 24h={c.get('daily_change_pct', 0):+.1f}%{funding_str}, "
+                f"{tf_str}. Reasons: {reasons}"
             )
-        ctx = "Наш локальный сканер MEXC отметил эти монеты:\n" + "\n".join(rows)
+        ctx = (
+            "Наш локальный MEXC-first сканер отметил эти монеты. "
+            "Выбирай только из них, COIN должен совпадать с тикером в начале строки:\n"
+            + "\n".join(rows)
+        )
     else:
-        ctx = "(локальный сканер не нашёл кандидатов — иди от полного рынка)"
+        ctx = "(локальный MEXC-first сканер не нашёл кандидатов; верни SENTIMENT и не придумывай COIN)"
     return f"Сегодня {today}. Выдай ТОП-{n} монет для шорта.\n\n{ctx}"
 
 

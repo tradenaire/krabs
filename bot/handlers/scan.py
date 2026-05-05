@@ -3,7 +3,8 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from bot.ai.scanner import scan_overbought, analyze_single_coin, mexc_find_futures_symbol, format_coin_card
+from bot.ai.scanner import (scan_overbought, analyze_single_coin, mexc_find_futures_symbol,
+                            format_coin_card, validate_short_pick)
 from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks, extract_sentiment,
                              format_usage_footer, DEFAULT_MODEL, FALLBACK_MODEL)
 
@@ -81,7 +82,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status = await update.message.reply_text("🧠 Думаю...")
+    status = await update.message.reply_text("📡 Собираю MEXC snapshot...")
 
     try:
         local_results, _total = await scan_overbought(client, 65.0, 10.0)
@@ -90,7 +91,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         local_results = []
 
     model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
-    await status.edit_text(f"🔍 Анализирую через {model}...")
+    await status.edit_text(f"🔍 Передаю MEXC snapshot в {model}...")
 
     ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n)
 
@@ -112,7 +113,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await status.edit_text(f"✅ AI выдал {len(picks)} монет. Проверяю MEXC...")
+    await status.edit_text(f"✅ AI выдал {len(picks)} монет. Валидирую MEXC trend/MSB/risk...")
 
     try:
         open_positions = await client.get_positions()
@@ -148,9 +149,16 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not tech:
             skipped.append((ticker, "нет OHLCV"))
             continue
+        validation_status, validation_errors = validate_short_pick(tech)
+        tech["validation_status"] = validation_status
+        tech["validation_errors"] = validation_errors
+        if validation_status != "VALIDATED":
+            skipped.append((ticker, "; ".join(validation_errors[:2]) or validation_status))
+            continue
         tech["_ai_fund"] = pick.get("fund", "")
         tech["_ai_funding"] = pick.get("funding", "")
         tech["_ai_risk"] = pick.get("risk", "")
+        tech["_ai_risk_num"] = pick.get("risk_num")
         validated.append(tech)
 
     try:
@@ -185,7 +193,8 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Sort: OK averaging first, risky (impossible to avg at configured amount) last
     validated.sort(key=lambda t: (0 if t["_avg_ok"] else 1))
 
-    header = f"*🎯 AI top-{len(validated)} шорт ({ai_result.model})*"
+    header = f"*🎯 SmartScan top-{len(validated)} шорт ({ai_result.model})*"
+    header += "\n_Источник цены/тренда/risk: MEXC post-validation_"
     if existing_picks:
         header += f"\n_уже в позиции: {', '.join(s.split('/')[0] for s, _ in existing_picks)}_"
     if skipped:
@@ -219,12 +228,12 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         icon = "🔻" if direction == "short" else "🔺"
 
-        if avg_ok:
+        if r.get("validation_status") == "VALIDATED" and avg_ok:
             btn = InlineKeyboardButton(
                 f"{icon} ${default_bet:g} · {lev_eff}x",
                 callback_data=f"open_{side_code}_{sym}",
             )
-        else:
+        elif r.get("validation_status") == "VALIDATED":
             # Averaging minimum exceeds configured amount — show warning
             card += (
                 f"\n   ⚠️ *Мин. докупка MEXC* `${min_avg:.2f}` > настройка `${averaging_amount:.2f}`"
@@ -234,6 +243,9 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ Открыть (докупка ~${min_avg:.2f})",
                 callback_data=f"open_anyway_{side_code}_{sym}",
             )
+        else:
+            card += "\n   ⛔ Открытие заблокировано: MEXC validation не пройдена"
+            btn = InlineKeyboardButton("⛔ Не actionable", callback_data="noop_scan_blocked")
 
         kb = InlineKeyboardMarkup([[btn]])
         try:
