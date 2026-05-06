@@ -258,6 +258,17 @@ async def averaging_job(app):
     threshold = float(getattr(config, "averaging_threshold", -100))
     amount = float(getattr(config, "averaging_amount", 0.50))
     max_count = int(getattr(config, "max_averaging_count", 100))
+
+    # Load dynamic averaging rules (sorted by "after" asc)
+    import json as _json
+    from bot import db as _db_dyn
+    _dyn_rules: list[dict] = []
+    try:
+        _dyn_raw = _db_dyn.get_config("avg_dynamic_rules", "")
+        if _dyn_raw:
+            _dyn_rules = sorted(_json.loads(_dyn_raw), key=lambda r: r["after"])
+    except Exception:
+        pass
     profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
     profit_lock_sl_pct = float(getattr(config, "averaging_profit_lock_sl_pct", 0))
 
@@ -277,7 +288,12 @@ async def averaging_job(app):
     avg_interval = int(getattr(config, "averaging_interval", 10))
     now_ts = time.time()
 
-    free_balance = app.bot_data.get("_bal_cache", 0.0)
+    try:
+        free_balance = await client.get_free_futures_balance()
+        if free_balance >= 0:
+            app.bot_data["_bal_cache"] = free_balance
+    except Exception:
+        free_balance = app.bot_data.get("_bal_cache", 0.0)
 
     db_positions = {p["symbol"]: p for p in db_mod.get_open_positions()}
     synth_store = app.bot_data.setdefault("_avg_synth", {})
@@ -354,10 +370,8 @@ async def averaging_job(app):
                 try:
                     await client.set_tp_sl(symbol, tp_price=_new_tp, sl_price=_new_sl, pos_data=pos)
                     _profit_locked.add(symbol)
-                    # Persistent flag в БД: гарантирует re-entry даже если бот рестартанёт
-                    # или was_closed_by_tp потеряет trigger_price из-за rate-limit.
-                    # См. reentry_job:_apply_profit_lock_override.
-                    db_mod.set_reentry_profit_locked(symbol, True)
+                    # Persist for reentry_job — survives position close + price bounce above entry
+                    app.bot_data.setdefault("_was_profit_locked", set()).add(symbol)
                     _pl_coin = symbol.split("/")[0]
                     await _notify_all(app,
                         f"🔒 *{_pl_coin}* SL перемещён в профит\n"
@@ -371,7 +385,8 @@ async def averaging_job(app):
         if now_ts - last_avg < 5:
             continue
 
-        if pnl_pct > threshold:
+        # Static threshold check — skip when dynamic rules active (checked per-position below)
+        if not _dyn_rules and pnl_pct > threshold:
             continue
 
         db_rec = db_positions.get(symbol)
@@ -387,6 +402,17 @@ async def averaging_job(app):
 
         total_invested = float(db_rec.get("total_invested") or 0)
         avg_count = int(db_rec.get("averaging_count") or 0)
+
+        # Determine effective threshold and amount — dynamic rules override globals
+        eff_threshold = threshold
+        eff_amount = amount
+        if _dyn_rules:
+            for _rule in _dyn_rules:
+                if avg_count >= _rule["after"]:
+                    eff_threshold = float(_rule["pnl"])
+                    eff_amount = float(_rule["amount"])
+        if pnl_pct > eff_threshold:
+            continue
 
         # Count check
         if avg_count >= max_count:
@@ -406,18 +432,25 @@ async def averaging_job(app):
         old_contracts = int(round(float(pos.get("contracts", 0) or 0)))
         old_pnl_usd = float(pos.get("unrealized_pnl", 0) or 0)
 
+        # Check minimum contract cost — use cached notional first, then live API
         _min_order_cache: dict = app.bot_data.setdefault("_min_order_cache", {})
         cached_min_notional = _min_order_cache.get(symbol, 0)
-        if cached_min_notional > 0 and amount * max(avg_lev, 1) <= cached_min_notional:
-            actual_amount = await client.get_min_order_usdt(
-                symbol, avg_lev, min_notional=cached_min_notional
-            ) or (cached_min_notional / max(avg_lev, 1) * 1.05)
-            logger.info("Avg %s: upgrading amount $%.2f -> $%.2f (min notional $%.0f)",
-                        symbol, amount, actual_amount, cached_min_notional)
+        if cached_min_notional > 0 and eff_amount * max(avg_lev, 1) <= cached_min_notional:
+            actual_amount = cached_min_notional / max(avg_lev, 1) * 1.05
+            logger.info("Avg %s: upgrading amount $%.2f -> $%.2f (cached min notional $%.0f)",
+                        symbol, eff_amount, actual_amount, cached_min_notional)
         else:
-            actual_amount = amount
+            try:
+                min_cost = await client.get_min_order_usdt(symbol, avg_lev)
+            except Exception:
+                min_cost = 0.0
+            # Add 5% buffer so notional is strictly > MEXC minimum (ceil may land exactly on minimum)
+            actual_amount = max(eff_amount, min_cost * 1.05) if min_cost > 0 else eff_amount
+            if min_cost > 0 and min_cost * 1.05 > eff_amount:
+                logger.info("Avg %s: min contract $%.2f (+5%%) > amount $%.2f, using $%.2f",
+                            symbol, min_cost, eff_amount, actual_amount)
 
-        if free_balance < actual_amount:
+        if free_balance < actual_amount - 0.001:
             coin = symbol.split("/")[0]
             _bal_warn_ts: dict = app.bot_data.setdefault("_avg_bal_warn_ts", {})
             if time.time() - _bal_warn_ts.get(symbol, 0) > 300:
@@ -438,7 +471,7 @@ async def averaging_job(app):
             except Exception as e:
                 err_msg = str(e).lower()
                 raw_err = str(e)
-                # Reset timestamp so next run can retry (we did not place an order)
+                # Reset timestamp so next run can retry (we didn't place an order)
                 _avg_ts.pop(symbol, None)
                 # Position limit hit — mute this symbol until position closes
                 _POS_LIMIT_KEYWORDS = ("exceed", "position size", "max position",
@@ -452,46 +485,29 @@ async def averaging_job(app):
                         f"🚫 *Докупки закончились* `{coin}`\n"
                         f"Биржа отклонила: лимит позиции достигнут\n"
                         f"Позиция закроется по TP, SL или вручную `/close {coin}`")
-                    continue
                 elif any(kw in err_msg for kw in _MIN_ORDER_KEYWORDS):
+                    # Extract minimum from error response if possible
                     import re as _re
-                    m = _re.search(r'(?i)"value"\s*:\s*(\d+(?:\.\d+)?)', raw_err)
+                    m = _re.search(r'"value"\s*:\s*(\d+(?:\.\d+)?)', raw_err)
                     min_usdt_notional = float(m.group(1)) if m else 5.0
-                    # Cache so next cycle uses correct margin automatically
+                    # Update cache so next cycle auto-upgrades amount instead of hitting 7008 again
+                    _min_order_cache: dict = app.bot_data.setdefault("_min_order_cache", {})
                     _min_order_cache[symbol] = min_usdt_notional
                     try:
-                        from bot import db as _db_c
-                        _db_c.set_min_order_notional(symbol, min_usdt_notional)
+                        from bot import db as _db_7008
+                        _db_7008.set_min_order_notional(symbol, min_usdt_notional)
                     except Exception:
                         pass
-                    min_margin = await client.get_min_order_usdt(
-                        symbol, avg_lev, min_notional=min_usdt_notional
-                    ) or (min_usdt_notional / max(avg_lev, 1) * 1.05)
+                    min_margin = min_usdt_notional / max(avg_lev, 1) * 1.05
+                    upgraded_amount = min_margin
                     coin = symbol.split("/")[0]
-                    logger.info("Avg %s: cached min notional $%.1f -> next avg $%.3f (auto-upgrade)",
-                                symbol, min_usdt_notional, min_margin)
-                    if min_margin > actual_amount and free_balance >= min_margin:
-                        try:
-                            order_result = await client.place_futures_order(
-                                symbol, avg_side, min_margin, avg_lev, margin_mode=avg_mm
-                            )
-                            actual_amount = min_margin
-                            logger.info("Avg %s: retry succeeded at MEXC min margin $%.3f",
-                                        symbol, actual_amount)
-                        except Exception as retry_e:
-                            logger.error("Averaging retry FAILED for %s at $%.3f: %s",
-                                         symbol, min_margin, retry_e)
-                            continue
-                    else:
-                        continue
+                    logger.info("Avg %s: 7008 — cached min notional $%.0f, next cycle uses $%.2f",
+                                symbol, min_usdt_notional, upgraded_amount)
                 else:
                     logger.error("Averaging order FAILED for %s: %s", symbol, e)
-                    continue
+                continue
 
         new_total = total_invested + actual_amount
-        if order_result and order_result.get("margin"):
-            actual_amount = max(actual_amount, float(order_result["margin"]))
-            new_total = total_invested + actual_amount
         new_count = avg_count + 1
         free_balance -= actual_amount
 
@@ -563,20 +579,6 @@ async def averaging_job(app):
                         if new_sl:
                             parts.append(f"SL: `{new_sl:.6g}`")
                         tp_sl_text = "\n🔄 " + ", ".join(parts) + f" (avg: `{new_entry:.6g}`)"
-                        # После докупки новый SL пересчитывается по обычной формуле
-                        # _calc_sl_price (loss-зона относительно нового entry).
-                        # Если профит-лок ранее поднял флаг — сбрасываем, иначе при
-                        # срабатывании этого SL мы ложно re-enter на убыточном close.
-                        # averaging_job снова дождётся pnl_pct ≥ trigger и снова
-                        # поднимет флаг + переставит SL в новую профит-зону.
-                        if new_sl is not None:
-                            sl_in_profit = (
-                                (new_sl < new_entry) if p_side == "short"
-                                else (new_sl > new_entry)
-                            )
-                            if not sl_in_profit:
-                                db_mod.set_reentry_profit_locked(symbol, False)
-                                _profit_locked.discard(symbol)
                 except Exception as e:
                     logger.warning("TP/SL recalc for %s: %s", symbol, e)
 
@@ -612,13 +614,10 @@ async def averaging_job(app):
 
 async def _resolve_close_reason(client, symbol: str, pos_side_str: str,
                                 opened_at_ms: int | None,
-                                entry_price: float) -> tuple[bool | None, bool, float | None]:
-    """Returns (closed_by_tp, profitable_sl, exit_price).
+                                entry_price: float) -> tuple[bool | None, bool]:
+    """Returns (closed_by_tp, profitable_sl).
     closed_by_tp: True=TP, False=SL, None=unknown.
-    profitable_sl: True if SL triggered but at a price better than entry (profit-lock SL).
-    exit_price:  цена, по которой исполнился plan order (или mark при fallback) —
-                 используется для расчёта realized PnL в сообщении пользователю.
-                 None если данных нет."""
+    profitable_sl: True if SL triggered but at a price better than entry (profit-lock SL)."""
     is_tp, trigger_price = await client.was_closed_by_tp(symbol, pos_side_str, opened_at_ms)
 
     profitable_sl = False
@@ -629,45 +628,16 @@ async def _resolve_close_reason(client, symbol: str, pos_side_str: str,
             else (trigger_price > entry_price)
         )
 
-    # exit_price предпочитаем trigger_price (точная цена сделки plan-order),
-    # иначе — mark из fallback-ветки ниже, иначе — None.
-    exit_price: float | None = trigger_price if trigger_price else None
-
     if is_tp is None and entry_price > 0:
         try:
             ticker = await client._exchange.fetch_ticker(symbol)
             mark = float(ticker.get("last", 0) or 0)
             if mark > 0:
                 is_tp = (mark < entry_price) if pos_side_str == "short" else (mark > entry_price)
-                if exit_price is None:
-                    exit_price = mark
         except Exception as e:
             logger.debug("_resolve_close_reason price fallback %s: %s", symbol, e)
 
-    return is_tp, profitable_sl, exit_price
-
-
-def _apply_profit_lock_override(closed_by_tp: bool | None, profitable_sl: bool,
-                                re_cfg: dict) -> tuple[bool | None, bool]:
-    """Forces profitable_sl=True если для symbol установлен флаг profit_locked в БД.
-
-    Зачем: averaging_job устанавливает profit_locked=1 в БД когда переставляет SL в
-    профит-зону. После закрытия позиции по такому SL `_resolve_close_reason` может
-    вернуть `profitable_sl=False` если `was_closed_by_tp` потеряла trigger_price из-за
-    rate-limit MEXC, лага plan-orders или рестарта бота. Без этого override
-    позиция выпала бы в loss-SL ветку и re-entry бы не случился.
-
-    Условия применения:
-      - closed_by_tp is False — резолв определил что был SL, но не уверен profit/loss.
-        НЕ переопределяем None (неопределённость = ждём следующий тик).
-      - profitable_sl is False — иначе и так re-enter, override не нужен.
-      - re_cfg['profit_locked'] truthy — флаг был поднят averaging_job.
-
-    Возвращает (closed_by_tp, profitable_sl) с возможной коррекцией profitable_sl.
-    """
-    if closed_by_tp is False and not profitable_sl and bool(re_cfg.get("profit_locked")):
-        return closed_by_tp, True
-    return closed_by_tp, profitable_sl
+    return is_tp, profitable_sl
 
 
 async def reentry_job(app):
@@ -723,59 +693,30 @@ async def reentry_job(app):
             except Exception:
                 pass
 
-        # Размер позиции для расчёта реализованного PnL — используем total_invested
-        # из position_history (учитывает все докупки), fallback на initial margin.
-        # Leverage берём из ph (актуальный для закрытой позиции), fallback на re_cfg.
-        ph_total_invested = float(ph.get("total_invested") or 0) if ph else 0
-        ph_leverage = int(ph.get("leverage") or 0) if ph else 0
-        re_margin = float(re_cfg.get("margin") or 1.0)
-        re_leverage = int(re_cfg.get("leverage") or 0)
-        pnl_margin = ph_total_invested or re_margin
-        pnl_lev = ph_leverage or re_leverage or 1
-
-        from bot.fmt import format_close_pnl, calc_close_pnl
-
-        def _pnl_suffix(exit_price: float | None) -> tuple[str, float]:
-            """Возвращает (' (+$X / +Y%)' для текста, числовой pnl_usdt для DB)."""
-            if not exit_price or entry_price <= 0:
-                return "", 0.0
-            pnl_usdt, _ = calc_close_pnl(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin)
-            human = format_close_pnl(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin)
-            return f" {human}" if human else "", pnl_usdt
-
-        # Сохраняем факт profit-lock ДО override чтобы потом различить "natural TP"
-        # vs "forced via flag" в сообщении re-entry. После override это значение
-        # становится частью profitable_sl и его уже не отличить.
-        was_profit_locked = bool(re_cfg.get("profit_locked"))
-
         if max_cycles == 0:
-            closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
-            closed_by_tp, profitable_sl = _apply_profit_lock_override(closed_by_tp, profitable_sl, re_cfg)
+            closed_by_tp, profitable_sl = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
             if closed_by_tp is None:
                 continue
             close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
-            pnl_text, pnl_usdt = _pnl_suffix(exit_price)
-            db_mod.log_trade(symbol, "close", pnl=pnl_usdt, note=close_note)
-            db_mod.close_position_history(symbol, exit_price=exit_price or 0, pnl=pnl_usdt, close_reason=close_note)
+            db_mod.log_trade(symbol, "close", note=close_note)
+            db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason=close_note)
             icon = "✅" if (closed_by_tp or profitable_sl) else "🛑"
             label = "по тейку" if closed_by_tp else ("по профит-локк SL" if profitable_sl else "по стопу")
-            await _notify_all(app, f"{icon} *{coin}* {label}{pnl_text} (перезаход отключён)")
+            await _notify_all(app, f"{icon} *{coin}* {label} (перезаход отключён)")
             db_mod.delete_reentry(symbol)
             continue
 
         if cycle_count >= max_cycles:
             logger.info("Re-entry: %s exhausted (%d/%d cycles)", symbol, cycle_count, max_cycles)
-            closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
-            closed_by_tp, profitable_sl = _apply_profit_lock_override(closed_by_tp, profitable_sl, re_cfg)
+            closed_by_tp, profitable_sl = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
             if closed_by_tp is None:
                 continue
             close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
-            pnl_text, pnl_usdt = _pnl_suffix(exit_price)
-            db_mod.log_trade(symbol, "close", pnl=pnl_usdt, note=close_note)
-            db_mod.close_position_history(symbol, exit_price=exit_price or 0, pnl=pnl_usdt, close_reason=close_note)
+            db_mod.log_trade(symbol, "close", note=close_note)
+            db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason=close_note)
             icon = "✅" if (closed_by_tp or profitable_sl) else "🛑"
             label = "по тейку" if closed_by_tp else ("по профит-локк SL" if profitable_sl else "по стопу")
-            await _notify_all(app, f"{icon} *{coin}* {label}{pnl_text} — циклы исчерпаны ({cycle_count}/{max_cycles})")
+            await _notify_all(app, f"{icon} *{coin}* {label} — циклы исчерпаны ({cycle_count}/{max_cycles})")
             db_mod.delete_reentry(symbol)
             continue
 
@@ -793,47 +734,33 @@ async def reentry_job(app):
 
         logger.info("Re-entry #%d %s %s $%.2f", cycle_count + 1, symbol, side, margin)
 
-        # Determine close reason: TP or profitable-SL → re-enter, loss-SL → skip.
-        # Override: если re_cfg.profit_locked=1 (averaging_job переставлял SL в профит)
-        # и резолв вернул closed_by_tp=False, profitable_sl=False — форсим
-        # profitable_sl=True, потому что мы УВЕРЕНЫ что SL был в плюсе.
-        # Это страхует от потери trigger_price из-за rate-limit MEXC.
-        closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
-        _orig_profitable_sl = profitable_sl
-        closed_by_tp, profitable_sl = _apply_profit_lock_override(closed_by_tp, profitable_sl, re_cfg)
-        if was_profit_locked and profitable_sl and not _orig_profitable_sl:
-            logger.info("Re-entry %s: profit-lock SL override applied (resolved as loss-SL but flag was set)", symbol)
+        # Determine close reason: TP or profitable-SL → re-enter, loss-SL → skip
+        closed_by_tp, profitable_sl = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
 
         if closed_by_tp is None:
             logger.info("Re-entry: %s close reason unknown, retrying next cycle", symbol)
             continue
 
         close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
-        pnl_text, pnl_usdt = _pnl_suffix(exit_price)
         still_open = db_mod.get_open_position(symbol) is not None
         if still_open:
             db_mod.close_position(symbol)
-            db_mod.log_trade(symbol, "close", pnl=pnl_usdt, note=close_note)
-            db_mod.close_position_history(symbol, exit_price=exit_price or 0, pnl=pnl_usdt, close_reason=close_note)
+            db_mod.log_trade(symbol, "close", note=close_note)
+            db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason=close_note)
+
+        # Fallback: if price bounced above entry before reentry_job ran,
+        # _resolve_close_reason misses the profit-lock. Check persistent flag.
+        if not closed_by_tp and not profitable_sl:
+            _was_pl: set = app.bot_data.setdefault("_was_profit_locked", set())
+            if symbol in _was_pl:
+                profitable_sl = True
+                _was_pl.discard(symbol)
 
         if not closed_by_tp and not profitable_sl:
-            # Loss-SL ветка: по умолчанию обрываем re-entry (защита от двойной
-            # просадки). Если пользователь явно включил config.reenter_on_loss_sl
-            # (через /avg визард или `/avg reenter_on_loss_sl 1`) — продолжаем
-            # цикл, тратя следующий cycle. Уведомление различается чтобы было
-            # видно какая ветка отработала.
-            config = app.bot_data.get("config")
-            reenter_on_loss = bool(getattr(config, "reenter_on_loss_sl", False)) if config else False
-            if reenter_on_loss:
-                await _notify_all(app,
-                    f"🛑 *{coin}* закрыта по стопу{pnl_text} — перезаход (loss-SL включён)")
-                # Не делаем delete_reentry, не делаем continue — падаем в общий
-                # execute_open ниже. Но баланс-чек ниже всё равно может отменить.
-            else:
-                await _notify_all(app,
-                    f"🛑 *{coin}* закрыта по стопу{pnl_text} — перезаход пропущен")
-                db_mod.delete_reentry(symbol)
-                continue
+            await _notify_all(app,
+                f"🛑 *{coin}* закрыта по стопу — перезаход пропущен")
+            db_mod.delete_reentry(symbol)
+            continue
 
         # Cancel re-entry if no free futures balance — don't retry
         if futures_avail < margin * 0.1:
@@ -847,29 +774,13 @@ async def reentry_job(app):
             result = await execute_open(client, app, symbol, side, margin, leverage,
                                         tp_pct=tp_pct, sl_pct=sl_pct)
             new_cycle = db_mod.increment_reentry_cycle(symbol)
-            # Сброс profit_locked флага: новая позиция начинает с чистым флагом.
-            # averaging_job снова дождётся pnl_pct ≥ trigger и снова поднимет флаг
-            # вместе с переустановкой SL в новую профит-зону.
-            # Также синхронизируем runtime _profit_locked set (используется самим
-            # averaging_job для пред-проверки `symbol not in _profit_locked`).
-            db_mod.set_reentry_profit_locked(symbol, False)
-            _profit_locked: set = app.bot_data.setdefault("_profit_locked", set())
-            _profit_locked.discard(symbol)
             db_mod.log_trade(symbol, "reentry", amount=margin, note=f"cycle {new_cycle}")
             # Clear exhausted flag so new cycle gets fresh averaging tracking
             notified_exhausted: set = app.bot_data.setdefault("_avg_notified_exhausted", set())
             notified_exhausted.discard(symbol)
-            # Различаем head в зависимости от того, был ли это profit-lock close.
-            # Если флаг был поднят (was_profit_locked=True), показываем 🔒 и явно
-            # говорим "по profit-lock SL" — это интуитивнее чем "в профит" когда
-            # позиция закрылась по ползущему SL. Если flag не был поднят — обычный
-            # формат TP/profitable-SL.
-            if was_profit_locked:
-                head = f"🔒 *{coin}* закрыта по profit-lock SL{pnl_text} → перезаход #{new_cycle}/{max_cycles}"
-            else:
-                head = f"✅ *{coin}* в профит{pnl_text} → перезаход #{new_cycle}/{max_cycles}"
+            close_label = "по TP" if closed_by_tp else "в прибыль (профит-локк SL)"
             msg = (
-                f"{head}\n"
+                f"✅ *{coin}* закрыта {close_label} → перезаход #{new_cycle}/{max_cycles}\n"
                 f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']}\n"
                 f"TP: `{result.get('tp_price', 0):.6g}` | SL: `{result.get('sl_price', 0):.6g}`"
             )
@@ -908,35 +819,6 @@ async def balance_alert_job(app):
             app.bot_data["_bal_alert_sent"] = True
         elif pct > 20.0 and was_alerted:
             app.bot_data["_bal_alert_sent"] = False  # сбросить при восстановлении
-
-        # Alert when free balance can't cover averaging budgets for all open positions
-        try:
-            from bot import db as db_mod
-            n_pos = len(db_mod.get_open_positions())
-            if n_pos > 0:
-                config = app.bot_data.get("config")
-                _avg_amount = float(getattr(config, "averaging_amount", 0.10)) if config else 0.10
-                _max_cnt = int(getattr(config, "max_averaging_count", 100)) if config else 100
-                _sl_pct = float(getattr(config, "sl_pct", 500)) if config else 500.0
-                _profit_lock = float(getattr(config, "averaging_profit_lock_trigger", 0)) if config else 0
-                avg_budget_eff = _max_cnt * _avg_amount
-                _sl_mult = 1.0 if _profit_lock > 0 else (_sl_pct / 100.0)
-                risk_per_pos = avg_budget_eff * _sl_mult
-                total_needed = n_pos * risk_per_pos
-                _margin_alert_ts = app.bot_data.get("_margin_alert_ts", 0)
-                if free < total_needed and time.time() - _margin_alert_ts >= 120:
-                    can_for = int(free / risk_per_pos) if risk_per_pos > 0 else 0
-                    _sl_label = "profit-lock" if _profit_lock > 0 else f"SL {_sl_pct:.0f}%"
-                    await _notify_all(app,
-                        f"🚨 *Не хватает маржи для докупок!*\n"
-                        f"Позиций: `{n_pos}` · нужно `${total_needed:.2f}` "
-                        f"(по `${risk_per_pos:.2f}` на каждую, {_max_cnt}×${_avg_amount:.2f} × {_sl_label})\n"
-                        f"Свободно `${free:.2f}` — хватит на `{can_for}` из `{n_pos}` поз\n"
-                        f"Пополни баланс или закрой часть позиций")
-                    app.bot_data["_margin_alert_ts"] = time.time()
-        except Exception as _me:
-            logger.debug("balance_alert_job margin check: %s", _me)
-
     except Exception as e:
         logger.debug("balance_alert_job: %s", e)
 
@@ -992,22 +874,15 @@ async def tpsl_enforce_job(app):
             await _check_pos(pos)
 
     # Clean up orphaned plan orders: cancel any active plan order whose symbol
-    # has no open position on the exchange (covers DB-missing cases too).
+    # has no open position on the exchange (covers DB-missing cases too)
     exchange_symbols = {pos["symbol"] for pos in positions}
     db_open_symbols = {p["symbol"] for p in db_mod.get_open_positions()}
-
-    # _delisted_orphans накапливается параллельно и используется ниже в DB sync.
-    # Контракт-делистинг (1001) — терминальное состояние: ZEC/LAB могут крутиться
-    # в orphan loop вечно если не помечать их закрытыми сразу.
-    _delisted_orphans: set[str] = set()
-
+    # DB-based cleanup (fast, no extra API call)
     async def _cancel_orphan(symbol):
         async with sem:
             try:
                 n = await client.cancel_tp_sl_orders(symbol)
-                if n == client.CANCEL_DELISTED:
-                    _delisted_orphans.add(symbol)
-                elif n > 0:
+                if n > 0:
                     logger.info("Cancelled %d orphaned plan orders for closed position %s", n, symbol)
             except Exception as e:
                 logger.warning("Orphan order cleanup %s: %s", symbol, e)
@@ -1016,30 +891,16 @@ async def tpsl_enforce_job(app):
     if orphan_syms:
         await asyncio.gather(*[_cancel_orphan(s) for s in orphan_syms])
 
-    # Sync DB: close any position that's open in DB but gone from exchange.
-    # Делистнутые контракты — закрываем БЕЗ оглядки на reentry: re-entry для
-    # делистнутого фьючерса всё равно невозможен, и оставление reentry-записи
-    # удерживает символ в orphan loop навсегда.
+    # Sync DB: close any position that's open in DB but gone from exchange
     reentry_symbols = {r["symbol"] for r in db_mod.get_all_reentry()}
     for symbol in orphan_syms:
-        is_delisted = symbol in _delisted_orphans
-        if symbol in reentry_symbols and not is_delisted:
-            continue  # reentry_job will handle close + re-entry decision
+        if symbol in reentry_symbols:
+            continue  # reentry_job will handle it (close + re-entry logic)
         db_mod.close_position(symbol)
-        db_mod.close_position_history(
-            symbol, exit_price=0, pnl=0,
-            close_reason="delisted" if is_delisted else "liquidated",
-        )
+        db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason="liquidated")
         coin = symbol.split("/")[0]
-        if is_delisted:
-            db_mod.delete_reentry(symbol)
-            logger.info("DB sync: %s delisted on MEXC, closed and reentry deleted", symbol)
-            await _notify_all(app,
-                f"⚠️ *{coin}* делистнут с MEXC — позиция и перезаход закрыты")
-        else:
-            logger.info("DB sync: closed stale open position %s (not on exchange)", symbol)
-            await _notify_all(app,
-                f"💀 *{coin}* закрыта принудительно (ликвидация или внешнее закрытие)")
+        logger.info("DB sync: closed stale open position %s (not on exchange)", symbol)
+        await _notify_all(app, f"💀 *{coin}* закрыта принудительно (ликвидация или внешнее закрытие)")
 
     # Full plan-order sweep every 5 min (every 5th run)
     run_count = app.bot_data.get("_tpsl_run_count", 0) + 1
@@ -1143,33 +1004,17 @@ async def auto_scan_job(app):
     scan_risk_pct = float(getattr(config, "auto_scan_capital_pct", 0.0))
     profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
     base_budget = max_avg_count * avg_amount + margin
-    full_budget = base_budget * (sl_pct / 100.0)
+    # Multiply by SL factor unless profit-lock SL is set (position won't reach full loss)
+    if profit_lock_trigger > 0:
+        full_budget = base_budget
+    else:
+        full_budget = base_budget * (sl_pct / 100.0)
     min_balance = full_budget * (1.0 - scan_risk_pct / 100.0)
 
     try:
         free_balance = await client.get_free_futures_balance()
     except Exception:
         free_balance = 0.0
-
-    # Compute actual remaining risk for existing open positions (mirrors balance.py logic)
-    _existing_risk = 0.0
-    try:
-        from bot import db as _db_scan
-        _min_cache_scan = app.bot_data.get("_min_order_cache", {})
-        for _ep in positions:
-            _esym = _ep.get("symbol", "")
-            _elev = int(_ep.get("leverage") or 1)
-            _erec = _db_scan.get_open_position(_esym)
-            _einv = float((_erec or {}).get("total_invested") or margin)
-            _ecnt = int((_erec or {}).get("averaging_count") or 0)
-            _erem = max(0, max_avg_count - _ecnt)
-            _enotional = _min_cache_scan.get(_esym, 0)
-            _eeff = (max(avg_amount, _enotional / max(_elev, 1) * 1.05)
-                     if _enotional > 0 else avg_amount)
-            _existing_risk += (_einv + _erem * _eeff) * (sl_pct / 100.0)
-    except Exception:
-        _existing_risk = 0.0
-    _opened_risk = 0.0  # accumulates risk of positions opened in this scan run
 
     from bot.handlers.trading import execute_open
     opened = 0
@@ -1199,52 +1044,14 @@ async def auto_scan_job(app):
             sym_max = 100
         leverage = min(user_lev, sym_max) if user_lev > 0 else sym_max
 
-        # Pre-fetch live min notional from MEXC (populate cache before skip/budget checks)
-        try:
-            _live_min = await client.get_min_order_usdt(fut_sym, leverage)
-            if _live_min > 0:
-                _live_notional = _live_min * max(leverage, 1)
-                _ao_cache = app.bot_data.setdefault("_min_order_cache", {})
-                if _live_notional > _ao_cache.get(fut_sym, 0):
-                    _ao_cache[fut_sym] = _live_notional
-                    try:
-                        from bot import db as _db_ao
-                        _db_ao.set_min_order_notional(fut_sym, _live_notional)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # Per-symbol effective avg amount and budget
-        _ao_notional = app.bot_data.get("_min_order_cache", {}).get(fut_sym, 0)
-        _ao_eff_avg = (max(avg_amount, _ao_notional / max(leverage, 1) * 1.05)
-                       if _ao_notional > 0 else avg_amount)
-        _sym_base = max_avg_count * _ao_eff_avg + margin
-        _sym_full = _sym_base * (sl_pct / 100.0)
-
-        # Capital check: free balance must cover existing risk + new position full risk
-        _total_risk = _existing_risk + _opened_risk + _sym_full
-        _needed = _total_risk * (1.0 - scan_risk_pct / 100.0)
-        if _needed > 0 and free_balance < _needed:
+        # Capital check: total balance must cover full_budget for ALL positions (existing + new)
+        current_open = initial_open_count + opened
+        total_available = free_balance + current_open * margin
+        min_total = full_budget * (current_open + 1) * (1.0 - scan_risk_pct / 100.0)
+        if min_total > 0 and total_available < min_total:
             skipped.append(f"{ticker}(мало депа)")
-            _surplus = free_balance - _existing_risk - _opened_risk
-            logger.info("AutoScan: skip %s — surplus $%.2f < needed $%.2f (existing $%.2f, new $%.2f, risk=%d%%)",
-                        ticker, _surplus, _sym_full, _existing_risk + _opened_risk, _sym_full, int(scan_risk_pct))
-            continue
-
-        # Skip only if averaging is fundamentally impossible:
-        # avg_amount * leverage must cover the MEXC minimum notional.
-        # The 5% buffer is applied at order-placement time, not here.
-        _cached_min_notional = app.bot_data.get("_min_order_cache", {}).get(fut_sym, 0)
-        if _cached_min_notional > 0 and avg_amount * max(leverage, 1) < _cached_min_notional:
-            _min_avg_margin = _cached_min_notional / max(leverage, 1) * 1.05
-            skipped.append(f"{ticker}(мин докупка ${_min_avg_margin:.2f})")
-            logger.info("AutoScan: skip %s — avg $%.2f x %d = $%.2f < min notional $%.1f",
-                        ticker, avg_amount, leverage, avg_amount * leverage, _cached_min_notional)
-            await _notify_all(app,
-                f"🚫 *AutoScan* `{ticker}` — открытие пропущено\n"
-                f"Мин. ордер MEXC `${_cached_min_notional:.0f}` при ×{leverage}: нужна маржа `${_min_avg_margin:.2f}`\n"
-                f"Настройка `averaging_amount=${avg_amount:.2f}` недостаточна")
+            logger.info("AutoScan: skip %s — total $%.2f < required $%.2f (%d poз × $%.2f, risk=%d%%)",
+                        ticker, total_available, min_total, current_open + 1, full_budget, int(scan_risk_pct))
             continue
 
         try:
@@ -1270,7 +1077,6 @@ async def auto_scan_job(app):
         open_coins.add(ticker)
         opened_names.append(coin)
         opened += 1
-        _opened_risk += _sym_full
 
     # Summary
     summary_lines = [f"🤖 *AutoScan* {now_str}"]

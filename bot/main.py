@@ -7,8 +7,6 @@ from telegram import Update
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, filters)
 
-from bot.handlers import wizard as wizard_mod
-
 from bot import db as db_mod
 from bot.config import Config
 from bot.exchange.client import ExchangeClient
@@ -17,15 +15,14 @@ from bot.handlers.scan import (scan_handler, open_callback, open_confirm_callbac
 from bot.handlers.balance import balance_handler, balance_callback
 from bot.handlers.positions import positions_handler, positions_callback
 from bot.handlers.trading import (short_handler, close_handler, avg_handler, setkey_handler,
-                                   setbet_handler, setstop_handler, settp_handler, avg_callback,
-                                   setmexc_handler)
+                                   setbet_handler, setstop_handler, settp_handler, avg_callback)
 from bot.handlers.assistant import assistant_handler, nlp_close_callback
 from bot.handlers.stats import stats_handler
 from bot.jobs.main import setup_scheduler
 from bot.handlers.monitor_callbacks import (monitor_close_callback, monitor_close_confirm_callback,
                                              monitor_close_cancel_callback, monitor_stats_callback)
 from bot.handlers.paper import paper_handler, paper_callback
-from bot.handlers.automode import automode_callback, automode_handler
+from bot.handlers.automode import automode_handler
 from bot.handlers.pin import pin_handler
 
 logging.basicConfig(
@@ -36,11 +33,6 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
-
-# python-telegram-bot uses httpx; INFO logs include full Telegram API URLs with
-# the bot token in the path. Keep HTTP client logs out of production bot.log.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 async def start_handler(update: Update, context):
@@ -95,8 +87,6 @@ def main():
             for p in db_mod.get_open_positions()
         }
         application.bot_data["tp_sl_pcts"] = tp_sl_pcts
-        # Restore min_order_cache from DB (persisted MEXC minimum notionals)
-        application.bot_data["_min_order_cache"] = db_mod.get_min_order_cache()
         setup_scheduler(application)
 
         # Deduplicate + sync DB with exchange on startup
@@ -126,7 +116,6 @@ def main():
             BotCommand("paper", "Бумажный портфель $500"),
             BotCommand("automode", "Авто-скан и открытие позиций"),
             BotCommand("pin", "Закрепить баланс (авто-обновление)"),
-            BotCommand("setmexc", "Заменить MEXC ключи (с проверкой)"),
         ])
         logger.info("Bot started.")
 
@@ -136,26 +125,6 @@ def main():
         .post_init(post_init)
         .build()
     )
-
-    async def _wizard_guard(update, context):
-        if not update.message or not update.message.text:
-            return
-        if not update.message.text.startswith("/"):
-            return
-        state = wizard_mod.active_wizard(context)
-        if state is None:
-            return
-        prefix, _ = state
-        wizard_mod.pop_wizard(context, prefix)
-        try:
-            await context.bot.send_message(
-                chat_id=update.message.chat_id,
-                text="✖️ Wizard прерван — выполняю команду.",
-            )
-        except Exception:
-            pass
-
-    app.add_handler(MessageHandler(filters.COMMAND, _wizard_guard), group=-1)
 
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", start_handler))
@@ -167,7 +136,6 @@ def main():
     app.add_handler(CommandHandler("avg", avg_handler))
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("setkey", setkey_handler))
-    app.add_handler(CommandHandler("setmexc", setmexc_handler))
     app.add_handler(CommandHandler("setbet", setbet_handler))
     app.add_handler(CommandHandler("setstop", setstop_handler))
     app.add_handler(CommandHandler("setstops", setstop_handler))
@@ -177,18 +145,6 @@ def main():
     app.add_handler(CallbackQueryHandler(paper_callback, pattern="^paper_reset"))
     app.add_handler(CommandHandler("automode", automode_handler))
     app.add_handler(CommandHandler("pin", pin_handler))
-
-    app.add_handler(CallbackQueryHandler(automode_callback, pattern=r"^automode_"))
-
-    def _wiz_cb(prefix: str):
-        async def handler(update, context):
-            await wizard_mod.handle_callback(update, context, prefix)
-        return handler
-
-    # /scan no longer uses wizard callbacks; keeping ^scan_ here intercepts
-    # scan_avg_* buttons before scan_avg_callback can handle them.
-    for _p in ("short", "close", "setbet", "setstop", "settp", "setkey"):
-        app.add_handler(CallbackQueryHandler(_wiz_cb(_p), pattern=fr"^{_p}_"))
 
     app.add_handler(CallbackQueryHandler(open_confirm_callback, pattern=r"^open_confirm_"))
     app.add_handler(CallbackQueryHandler(open_anyway_callback, pattern=r"^open_anyway_"))
@@ -205,11 +161,10 @@ def main():
     app.add_handler(CallbackQueryHandler(monitor_stats_callback, pattern=r"^mon_stats$"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^bal_close_confirm_"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^bal_close_cancel$"))
-    # transfer_* callbacks приходят из /balance и triggers UI перевода USDT spot↔futures.
-    # Сам перевод выполняется в assistant_handler по pending_transfer state.
     app.add_handler(CallbackQueryHandler(balance_callback, pattern=r"^transfer_"))
 
     app.add_handler(CallbackQueryHandler(avg_callback, pattern=r"^avg_"))
+    app.add_handler(CallbackQueryHandler(avg_callback, pattern=r"^dyn_"))
     app.add_handler(CallbackQueryHandler(nlp_close_callback, pattern=r"^nlp_close_"))
 
     # NLP free-form text (lowest priority — after all commands and callbacks)

@@ -263,20 +263,6 @@ def delete_reentry(symbol: str):
         conn.execute("DELETE FROM reentry WHERE symbol=?", (symbol,))
 
 
-def set_reentry_profit_locked(symbol: str, locked: bool):
-    with _connect() as conn:
-        try:
-            conn.execute(
-                "ALTER TABLE reentry ADD COLUMN profit_locked INTEGER NOT NULL DEFAULT 0"
-            )
-        except Exception:
-            pass
-        conn.execute(
-            "UPDATE reentry SET profit_locked=? WHERE symbol=?",
-            (1 if locked else 0, symbol)
-        )
-
-
 def get_all_reentry() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute("SELECT * FROM reentry").fetchall()
@@ -360,11 +346,12 @@ def get_daily_stats(date_str: str | None = None) -> dict:
         elif action == "reentry":
             stats["reentry_count"] = r["cnt"]
     with _connect() as conn:
+        # Win = pnl > 0 (manual close in profit) OR note='tp' (closed by TP or profit-lock SL)
         stats["wins"] = conn.execute(
-            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND pnl > 0", (d,)
+            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND (pnl > 0 OR note='tp')", (d,)
         ).fetchone()[0]
         stats["losses"] = conn.execute(
-            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND pnl <= 0", (d,)
+            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND pnl <= 0 AND note != 'tp'", (d,)
         ).fetchone()[0]
     return stats
 

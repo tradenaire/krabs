@@ -29,11 +29,6 @@ class Config:
 
     # Re-entry
     max_reentry_cycles: int = 3
-    # Если True — после loss-SL продолжаем перезаход (cycle++), как при TP/profit-SL.
-    # Если False (default) — loss-SL прерывает re-entry навсегда, чтобы не двойная
-    # просадка. Пользователь может явно включить через визард /avg или
-    # `/avg reenter_on_loss_sl 1`.
-    reenter_on_loss_sl: bool = False
 
     # Auto scan
     auto_scan_enabled: bool = False

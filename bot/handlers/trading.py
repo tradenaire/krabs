@@ -1,11 +1,9 @@
-"""/short, /close, /avg + setbet/setstop/settp/setkey — торговые команды."""
+"""/short, /close, /avg — торговые команды."""
 import asyncio
+import json
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-
-from bot.handlers import wizard
-from bot.handlers.wizard import Step
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +13,7 @@ def _funding_line(rate: float, leverage: int) -> str:
     if rate == 0:
         return ""
     pct = rate * 100
-    daily_pct = abs(pct) * 3 * leverage
+    daily_pct = abs(pct) * 3 * leverage  # 3 periods/day × leverage impact on margin
     sign = "+" if rate > 0 else ""
     icon = "💰" if rate > 0 else ("⚠️" if rate > -0.001 else "🚨")
     direction = "получаем" if rate > 0 else "платим"
@@ -23,10 +21,11 @@ def _funding_line(rate: float, leverage: int) -> str:
 
 
 def _funding_warning(rate: float, margin: float) -> str:
-    if rate >= -0.0005:
+    """Pre-open warning message if funding is costly."""
+    if rate >= -0.0005:  # better than -0.05% → no warning needed
         return ""
     pct = rate * 100
-    daily_cost_pct = abs(pct) * 3 * 100
+    daily_cost_pct = abs(pct) * 3 * 100  # rough: per 100% notional (ignoring leverage)
     if rate <= -0.003:
         return (
             f"🚨 *Дорогой фандинг!* `{pct:.4f}%`/8h\n"
@@ -40,11 +39,13 @@ def _funding_warning(rate: float, margin: float) -> str:
 
 
 def _calc_tp_price(entry: float, leverage: int, tp_pct: float, side: str) -> float:
+    """entry + leverage move that gives tp_pct PnL on margin."""
     move = entry * tp_pct / 100 / leverage
     return entry - move if side == "short" else entry + move
 
 
 def _calc_sl_price(entry: float, leverage: int, sl_pct: float, side: str) -> float:
+    """entry + leverage move that gives -sl_pct PnL on margin."""
     move = entry * sl_pct / 100 / leverage
     return entry + move if side == "short" else entry - move
 
@@ -55,6 +56,7 @@ async def execute_open(client, app, symbol: str, side: str,
     """Open a futures position with TP/SL and register re-entry."""
     config = app.bot_data.get("config")
 
+    # Resolve max leverage if not given
     if leverage is None or leverage <= 0:
         try:
             leverage = await client.get_max_leverage(symbol)
@@ -64,6 +66,7 @@ async def execute_open(client, app, symbol: str, side: str,
     order = await client.place_futures_order(symbol, side, margin, leverage)
     actual_lev = order.get("leverage", leverage) or leverage
 
+    # Wait for MEXC to settle the position
     await asyncio.sleep(2)
     pos = await client.get_position(symbol)
 
@@ -83,6 +86,7 @@ async def execute_open(client, app, symbol: str, side: str,
         except Exception as e:
             logger.warning("TP/SL set failed for %s: %s", symbol, e)
 
+    # Persist in DB
     from bot import db as db_mod
     fsym = client.futures_symbol(symbol)
     max_avg_count = int(getattr(config, "max_averaging_count", 100)) if config else 100
@@ -94,8 +98,10 @@ async def execute_open(client, app, symbol: str, side: str,
         tp_pct=tp_pct, sl_pct=sl_pct, budget=budget,
     )
 
+    # Log to stats
     db_mod.log_trade(fsym, "open", amount=margin, note=f"lev={actual_lev}")
 
+    # Full position history
     hist_side = "short" if side == "sell" else "long"
     db_mod.open_position_history(
         fsym, hist_side, actual_lev, entry, margin,
@@ -107,6 +113,7 @@ async def execute_open(client, app, symbol: str, side: str,
         avg_interval=int(getattr(config, "averaging_interval", 0)) if config else 0,
     )
 
+    # Register re-entry (skip if disabled)
     max_cycles = int(getattr(config, "max_reentry_cycles", 3)) if config else 3
     if max_cycles == 0:
         db_mod.delete_reentry(fsym)
@@ -122,6 +129,7 @@ async def execute_open(client, app, symbol: str, side: str,
             cycle_count=0,
         )
 
+    # Store tp_sl_pcts for averaging recalc
     tp_sl_pcts = app.bot_data.setdefault("tp_sl_pcts", {})
     tp_sl_pcts[fsym] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
 
@@ -140,100 +148,42 @@ async def execute_open(client, app, symbol: str, side: str,
     }
 
 
-# ── /short ────────────────────────────────────────────────────────
+async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/short SYMBOL [amount] — открыть шорт с максимальным плечом."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /short SYMBOL [amount_usdt]")
+        return
 
-async def _open_short(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
-                      symbol_raw: str, margin: float | None) -> None:
-    """Shared open-short flow. ``margin=None`` → use config default."""
+    symbol_raw = args[0].upper()
     config = context.bot_data["config"]
     client = context.bot_data["exchange"]
-    if margin is None:
-        margin = float(getattr(config, "default_trade_usdt", 0.20))
+    default_margin = float(getattr(config, "default_trade_usdt", 0.20))
+    margin = float(args[1]) if len(args) > 1 else default_margin
     tp_pct = float(getattr(config, "tp_pct", 500))
     sl_pct = float(getattr(config, "sl_pct", 500))
 
-    # Если контракт не найден — НЕ продолжаем со фейковым символом (это раньше
-    # давало криптические ошибки биржи). Подсказываем близкие тикеры.
-    from bot.ai.scanner import mexc_find_futures_symbol, mexc_suggest_tickers
+    from bot.ai.scanner import mexc_find_futures_symbol
     sym = await mexc_find_futures_symbol(client, symbol_raw)
     if not sym:
-        suggestions = await mexc_suggest_tickers(client, symbol_raw, n=3)
-        if suggestions:
-            hint = ", ".join(f"`{s}`" for s in suggestions)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Фьючерс `{symbol_raw}` не найден на MEXC.\n"
-                     f"Может имел в виду: {hint}?\n"
-                     f"Попробуй: `/short {suggestions[0]}`",
-                parse_mode="Markdown",
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Фьючерс `{symbol_raw}` не найден на MEXC и нет похожих тикеров.",
-                parse_mode="Markdown",
-            )
-        return
+        sym = client.futures_symbol(symbol_raw)
 
     coin = sym.split("/")[0]
 
+    # Fetch funding rate before opening — warn if negative
     funding_warn = ""
-    rate = 0.0
     try:
         fr = await client.get_funding_rate(sym)
         rate = fr["rate"]
         funding_warn = _funding_warning(rate, margin)
     except Exception:
-        pass
+        rate = 0.0
 
     if funding_warn:
-        await context.bot.send_message(chat_id=chat_id, text=funding_warn,
-                                       parse_mode="Markdown")
+        await update.message.reply_text(funding_warn, parse_mode="Markdown")
 
-    # Budget check: (margin + avg_budget) * sl_pct/100 = worst-case capital at risk
-    try:
-        free = await client.get_free_futures_balance()
-    except Exception:
-        free = float(context.bot_data.get("_bal_cache", 0.0))
-    avg_amount = float(getattr(config, "averaging_amount", 0.10))
-    avg_budget = float(getattr(config, "averaging_budget", 5.00))
-    profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
-    base_budget = margin + avg_budget
-    full_budget = base_budget if profit_lock_trigger > 0 else base_budget * (sl_pct / 100.0)
-    max_steps = int(avg_budget / avg_amount) if avg_amount > 0 else 0
-    if free < margin:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ Недостаточно баланса: `${free:.2f}` < маржа `${margin:.2f}`",
-            parse_mode="Markdown"
-        )
-        return
-    if free < full_budget:
-        positions_possible = int(free / full_budget) if full_budget > 0 else 0
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        margin_milli = int(margin * 1000)
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                f"⚠️ Открыть ({positions_possible} полных поз доступно)",
-                callback_data=f"open_confirm_sell_{margin_milli}_{sym}"
-            )
-        ]])
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ *{coin}* SHORT: недостаточный бюджет\n"
-                f"Свободно `${free:.2f}` · нужно `${full_budget:.2f}` на 1 поз\n"
-                f"_(маржа+докупки `${base_budget:.2f}` × SL {sl_pct:.0f}%)_\n"
-                f"Хватит на `{positions_possible}` полных позиций. Открыть всё равно?"
-            ),
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-        return
-
-    await context.bot.send_message(chat_id=chat_id,
-                                   text=f"🔻 Открываю SHORT `{coin}` ${margin:g}...",
-                                   parse_mode="Markdown")
+    await update.message.reply_text(f"🔻 Открываю SHORT `{coin}` ${margin:g}...",
+                                     parse_mode="Markdown")
     try:
         result = await execute_open(
             client, context.application, sym, "sell", margin,
@@ -249,63 +199,29 @@ async def _open_short(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             lines.append(f"✅ TP: `{result['tp_price']:.6g}` (+{tp_pct:.0f}%)")
         if result.get("sl_price"):
             lines.append(f"🛑 SL: `{result['sl_price']:.6g}` (-{sl_pct:.0f}%)")
-        funding = _funding_line(rate, result["leverage"])
-        if funding:
-            lines.append(funding)
-        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines),
-                                       parse_mode="Markdown")
+        lines.append(_funding_line(rate, result["leverage"]))
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
-SHORT_STEPS: list[Step] = [
-    Step(key="symbol", prompt="Тикер монеты (BTC, SOL, …)", kind="text",
-         optional=False, parser=lambda s: s.strip().upper()),
-    Step(key="margin", attr="default_trade_usdt",
-         prompt="Маржа в USDT (SKIP — использовать дефолт)",
-         kind="float", unit="$", optional=True),
-]
-
-
-async def _short_finish(context, chat_id: int, wizard_state: dict) -> None:
-    values = wizard_state.get("values", {}) or {}
-    symbol = values.get("symbol")
-    if not symbol:
-        await context.bot.send_message(chat_id=chat_id, text="❌ Тикер не указан.")
-        return
-    margin = values.get("margin")  # None → default in _open_short
-    await _open_short(context, chat_id, symbol, margin)
-
-
-wizard.register("short", SHORT_STEPS, _short_finish)
-
-
-async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/short [SYMBOL [amount]] — открыть шорт. Без args — визард."""
+async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/close SYMBOL — закрыть позицию."""
     args = context.args or []
     if not args:
-        wizard.start_wizard(context, "short")
-        await wizard.render_step(context.bot, update.message.chat_id, "short", 0, context)
+        await update.message.reply_text("Использование: /close SYMBOL")
         return
 
     symbol_raw = args[0].upper()
-    margin = float(args[1]) if len(args) > 1 else None
-    await _open_short(context, update.message.chat_id, symbol_raw, margin)
-
-
-# ── /close ────────────────────────────────────────────────────────
-
-async def _close_symbol(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
-                        symbol_raw: str) -> None:
     client = context.bot_data["exchange"]
+
     from bot.ai.scanner import mexc_find_futures_symbol
     sym = await mexc_find_futures_symbol(client, symbol_raw)
     if not sym:
         sym = client.futures_symbol(symbol_raw)
 
     coin = sym.split("/")[0]
-    await context.bot.send_message(chat_id=chat_id, text=f"Закрываю `{coin}`...",
-                                   parse_mode="Markdown")
+    await update.message.reply_text(f"Закрываю `{coin}`...", parse_mode="Markdown")
     try:
         pos = await client.get_position(sym)
         pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
@@ -318,243 +234,408 @@ async def _close_symbol(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         db_mod.delete_reentry(sym)
         db_mod.log_trade(sym, "close", amount=margin, pnl=pnl, note="manual")
         db_mod.close_position_history(sym, exit_price, pnl, "manual")
-        await context.bot.send_message(chat_id=chat_id, text=f"✅ *{coin}* закрыт.",
-                                       parse_mode="Markdown")
+        await update.message.reply_text(f"✅ *{coin}* закрыт.", parse_mode="Markdown")
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка закрытия: {e}")
+        await update.message.reply_text(f"❌ Ошибка закрытия: {e}")
 
 
-def _close_choices(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[str, str]]:
-    return list(context.user_data.get("_close_choices", []))
+# ── Avg wizard ────────────────────────────────────────────────────
 
-
-CLOSE_STEPS: list[Step] = [
-    Step(key="coin", prompt="Какую позицию закрыть?",
-         kind="choice", optional=False, choices=_close_choices),
+AVG_WIZARD_STEPS = [
+    (1, "bet",       "default_trade_usdt",     float, "Маржа",        "$"),
+    (2, "leverage",  "default_leverage",       int,   "Плечо",        "#"),
+    (3, "tp",        "tp_pct",                 float, "TP",           "%"),
+    (4, "sl",        "sl_pct",                 float, "SL",           "%"),
+    (5, "threshold", "averaging_threshold",    float, "При PnL",      "%"),
+    (6, "amount",    "averaging_amount",       float, "Сумма",        "$"),
+    (7, "maxavg",    "max_averaging_count",    int,   "Макс",         "#"),
+    (8, "interval",  "averaging_interval",     int,   "Интервал",     "s"),
+    (10, "scan_cap", "auto_scan_capital_pct",  float, "Авто-капитал", "%"),
 ]
 
-
-async def _close_finish(context, chat_id: int, wizard_state: dict) -> None:
-    values = wizard_state.get("values", {}) or {}
-    coin = values.get("coin")
-    context.user_data.pop("_close_choices", None)
-    if not coin:
-        await context.bot.send_message(chat_id=chat_id, text="✖️ Отменено.")
-        return
-    await _close_symbol(context, chat_id, coin)
+_AVG_BY_NUM = {num: (key, attr, cast, label, unit) for num, key, attr, cast, label, unit in AVG_WIZARD_STEPS}
+_AVG_BY_KEY = {key: (num, attr, cast, label, unit) for num, key, attr, cast, label, unit in AVG_WIZARD_STEPS}
 
 
-wizard.register("close", CLOSE_STEPS, _close_finish)
-
-
-async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/close [SYMBOL] — закрыть позицию. Без args — визард с выбором из открытых."""
-    args = context.args or []
-    if args:
-        await _close_symbol(context, update.message.chat_id, args[0].upper())
-        return
-
-    client = context.bot_data["exchange"]
+def _load_avg_dynamic_rules() -> list[dict]:
+    from bot import db as db_mod
+    raw = db_mod.get_config("avg_dynamic_rules", "")
+    if not raw:
+        return []
     try:
-        positions = await client.get_positions()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Не получилось получить позиции: {e}")
-        return
-
-    if not positions:
-        await update.message.reply_text("Нет открытых позиций.")
-        return
-
-    choices: list[tuple[str, str]] = []
-    for p in positions:
-        coin = p["symbol"].split("/")[0]
-        side = p.get("side", "")
-        icon = "🔻" if side == "short" else "🟩"
-        pnl = p.get("unrealized_pnl")
+        rules = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(rules, list):
+        return []
+    out: list[dict] = []
+    for r in rules[:4]:
         try:
-            pnl_str = f" ({float(pnl):+.2f}$)" if pnl is not None else ""
-        except (TypeError, ValueError):
-            pnl_str = ""
-        choices.append((f"{icon} {coin}{pnl_str}", coin))
-
-    context.user_data["_close_choices"] = choices
-    wizard.start_wizard(context, "close")
-    await wizard.render_step(context.bot, update.message.chat_id, "close", 0, context)
-
-
-# ── /avg ──────────────────────────────────────────────────────────
-
-AVG_STEPS: list[Step] = [
-    Step(key="default_trade_usdt",  attr="default_trade_usdt",
-         prompt="Маржа на сделку",         kind="float", unit="$"),
-    Step(key="default_leverage",    attr="default_leverage",
-         prompt="Плечо (0=макс)",          kind="int:0:200", unit="#"),
-    Step(key="tp_pct",              attr="tp_pct",
-         prompt="Тейкпрофит",              kind="float", unit="%"),
-    Step(key="sl_pct",              attr="sl_pct",
-         prompt="Стоплосс",                kind="float", unit="%"),
-    Step(key="averaging_threshold", attr="averaging_threshold",
-         prompt="Докупка при PnL",         kind="float", unit="%"),
-    Step(key="averaging_amount",    attr="averaging_amount",
-         prompt="Сумма докупки",           kind="float", unit="$"),
-    Step(key="max_averaging_count", attr="max_averaging_count",
-         prompt="Макс докупок",            kind="int:0:1000", unit="#"),
-    Step(key="max_reentry_cycles",  attr="max_reentry_cycles",
-         prompt="Перезаходов макс",        kind="int:0:1000", unit="#"),
-    # Опасный флаг: True = перезаходить даже после loss-SL. Дефолт False.
-    # См. bot/jobs/main.py reentry_job — ветка `not closed_by_tp and not profitable_sl`.
-    Step(key="reenter_on_loss_sl",  attr="reenter_on_loss_sl",
-         prompt="Перезаход после loss-SL (опасно)", kind="bool"),
-    # Profit-lock: при достижении PnL ≥ trigger переставить SL на lock_sl PnL.
-    # 0 в trigger = выкл (используется prod jobs/main.py averaging_job).
-    Step(key="averaging_profit_lock_trigger", attr="averaging_profit_lock_trigger",
-         prompt="Локк SL при профите ≥ (0=выкл)", kind="float", unit="%"),
-    Step(key="averaging_profit_lock_sl_pct",  attr="averaging_profit_lock_sl_pct",
-         prompt="Поставить SL на PnL",            kind="float", unit="%"),
-    # Auto-scan capital risk: 0 = требовать полный бюджет, 100 = всегда открывать.
-    Step(key="auto_scan_capital_pct",         attr="auto_scan_capital_pct",
-         prompt="Авто-капитал риск (0..100)",     kind="float", unit="%"),
-]
+            out.append({
+                "after": int(r["after"]),
+                "pnl": float(r["pnl"]),
+                "amount": float(r["amount"]),
+            })
+        except Exception:
+            continue
+    return sorted(out, key=lambda r: r["after"])
 
 
-def _build_avg_text(config) -> str:
-    # Помимо базовых настроек — отображаем профит-локк и авто-капитал риск
-    # (поля принесены из prod вместе с config-keys и ловятся jobs/main.py averaging_job).
-    lock_trig = float(getattr(config, "averaging_profit_lock_trigger", 0) or 0)
-    lock_sl   = float(getattr(config, "averaging_profit_lock_sl_pct", 0) or 0)
-    scan_cap  = float(getattr(config, "auto_scan_capital_pct", 0) or 0)
-    lock_line = (f"  Профит-локк: при `+{lock_trig:.0f}%` → SL в `+{lock_sl:.0f}%`"
-                 if lock_trig > 0 else "  Профит-локк: выкл")
-    scan_line = f"  Авто-капитал риск: `{scan_cap:.0f}%`"
+def _save_avg_dynamic_rules(rules: list[dict]) -> None:
+    from bot import db as db_mod
+    clean = []
+    for r in rules[:4]:
+        try:
+            amount = float(r["amount"])
+            if amount <= 0:
+                continue
+            clean.append({
+                "after": int(r["after"]),
+                "pnl": float(r["pnl"]),
+                "amount": amount,
+            })
+        except Exception:
+            continue
+    clean.sort(key=lambda r: r["after"])
+    db_mod.set_config("avg_dynamic_rules", json.dumps(clean) if clean else "")
+
+
+def _fmt_dyn_rule(rule: dict | None) -> str:
+    if not rule:
+        return "выкл"
+    return f"после `{int(rule['after'])}` докупок → PnL ≤ `{float(rule['pnl']):.0f}%`, сумма `${float(rule['amount']):.2f}`"
+
+
+def _avg_fmt(config, attr: str, unit: str) -> str:
+    val = getattr(config, attr, 0)
+    if unit == "$":
+        return f"${float(val):.2f}"
+    if unit == "#":
+        return str(int(val))
+    if unit == "s":
+        return f"{int(val)}s"
+    return f"{float(val):.0f}%"
+
+
+def avg_pending_for_number(num: int) -> dict | None:
+    if num in _AVG_BY_NUM:
+        key, attr, cast, label, unit = _AVG_BY_NUM[num]
+        return {"num": num, "kind": "simple", "key": key, "attr": attr,
+                "cast": cast.__name__, "label": label, "unit": unit}
+    if num == 9:
+        return {"num": 9, "kind": "lock", "key": "profit_lock", "label": "Профит-локк"}
+    if 11 <= num <= 14:
+        return {"num": num, "kind": "dyn", "key": f"dyn_{num - 10}",
+                "label": f"Ступень {num - 10}", "index": num - 11}
+    return None
+
+
+def avg_pending_for_key(key: str) -> dict | None:
+    if key in _AVG_BY_KEY:
+        num, attr, cast, label, unit = _AVG_BY_KEY[key]
+        return {"num": num, "kind": "simple", "key": key, "attr": attr,
+                "cast": cast.__name__, "label": label, "unit": unit}
+    if key == "profit_lock":
+        return avg_pending_for_number(9)
+    if key.startswith("dyn_"):
+        try:
+            dyn_num = int(key.split("_", 1)[1])
+        except ValueError:
+            return None
+        if 1 <= dyn_num <= 4:
+            return avg_pending_for_number(10 + dyn_num)
+    return None
+
+
+def avg_question_text(config, pending: dict) -> str:
+    num = int(pending["num"])
+    label = pending["label"]
+    kind = pending.get("kind")
+    if kind == "simple":
+        cur = _avg_fmt(config, pending["attr"], pending["unit"])
+        return f"*{num}. {label}*\nСейчас: `{cur}`\n\nВведи новое значение:"
+    if kind == "lock":
+        trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
+        sl_pct = float(getattr(config, "averaging_profit_lock_sl_pct", 0))
+        cur = f"при +{trigger:.0f}% → SL +{sl_pct:.0f}%" if trigger > 0 else "выкл"
+        return (
+            f"*9. Профит-локк*\nСейчас: `{cur}`\n\n"
+            "Введи два числа: `trigger sl`, например `150 100`.\n"
+            "Или `0`, чтобы выключить."
+        )
+    rules = _load_avg_dynamic_rules()
+    idx = int(pending["index"])
+    cur = _fmt_dyn_rule(rules[idx] if idx < len(rules) else None)
+    return (
+        f"*{num}. {label}*\nСейчас: {cur}\n\n"
+        "Введи три значения: `после PnL сумма`, например `50 -150 0.10`.\n"
+        "Или `0`, чтобы выключить эту ступень."
+    )
+
+
+def _parse_numbers(text: str) -> list[float]:
+    parts = text.replace(",", ".").replace(";", " ").split()
+    return [float(p) for p in parts]
+
+
+async def apply_avg_pending_value(context: ContextTypes.DEFAULT_TYPE,
+                                  pending: dict, text: str) -> str:
+    config = context.bot_data["config"]
+    kind = pending.get("kind")
+    from bot import db as db_mod
+
+    if kind == "simple":
+        cast = {"float": float, "int": int}.get(pending["cast"], float)
+        raw = text.replace(",", ".").strip()
+        val = cast(float(raw)) if cast is int else cast(raw)
+        setattr(config, pending["attr"], val)
+        db_mod.set_config(pending["attr"], str(val))
+
+        key = pending["key"]
+        if key in ("tp", "sl"):
+            await _reapply_tpsl_all(context.application, config)
+        if key == "interval":
+            from bot.jobs.main import reschedule_averaging
+            reschedule_averaging(context.application, int(val))
+        if key in ("amount", "maxavg"):
+            new_budget = config.max_averaging_count * config.averaging_amount
+            with db_mod._connect() as conn:
+                conn.execute("UPDATE positions SET averaging_budget=? WHERE status='open'", (new_budget,))
+        return f"{pending['num']}. {pending['label']} → `{_avg_fmt(config, pending['attr'], pending['unit'])}`"
+
+    lo = text.strip().lower()
+    if kind == "lock":
+        if lo in ("0", "off", "выкл", "выключить", "нет"):
+            trigger = 0.0
+            sl_pct = 0.0
+        else:
+            nums = _parse_numbers(text)
+            if len(nums) < 2:
+                raise ValueError("нужно два числа: trigger sl, например `150 100`, или `0`")
+            trigger, sl_pct = nums[0], nums[1]
+            if trigger < 0 or sl_pct < 0:
+                raise ValueError("значения профит-локка должны быть ≥ 0")
+        config.averaging_profit_lock_trigger = float(trigger)
+        config.averaging_profit_lock_sl_pct = float(sl_pct)
+        db_mod.set_config("averaging_profit_lock_trigger", str(trigger))
+        db_mod.set_config("averaging_profit_lock_sl_pct", str(sl_pct))
+        return "9. Профит-локк → `выкл`" if trigger <= 0 else (
+            f"9. Профит-локк → `+{trigger:.0f}% → SL +{sl_pct:.0f}%`"
+        )
+
+    if kind == "dyn":
+        rules = _load_avg_dynamic_rules()
+        idx = int(pending["index"])
+        if lo in ("0", "off", "выкл", "выключить", "нет"):
+            if idx < len(rules):
+                rules.pop(idx)
+            _save_avg_dynamic_rules(rules)
+            return f"{pending['num']}. {pending['label']} → `выкл`"
+
+        nums = _parse_numbers(text)
+        if len(nums) < 3:
+            raise ValueError("нужно три значения: `после PnL сумма`, например `50 -150 0.10`, или `0`")
+        after, pnl, amount = int(nums[0]), float(nums[1]), float(nums[2])
+        if after < 0:
+            raise ValueError("количество докупок должно быть ≥ 0")
+        if pnl > 0:
+            pnl = -pnl
+        if amount <= 0:
+            raise ValueError("сумма докупки должна быть > 0")
+        while len(rules) <= idx:
+            rules.append({"after": 0, "pnl": -100.0, "amount": float(getattr(config, "averaging_amount", 0.1))})
+        rules[idx] = {"after": after, "pnl": pnl, "amount": amount}
+        _save_avg_dynamic_rules(rules)
+        return f"{pending['num']}. {pending['label']} → `{_fmt_dyn_rule(rules[idx])}`"
+
+    raise ValueError("неизвестный пункт настройки")
+
+
+def _build_avg_select_kb(config) -> InlineKeyboardMarkup:
+    """Keyboard with one button per numbered setting."""
+    rows = []
+    pair = []
+    for num in range(1, 15):
+        pending = avg_pending_for_number(num)
+        if not pending:
+            continue
+        label = f"{num}. {pending['label']}"
+        pair.append(InlineKeyboardButton(label, callback_data=f"avg_pick_{pending['key']}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("✖ Готово", callback_data="avg_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_avg_wizard_step(bot, chat_id: int, step_idx: int, config) -> None:
+    _num, _key, attr, _cast, label, unit = AVG_WIZARD_STEPS[step_idx]
+    cur = _avg_fmt(config, attr, unit)
+    total = 14
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭ Пропустить", callback_data=f"avg_skip_{step_idx}"),
+        InlineKeyboardButton("✖ Отмена", callback_data="avg_cancel"),
+    ]])
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"*{label}* ({step_idx + 1}/{total})\nСейчас: `{cur}`\nВведи новое значение:",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+def _build_avg_text(config, free_balance: float | None = None, open_count: int = 0) -> str:
+    lock_trig = float(getattr(config, "averaging_profit_lock_trigger", 0))
+    lock_sl = float(getattr(config, "averaging_profit_lock_sl_pct", 0))
+    lock_line = (f"9. Профит-локк: при `+{lock_trig:.0f}%` → SL в `+{lock_sl:.0f}%`"
+                 if lock_trig > 0 else "9. Профит-локк: выкл")
+    scan_risk = float(getattr(config, "auto_scan_capital_pct", 0))
+    avg_count = int(getattr(config, "max_averaging_count", 100))
+    avg_amt = float(getattr(config, "averaging_amount", 0.5))
+    bet = float(getattr(config, "default_trade_usdt", 0.2))
+    sl_f = float(getattr(config, "sl_pct", 500))
+    lock_trig_f = float(getattr(config, "averaging_profit_lock_trigger", 0))
+    base_bud = avg_count * avg_amt + bet
+    full_budget = base_bud if lock_trig_f > 0 else base_bud * (sl_f / 100.0)
+    min_dep = full_budget * (1 - scan_risk / 100)
+    lock_note = " (lock)" if lock_trig_f > 0 else f" (×SL{sl_f:.0f}%)"
+    if free_balance is not None:
+        total_avail = free_balance + open_count * bet
+        total_needed = full_budget * (open_count + 1) * (1.0 - scan_risk / 100.0)
+        ok = "✅" if total_avail >= total_needed else "❌"
+        pos_label = f"{open_count + 1} поз" if open_count else "1 поз"
+        scan_risk_line = (
+            f"10. Авто-капитал: `{scan_risk:.0f}%` → `${total_needed:.2f}` ({pos_label}×`${full_budget:.2f}`){lock_note}"
+            f" | фьюч `${free_balance:.2f}` {ok}"
+        )
+    else:
+        scan_risk_line = (
+            f"10. Авто-капитал: `{scan_risk:.0f}%` → нужно `${min_dep:.2f}`/поз{lock_note}"
+        )
     lines = [
         "*Торговые настройки*",
         "",
         "*Вход*",
-        f"  Маржа: `${config.default_trade_usdt:.2f}`",
-        f"  Плечо: `{'макс' if not config.default_leverage else f'×{config.default_leverage}'}`",
-        f"  TP:    `{config.tp_pct:.0f}%`",
-        f"  SL:    `{config.sl_pct:.0f}%`",
+        f"1. Маржа: `${config.default_trade_usdt:.2f}`",
+        f"2. Плечо: `{'макс' if not config.default_leverage else f'×{config.default_leverage}'}`",
+        f"3. TP: `{config.tp_pct:.0f}%`",
+        f"4. SL: `{config.sl_pct:.0f}%`",
         "",
         "*Докупка*",
-        f"  При PnL: `{config.averaging_threshold:.0f}%`",
-        f"  Сумма:   `${config.averaging_amount:.2f}`",
-        f"  Макс:    `{config.max_averaging_count}` докупок",
-        f"  Интервал:`{config.averaging_interval}s`",
+        f"5. При PnL: `{config.averaging_threshold:.0f}%`",
+        f"6. Сумма: `${config.averaging_amount:.2f}`",
+        f"7. Макс: `{config.max_averaging_count}` докупок",
+        f"8. Интервал: `{config.averaging_interval}s`",
         lock_line,
-        scan_line,
+        scan_risk_line,
+        "",
+        "_Напиши номер `1`-`14`, чтобы изменить конкретный пункт._",
     ]
+    dyn = _load_avg_dynamic_rules()
+    lines.append("")
+    lines.append("*Динамика докупки:*")
+    for i in range(4):
+        lines.append(f"{11 + i}. Ступень {i + 1}: {_fmt_dyn_rule(dyn[i] if i < len(dyn) else None)}")
     return "\n".join(lines)
 
 
-def _avg_intro(context: ContextTypes.DEFAULT_TYPE) -> str:
-    config = context.bot_data.get("config")
-    if config is None:
-        return ""
-    return _build_avg_text(config)
-
-
-async def _avg_finish(context, chat_id: int, wizard_state: dict) -> None:
-    config = context.bot_data["config"]
-    changed = wizard_state.get("changed", {}) or {}
-    if not changed:
-        await context.bot.send_message(chat_id=chat_id, text="Ничего не изменено.")
-        return
-
-    from bot import db as db_mod
-    for attr, value in changed.items():
-        setattr(config, attr, value)
-        db_mod.set_config(attr, str(value))
-
-    lines = ["✅ *Настройки обновлены:*", ""]
-    for step in AVG_STEPS:
-        if step.key not in changed:
-            continue
-        lines.append(f"  {step.prompt}: `{wizard.format_value(step, changed[step.key])}`")
-    lines.append("")
-    lines.append(_build_avg_text(config))
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines),
-                                   parse_mode="Markdown")
-
-    if "tp_pct" in changed or "sl_pct" in changed:
-        await _reapply_tpsl_all(context.application, config)
-    if "averaging_amount" in changed or "max_averaging_count" in changed:
-        new_budget = config.max_averaging_count * config.averaging_amount
-        with db_mod._connect() as conn:
-            conn.execute("UPDATE positions SET averaging_budget=? WHERE status='open'",
-                         (new_budget,))
-
-
-wizard.register("avg", AVG_STEPS, _avg_finish, intro=_avg_intro)
-
-
-_AVG_PARAM_TO_ATTR = {
-    "bet":          ("default_trade_usdt", float),
-    "leverage":     ("default_leverage", int),
-    "tp":           ("tp_pct", float),
-    "sl":           ("sl_pct", float),
-    "threshold":    ("averaging_threshold", float),
-    "amount":       ("averaging_amount", float),
-    "interval":     ("averaging_interval", int),
-    "maxavg":       ("max_averaging_count", int),
-    # Принесено из prod: profit-lock + auto-scan capital — позволяет
-    # /avg lock_trigger 100 / /avg lock_sl 50 / /avg scan_cap 50 без визарда.
-    "lock_trigger": ("averaging_profit_lock_trigger", float),
-    "lock_sl":      ("averaging_profit_lock_sl_pct", float),
-    "scan_cap":     ("auto_scan_capital_pct", float),
-    # bool: 1/yes/true/вкл = True, 0/no/false/выкл = False (см. _bool_arg ниже)
-    "reenter_on_loss_sl": ("reenter_on_loss_sl", "bool"),
-}
-
-
-def _bool_arg(s: str) -> bool:
-    """Принимает '1'/'0'/'true'/'false'/'on'/'off'/'вкл'/'выкл' и т.п."""
-    v = str(s).strip().lower()
-    if v in ("1", "true", "yes", "y", "on", "вкл", "включи", "включить"):
-        return True
-    if v in ("0", "false", "no", "n", "off", "выкл", "выключи", "выключить"):
-        return False
-    raise ValueError(f"ожидался bool, получено: {s}")
-
-
 async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/avg [param] [value] — все торговые настройки. Без args/неизвестный — визард."""
+    """/avg [param] [value] — все торговые настройки."""
     config = context.bot_data["config"]
     args = context.args or []
 
-    if len(args) < 2 or args[0].lower() not in _AVG_PARAM_TO_ATTR:
-        wizard.start_wizard(context, "avg")
-        await wizard.send_intro(context.bot, update.message.chat_id, "avg", context)
-        await wizard.render_step(context.bot, update.message.chat_id, "avg", 0, context)
+    if not args:
+        client = context.bot_data.get("exchange")
+        free_balance: float | None = None
+        open_count = 0
+        if client:
+            try:
+                free_balance = await client.get_free_futures_balance()
+            except Exception:
+                pass
+            pos_cache = context.bot_data.get("_pos_cache")
+            if pos_cache is not None:
+                open_count = len(pos_cache)
+            else:
+                try:
+                    open_count = len(await client.get_positions())
+                except Exception:
+                    pass
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить", callback_data="avg_edit")],
+            [InlineKeyboardButton("⚙️ Динамика докупки", callback_data="dyn_setup")],
+        ])
+        context.user_data["avg_select_mode"] = True
+        await update.message.reply_text(_build_avg_text(config, free_balance, open_count),
+                                        parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if args[0].isdigit():
+        pending = avg_pending_for_number(int(args[0]))
+        if not pending:
+            await update.message.reply_text("Номер должен быть от 1 до 14.")
+            return
+        if len(args) < 2:
+            context.user_data["avg_pending"] = pending
+            context.user_data["avg_select_mode"] = True
+            await update.message.reply_text(
+                avg_question_text(config, pending),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data="avg_back")]]),
+            )
+            return
+        try:
+            result = await apply_avg_pending_value(context, pending, " ".join(args[1:]))
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}", parse_mode="Markdown")
+            return
+        await update.message.reply_text(f"✅ {result}", parse_mode="Markdown")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Использование: `/avg param value`\n"
+            "Параметры: `bet`, `tp`, `sl`, `threshold`, `amount`, `budget`, `interval`",
+            parse_mode="Markdown"
+        )
         return
 
     param, val_str = args[0].lower(), args[1]
-    if param not in _AVG_PARAM_TO_ATTR:
-        await update.message.reply_text(f"Неизвестный параметр: `{param}`",
-                                        parse_mode="Markdown")
-        return
-
-    attr, cast = _AVG_PARAM_TO_ATTR[param]
-    # Маркер "bool" → особая обработка через _bool_arg, остальные cast — float/int.
     try:
-        if cast == "bool":
-            casted = _bool_arg(val_str)
-            db_value = "true" if casted else "false"
-        else:
-            val = float(val_str)
-            casted = cast(val)
-            db_value = str(val)
-    except ValueError as e:
-        await update.message.reply_text(f"Неверное значение: {val_str} ({e})")
+        val = float(val_str)
+    except ValueError:
+        await update.message.reply_text(f"Неверное значение: {val_str}")
         return
 
-    setattr(config, attr, casted)
-    from bot import db as db_mod
-    db_mod.set_config(attr, db_value)
+    field_map = {
+        "bet":          ("default_trade_usdt", float),
+        "leverage":     ("default_leverage", int),
+        "tp":           ("tp_pct", float),
+        "sl":           ("sl_pct", float),
+        "threshold":    ("averaging_threshold", float),
+        "amount":       ("averaging_amount", float),
+        "interval":     ("averaging_interval", int),
+        "maxavg":       ("max_averaging_count", int),
+        "lock_trigger": ("averaging_profit_lock_trigger", float),
+        "lock_sl":      ("averaging_profit_lock_sl_pct", float),
+        "scan_cap":     ("auto_scan_capital_pct", float),
+    }
+    if param not in field_map:
+        await update.message.reply_text(
+            f"Неизвестный параметр: `{param}`\n"
+            "Доступны: `bet`, `leverage`, `tp`, `sl`, `threshold`, `amount`, `interval`, `maxavg`, `lock_trigger`, `lock_sl`, `scan_cap`",
+            parse_mode="Markdown"
+        )
+        return
 
-    label_map = {"bet": f"${casted:.2f}" if isinstance(casted, (int, float)) else str(casted),
-                 "tp":  f"{casted:.0f}%" if isinstance(casted, (int, float)) else str(casted),
-                 "sl":  f"{casted:.0f}%" if isinstance(casted, (int, float)) else str(casted)}
-    label = label_map.get(param, ("ВКЛ" if casted else "ВЫКЛ") if isinstance(casted, bool) else str(casted))
+    attr, cast = field_map[param]
+    setattr(config, attr, cast(val))
+    from bot import db as db_mod
+    db_mod.set_config(attr, str(val))
+
+    label = {"bet": f"${val:.2f}", "tp": f"{val:.0f}%", "sl": f"{val:.0f}%"}.get(param, str(val))
     await update.message.reply_text(f"✅ `{param}` = `{label}`", parse_mode="Markdown")
 
     if param in ("tp", "sl"):
@@ -562,13 +643,12 @@ async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if param == "interval":
         from bot.jobs.main import reschedule_averaging
-        reschedule_averaging(context.application, int(casted))
+        reschedule_averaging(context.application, int(val))
 
     if param in ("amount", "maxavg"):
         new_budget = config.max_averaging_count * config.averaging_amount
         with db_mod._connect() as conn:
-            conn.execute("UPDATE positions SET averaging_budget=? WHERE status='open'",
-                         (new_budget,))
+            conn.execute("UPDATE positions SET averaging_budget=? WHERE status='open'", (new_budget,))
 
 
 async def _reapply_tpsl_all(app, config) -> None:
@@ -609,203 +689,185 @@ async def _reapply_tpsl_all(app, config) -> None:
 
 
 async def avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await wizard.handle_callback(update, context, "avg")
-
-
-# ── Single-step setting wizards ───────────────────────────────────
-
-SETBET_STEPS: list[Step] = [
-    Step(key="default_trade_usdt", attr="default_trade_usdt",
-         prompt="Ставка в USDT (например 1.50)", kind="float", unit="$"),
-]
-
-
-async def _setbet_finish(context, chat_id: int, wizard_state: dict) -> None:
-    config = context.bot_data["config"]
-    changed = wizard_state.get("changed", {}) or {}
-    if "default_trade_usdt" not in changed:
-        await context.bot.send_message(chat_id=chat_id, text="Без изменений.")
+    """Callback for /avg inline wizard."""
+    q = update.callback_query
+    await q.answer()
+    config = context.bot_data.get("config")
+    if not config:
+        await q.edit_message_text("❌ Конфиг недоступен.")
         return
-    val = float(changed["default_trade_usdt"])
-    config.default_trade_usdt = val
-    from bot import db as db_mod
-    db_mod.set_config("default_trade_usdt", str(val))
-    await context.bot.send_message(chat_id=chat_id,
-                                   text=f"✅ *Ставка* применена: `${val:.2f}`",
-                                   parse_mode="Markdown")
 
-
-wizard.register("setbet", SETBET_STEPS, _setbet_finish)
-
-
-SETSTOP_STEPS: list[Step] = [
-    Step(key="sl_pct", attr="sl_pct",
-         prompt="Стоплосс в % от маржи (например 500)", kind="float", unit="%"),
-]
-
-
-async def _setstop_finish(context, chat_id: int, wizard_state: dict) -> None:
-    config = context.bot_data["config"]
-    changed = wizard_state.get("changed", {}) or {}
-    if "sl_pct" not in changed:
-        await context.bot.send_message(chat_id=chat_id, text="Без изменений.")
+    if q.data in ("avg_edit", "avg_back"):
+        context.user_data.pop("avg_pending", None)
+        context.user_data["avg_select_mode"] = True
+        await q.edit_message_text(
+            _build_avg_text(config) + "\n\n_Выбери параметр для изменения:_",
+            parse_mode="Markdown",
+            reply_markup=_build_avg_select_kb(config),
+        )
         return
-    val = float(changed["sl_pct"])
-    config.sl_pct = val
-    from bot import db as db_mod
-    db_mod.set_config("sl_pct", str(val))
-    await context.bot.send_message(chat_id=chat_id,
-                                   text=f"✅ *Стоплосс* применён: `{val:.0f}%`",
-                                   parse_mode="Markdown")
-    await _reapply_tpsl_all(context.application, config)
 
-
-wizard.register("setstop", SETSTOP_STEPS, _setstop_finish)
-
-
-SETTP_STEPS: list[Step] = [
-    Step(key="tp_pct", attr="tp_pct",
-         prompt="Тейкпрофит в % от маржи (например 500)", kind="float", unit="%"),
-]
-
-
-async def _settp_finish(context, chat_id: int, wizard_state: dict) -> None:
-    config = context.bot_data["config"]
-    changed = wizard_state.get("changed", {}) or {}
-    if "tp_pct" not in changed:
-        await context.bot.send_message(chat_id=chat_id, text="Без изменений.")
+    if q.data == "avg_done":
+        context.user_data.pop("avg_pending", None)
+        context.user_data.pop("avg_select_mode", None)
+        client = context.bot_data.get("exchange")
+        free_balance: float | None = None
+        open_count = 0
+        if client:
+            try:
+                free_balance = await client.get_free_futures_balance()
+            except Exception:
+                pass
+            pos_cache = context.bot_data.get("_pos_cache")
+            open_count = len(pos_cache) if pos_cache is not None else 0
+        await q.edit_message_text(
+            _build_avg_text(config, free_balance, open_count),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Изменить", callback_data="avg_edit")]]),
+        )
         return
-    val = float(changed["tp_pct"])
-    config.tp_pct = val
-    from bot import db as db_mod
-    db_mod.set_config("tp_pct", str(val))
-    await context.bot.send_message(chat_id=chat_id,
-                                   text=f"✅ *Тейкпрофит* применён: `{val:.0f}%`",
-                                   parse_mode="Markdown")
-    await _reapply_tpsl_all(context.application, config)
+
+    if q.data.startswith("avg_pick_"):
+        key = q.data[len("avg_pick_"):]
+        pending = avg_pending_for_key(key)
+        if not pending:
+            await q.answer("Неизвестный параметр")
+            return
+        context.user_data["avg_pending"] = pending
+        context.user_data["avg_select_mode"] = True
+        await q.edit_message_text(
+            avg_question_text(config, pending),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data="avg_back")]]),
+        )
+        return
+
+    if q.data == "avg_cancel":
+        context.user_data.pop("avg_pending", None)
+        context.user_data.pop("avg_wizard", None)
+        context.user_data.pop("avg_select_mode", None)
+        await q.edit_message_text("✖ Изменение настроек отменено.")
+        return
+
+    if q.data == "dyn_setup":
+        from bot import db as db_mod
+        dyn_raw = db_mod.get_config("avg_dynamic_rules", "")
+        cur_text = ""
+        if dyn_raw:
+            try:
+                dyn = json.loads(dyn_raw)
+                if dyn:
+                    rows_txt = []
+                    for i, r in enumerate(dyn, 1):
+                        rows_txt.append(f"  {i}. после {r['after']} докупок → PnL≤{r['pnl']:.0f}%, ${r['amount']:.2f}")
+                    cur_text = "\n*Текущие правила:*\n" + "\n".join(rows_txt) + "\n\n"
+            except Exception:
+                pass
+        context.user_data["dyn_wizard"] = {"phase": "count", "rules": []}
+        await q.edit_message_text(
+            f"⚙️ *Динамика докупки*{cur_text}\n"
+            "Сколько ступеней правил? (0 — отключить динамику)\n"
+            "Каждая ступень: порог PnL и сумма меняются после N докупок.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Отмена", callback_data="dyn_cancel")]]),
+        )
+        return
+
+    if q.data == "dyn_cancel":
+        context.user_data.pop("dyn_wizard", None)
+        config = context.bot_data.get("config")
+        client = context.bot_data.get("exchange")
+        free_balance: float | None = None
+        open_count = 0
+        if client:
+            try:
+                free_balance = await client.get_free_futures_balance()
+            except Exception:
+                pass
+            pos_cache = context.bot_data.get("_pos_cache")
+            open_count = len(pos_cache) if pos_cache is not None else 0
+        await q.edit_message_text(
+            _build_avg_text(config, free_balance, open_count),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Изменить", callback_data="avg_edit")],
+                [InlineKeyboardButton("⚙️ Динамика докупки", callback_data="dyn_setup")],
+            ]),
+        )
+        return
 
 
-wizard.register("settp", SETTP_STEPS, _settp_finish)
+async def _finish_wizard(chat_id: int, context, changed: dict, config) -> None:
+    if not changed:
+        await context.bot.send_message(chat_id=chat_id, text="Ничего не изменено.")
+        return
+    lines = ["✅ *Настройки обновлены:*", ""]
+    unit_map = {key: unit for _num, key, _attr, _cast, _label, unit in AVG_WIZARD_STEPS}
+    for key, val in changed.items():
+        unit = unit_map.get(key, "")
+        fmt = f"${val:.2f}" if unit == "$" else (str(int(val)) if unit == "#" else f"{val:.0f}%")
+        labels = {"bet": "Маржа", "tp": "TP", "sl": "SL",
+                  "threshold": "Докупка при", "amount": "Сумма докупки",
+                  "budget": "Бюджет", "maxavg": "Макс докупок"}
+        lines.append(f"  {labels.get(key, key)}: `{fmt}`")
+    lines.append("")
+    lines.append(_build_avg_text(config))
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+    if changed:
+        await _reapply_tpsl_all(context.application, config)
+    if "averaging_amount" in changed or "max_averaging_count" in changed:
+        from bot import db as db_mod
+        new_budget = config.max_averaging_count * config.averaging_amount
+        with db_mod._connect() as conn:
+            conn.execute("UPDATE positions SET averaging_budget=? WHERE status='open'", (new_budget,))
 
 
 async def setbet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setbet — однокнопочный визард для ставки."""
-    wizard.start_wizard(context, "setbet")
-    await wizard.render_step(context.bot, update.message.chat_id, "setbet", 0, context)
+    """/setbet — запросить новую ставку."""
+    context.user_data["pending_set"] = "bet"
+    await update.message.reply_text(
+        "Введи новую ставку в USDT (например `1.50`):", parse_mode="Markdown"
+    )
 
 
 async def setstop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setstop — однокнопочный визард для стоплосса."""
-    wizard.start_wizard(context, "setstop")
-    await wizard.render_step(context.bot, update.message.chat_id, "setstop", 0, context)
+    """/setstop — запросить новый стоплосс."""
+    context.user_data["pending_set"] = "sl"
+    await update.message.reply_text(
+        "Введи стоплосс в % от маржи (например `500`):", parse_mode="Markdown"
+    )
 
 
 async def settp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/settp — однокнопочный визард для тейкпрофита."""
-    wizard.start_wizard(context, "settp")
-    await wizard.render_step(context.bot, update.message.chat_id, "settp", 0, context)
-
-
-# ── /setkey ───────────────────────────────────────────────────────
-
-def _setkey_parse_key(text: str) -> str:
-    return text.strip()
-
-
-SETKEY_STEPS: list[Step] = [
-    Step(key="key", prompt="Имя ключа конфига (напр. `openrouter_api_key`)",
-         kind="text", optional=False, parser=_setkey_parse_key),
-    Step(key="value", prompt="Значение", kind="text", optional=False),
-]
-
-
-def _coerce_to_attr_type(config, key: str, value: str):
-    attr = getattr(config, key, None)
-    if isinstance(attr, bool):
-        return value.lower() in ("1", "true", "yes", "on", "вкл", "да")
-    if isinstance(attr, int):
-        try:
-            return int(value)
-        except ValueError:
-            return value
-    if isinstance(attr, float):
-        try:
-            return float(value)
-        except ValueError:
-            return value
-    return value
-
-
-async def _setkey_finish(context, chat_id: int, wizard_state: dict) -> None:
-    config = context.bot_data["config"]
-    values = wizard_state.get("values", {}) or {}
-    key = values.get("key")
-    value = values.get("value")
-    if not key or value is None:
-        await context.bot.send_message(chat_id=chat_id, text="Не хватает данных.")
-        return
-    if not hasattr(config, key):
-        await context.bot.send_message(chat_id=chat_id,
-                                       text=f"❌ Неизвестный ключ: `{key}`",
-                                       parse_mode="Markdown")
-        return
-    from bot import db as db_mod
-    db_mod.set_config(key, value)
-    coerced = _coerce_to_attr_type(config, key, value)
-    setattr(config, key, coerced)
-    await context.bot.send_message(chat_id=chat_id,
-                                   text=f"✅ Сохранено: `{key}` = `{value}`",
-                                   parse_mode="Markdown")
-
-
-wizard.register("setkey", SETKEY_STEPS, _setkey_finish)
+    """/settp — запросить новый тейкпрофит."""
+    context.user_data["pending_set"] = "tp"
+    await update.message.reply_text(
+        "Введи тейкпрофит в % от маржи (например `500`):", parse_mode="Markdown"
+    )
 
 
 async def setkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setkey [KEY [VALUE]] — сохранить ключ в конфиг.
-
-    Без args — визард. С 1 arg — визард с предзаполненным KEY. С 2+ args — прямой путь.
-    """
+    """/setkey KEY VALUE — сохранить ключ в конфиг."""
     args = context.args or []
-    config = context.bot_data["config"]
-
-    if len(args) >= 2:
-        key, value = args[0], " ".join(args[1:])
-        if not hasattr(config, key):
-            await update.message.reply_text(f"Неизвестный ключ: {key}")
-            return
-        from bot import db as db_mod
-        db_mod.set_config(key, value)
-        coerced = _coerce_to_attr_type(config, key, value)
-        setattr(config, key, coerced)
-        await update.message.reply_text(f"✅ Сохранено: `{key}` = `{value}`",
-                                        parse_mode="Markdown")
+    if len(args) < 2:
+        await update.message.reply_text("Использование: /setkey KEY VALUE")
         return
-
-    initial = {"key": args[0]} if len(args) == 1 else None
-    state = wizard.start_wizard(context, "setkey", initial_values=initial)
-    if initial:
-        # Skip the first step
-        state["step"] = 1
-    await wizard.render_step(context.bot, update.message.chat_id, "setkey",
-                             state["step"], context)
-
-
-# ── /setmexc — двухшаговая замена MEXC ключей с проверкой ────────
-# Это НЕ wizard.register-визард, а stateful диалог через context.user_data["pending_mexc"].
-# Причина: secret и api_key вводятся обычным текстом, и сообщение пользователя должно быть
-# удалено сразу после получения (free-form input + side-effect delete). Wizard framework не
-# поддерживает такую логику. Обработка ввода живёт в bot/handlers/assistant.py:assistant_handler
-# (блок `pending_mexc`).
-async def setmexc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setmexc — заменить MEXC API key+secret с предварительной проверкой."""
-    context.user_data["pending_mexc"] = {"step": "secret"}
-    # Очистим возможный остаток от предыдущей попытки.
-    context.user_data.pop("_mexc_secret", None)
-    await update.message.reply_text(
-        "🔐 *Замена MEXC ключей*\n\n"
-        "Шаг 1/2 — введи *secret* (из настроек MEXC API).\n\n"
-        "_Сообщение с ключом удалю сразу после получения._\n"
-        "Напиши `отмена` чтобы прервать.",
-        parse_mode="Markdown",
-    )
+    key, value = args[0], " ".join(args[1:])
+    config = context.bot_data["config"]
+    if not hasattr(config, key):
+        await update.message.reply_text(f"Неизвестный ключ: {key}")
+        return
+    from bot import db as db_mod
+    db_mod.set_config(key, value)
+    # Update live config
+    try:
+        attr = getattr(config, key)
+        if isinstance(attr, float):
+            setattr(config, key, float(value))
+        elif isinstance(attr, int):
+            setattr(config, key, int(value))
+        else:
+            setattr(config, key, value)
+    except Exception:
+        setattr(config, key, value)
+    await update.message.reply_text(f"✅ Сохранено: `{key}` = `{value}`", parse_mode="Markdown")

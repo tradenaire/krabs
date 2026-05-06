@@ -4,8 +4,6 @@ import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from bot.handlers import wizard
-
 logger = logging.getLogger(__name__)
 
 # TP/SL extraction patterns
@@ -30,10 +28,11 @@ def _parse_float(s: str) -> float:
     return float(s.replace(",", "."))
 
 
-async def _start_setting_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                prefix: str) -> None:
-    wizard.start_wizard(context, prefix)
-    await wizard.render_step(context.bot, update.message.chat_id, prefix, 0, context)
+_PENDING_PROMPTS = {
+    "bet": ("default_trade_usdt", "Введи новую ставку в USDT (например `1.50`):", "$", float),
+    "tp":  ("tp_pct",             "Введи тейкпрофит в % (например `500`):", "%", float),
+    "sl":  ("sl_pct",             "Введи стоплосс в % (например `500`):", "%", float),
+}
 
 
 async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -41,26 +40,179 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
+    # In group chats — only react when bot is @mentioned
     chat_type = update.message.chat.type
     if chat_type in ("group", "supergroup"):
         bot_username = (await context.bot.get_me()).username
         if f"@{bot_username}" not in update.message.text:
             return
 
-    # Wizard приоритетнее pending_transfer/pending_mexc — если пользователь
-    # сейчас в визарде (/avg, /automode, /short и т.д.), его ввод должен идти
-    # туда, не в случайно повисшие state. start_wizard теперь чистит pending_X
-    # при старте, но дополнительно страхуемся здесь: если wizard активен, он
-    # перехватывает ввод раньше всех остальных state-машин.
-    if await wizard.handle_text(update, context):
-        return
-
     msg = update.message.text.strip()
     lo = msg.lower()
 
-    # ── pending_transfer: ввод суммы для USDT spot↔futures перевода ─
-    # Активируется кнопкой в /balance (см. handlers/balance.py transfer_*).
-    # Состояние одноразовое: получили сумму → выполнили перевод → очистили.
+    client = context.bot_data.get("exchange")
+    app = context.application
+
+    # ── Avg picker (single-field editor) ─────────────────────────
+    avg_pending = context.user_data.get("avg_pending")
+    if avg_pending is not None:
+        from bot.handlers.trading import (_build_avg_select_kb, apply_avg_pending_value,
+                                          avg_question_text)
+
+        if lo in ("отмена", "стоп", "cancel", "выход"):
+            context.user_data.pop("avg_pending", None)
+            config = context.bot_data.get("config")
+            await update.message.reply_text(
+                "Выбери параметр для изменения:",
+                reply_markup=_build_avg_select_kb(config),
+            )
+            return
+
+        config = context.bot_data.get("config")
+        try:
+            result = await apply_avg_pending_value(context, avg_pending, msg)
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ {e}\n\n" + avg_question_text(config, avg_pending),
+                parse_mode="Markdown",
+            )
+            return
+        context.user_data.pop("avg_pending", None)
+        await update.message.reply_text(
+            f"✅ {result}\n\nВыбери следующий номер `1`-`14` или нажми *Готово*:",
+            parse_mode="Markdown",
+            reply_markup=_build_avg_select_kb(config),
+        )
+        return
+
+    if context.user_data.get("avg_select_mode") and msg.isdigit():
+        from bot.handlers.trading import avg_pending_for_number, avg_question_text
+        config = context.bot_data.get("config")
+        pending = avg_pending_for_number(int(msg))
+        if not pending:
+            await update.message.reply_text("Номер должен быть от 1 до 14.")
+            return
+        context.user_data["avg_pending"] = pending
+        await update.message.reply_text(
+            avg_question_text(config, pending),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data="avg_back")]]),
+        )
+        return
+
+    # ── Dynamic averaging wizard ──────────────────────────────────────
+    dyn = context.user_data.get("dyn_wizard")
+    if dyn is not None:
+        import json as _json
+        from bot import db as db_mod
+        from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖ Отмена", callback_data="dyn_cancel")]])
+
+        if lo in ("отмена", "стоп", "cancel", "выход"):
+            context.user_data.pop("dyn_wizard", None)
+            await update.message.reply_text("✖ Настройка динамики отменена.")
+            return
+
+        phase = dyn["phase"]
+
+        # ── Phase: enter total step count ───────────────────────────
+        if phase == "count":
+            try:
+                n = int(float(msg.replace(",", ".")))
+            except ValueError:
+                await update.message.reply_text("Введи целое число (например `3`).", parse_mode="Markdown")
+                return
+            if n <= 0:
+                db_mod.set_config("avg_dynamic_rules", "")
+                context.user_data.pop("dyn_wizard", None)
+                await update.message.reply_text("✅ Динамика докупки отключена.")
+                return
+            dyn["total"] = n
+            dyn["current"] = 0
+            dyn["rules"] = []
+            dyn["phase"] = "after"
+            await update.message.reply_text(
+                f"*Ступень 1 из {n}*\nПосле скольких докупок применять это правило?\n_(0 = с самого начала)_",
+                parse_mode="Markdown", reply_markup=cancel_kb,
+            )
+            return
+
+        step_n = dyn["current"] + 1
+        total = dyn["total"]
+
+        # ── Phase: enter "after N averagings" ────────────────────────
+        if phase == "after":
+            try:
+                after = int(float(msg.replace(",", ".")))
+            except ValueError:
+                await update.message.reply_text("Введи целое число (например `10`).", parse_mode="Markdown")
+                return
+            dyn["_cur_after"] = after
+            dyn["phase"] = "pnl"
+            await update.message.reply_text(
+                f"*Ступень {step_n} из {total}*\nПри каком PnL % докупать?\n_(например `-50` = когда PnL ≤ −50%)_",
+                parse_mode="Markdown", reply_markup=cancel_kb,
+            )
+            return
+
+        # ── Phase: enter PnL threshold ───────────────────────────────
+        if phase == "pnl":
+            try:
+                pnl = float(msg.replace(",", "."))
+                if pnl > 0:
+                    pnl = -pnl  # ensure negative
+            except ValueError:
+                await update.message.reply_text("Введи число (например `-50` или `50`).", parse_mode="Markdown")
+                return
+            dyn["_cur_pnl"] = pnl
+            dyn["phase"] = "amount"
+            await update.message.reply_text(
+                f"*Ступень {step_n} из {total}*\nСумма докупки в $ (например `0.10`):",
+                parse_mode="Markdown", reply_markup=cancel_kb,
+            )
+            return
+
+        # ── Phase: enter averaging amount ────────────────────────────
+        if phase == "amount":
+            try:
+                amt = float(msg.replace(",", "."))
+                if amt <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("Введи положительное число (например `0.10`).", parse_mode="Markdown")
+                return
+
+            dyn["rules"].append({
+                "after": dyn.pop("_cur_after"),
+                "pnl": dyn.pop("_cur_pnl"),
+                "amount": amt,
+            })
+            dyn["current"] += 1
+
+            if dyn["current"] >= total:
+                # All steps collected — save and done
+                rules = sorted(dyn["rules"], key=lambda r: r["after"])
+                db_mod.set_config("avg_dynamic_rules", _json.dumps(rules))
+                context.user_data.pop("dyn_wizard", None)
+
+                lines = ["✅ *Динамика докупки сохранена:*", ""]
+                for i, r in enumerate(rules, 1):
+                    lines.append(
+                        f"  Ступень {i}: после `{r['after']}` докупок → "
+                        f"PnL ≤ `{r['pnl']:.0f}%`, сумма `${r['amount']:.2f}`"
+                    )
+                await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            else:
+                next_n = dyn["current"] + 1
+                dyn["phase"] = "after"
+                await update.message.reply_text(
+                    f"*Ступень {next_n} из {total}*\nПосле скольких докупок применять это правило?",
+                    parse_mode="Markdown", reply_markup=cancel_kb,
+                )
+            return
+
+    # ── Transfer dialog ──────────────────────────────────────────────
     pending_transfer = context.user_data.get("pending_transfer")
     if pending_transfer:
         context.user_data.pop("pending_transfer", None)
@@ -70,15 +222,12 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не похоже на число. Перевод отменён.")
             return
         direction = pending_transfer.get("dir", "s2f")
-        avail = float(pending_transfer.get("avail", 0.0) or 0.0)
+        avail = pending_transfer.get("avail", 0.0)
         if amount <= 0:
             await update.message.reply_text("Сумма должна быть больше нуля.")
             return
         if amount > avail:
-            await update.message.reply_text(
-                f"❌ Недостаточно средств. Доступно: `${avail:.2f}`",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text(f"❌ Недостаточно средств. Доступно: `${avail:.2f}`", parse_mode="Markdown")
             return
         client = context.bot_data.get("exchange")
         if not client:
@@ -88,104 +237,47 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await client.transfer_usdt(amount, direction)
             await update.message.reply_text(
-                f"✅ *{label}*: `${amount:.2f}` USDT переведено.",
-                parse_mode="Markdown",
+                f"✅ *{label}*: `${amount:.2f}` USDT переведено.", parse_mode="Markdown"
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка перевода: {e}")
         return
 
-    # ── pending_mexc: двухшаговая замена MEXC ключей с проверкой ────
-    # Запускается /setmexc (handlers/trading.py:setmexc_handler).
-    # Шаг 1 = secret, шаг 2 = api_key. После api_key — пробуем фьюч-баланс,
-    # если ОК — записываем оба ключа в DB и заменяем live ExchangeClient.
-    # Удаляем сообщение пользователя сразу после получения чтобы ключ не остался в чате.
-    pending_mexc = context.user_data.get("pending_mexc")
-    if pending_mexc:
-        if lo in ("отмена", "cancel", "стоп", "выход"):
-            context.user_data.pop("pending_mexc", None)
-            context.user_data.pop("_mexc_secret", None)
-            await update.message.reply_text("✖ Замена ключей отменена.")
-            return
-
-        # Удаление сообщения с ключом — best-effort.
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-
-        chat_id = update.effective_chat.id
-        step = pending_mexc.get("step")
-
-        if step == "secret":
-            context.user_data["_mexc_secret"] = msg
-            pending_mexc["step"] = "api_key"
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="✅ Secret получен (твоё сообщение удалено).\n\n"
-                     "Шаг 2/2 — теперь введи *API key*:",
-                parse_mode="Markdown",
-            )
-            return
-
-        if step == "api_key":
-            api_key = msg
-            secret = context.user_data.pop("_mexc_secret", None)
-            context.user_data.pop("pending_mexc", None)
-
-            if not secret:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="❌ Внутренняя ошибка: secret потерян. Запусти /setmexc заново.",
-                )
-                return
-
-            await context.bot.send_message(chat_id=chat_id, text="⏳ Проверяю ключи на MEXC…")
-
-            from bot.exchange.client import ExchangeClient
-            test_client = ExchangeClient(api_key, secret)
+    # ── Pending input state (two-step dialog) ─────────────────────
+    _TRIGGER_WORDS = ("setbet", "сетбет", "setstop", "setstops", "сетстоп", "settp", "settakes", "сеттп",
+                      "стоплосс", "тейкпрофит", "ставка")
+    pending = context.user_data.get("pending_set")
+    if pending and pending in _PENDING_PROMPTS:
+        # If the message looks like a new command — cancel state and fall through
+        if any(w in lo for w in _TRIGGER_WORDS):
+            context.user_data.pop("pending_set", None)
+        else:
             try:
-                bal = await test_client.get_futures_balance()
-            except Exception as e:
-                # Не записываем — оставляем старые ключи рабочими.
-                try:
-                    await test_client.close()
-                except Exception:
-                    pass
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ Ключи не работают: `{type(e).__name__}: {e}`\n\n"
-                         "Запусти /setmexc заново.",
-                    parse_mode="Markdown",
+                val = float(msg.replace(",", "."))
+            except ValueError:
+                await update.message.reply_text(
+                    "Не похоже на число. Попробуй ещё раз или напиши другую команду.",
+                    parse_mode="Markdown"
                 )
+                context.user_data.pop("pending_set", None)
                 return
 
-            from bot import db as db_mod
-            db_mod.set_config("mexc_api_key", api_key)
-            db_mod.set_config("mexc_secret", secret)
+            attr, _, unit, cast = _PENDING_PROMPTS[pending]
             config = context.bot_data.get("config")
-            if config is not None:
-                config.mexc_api_key = api_key
-                config.mexc_secret = secret
-
-            # Подменяем активный клиент на проверенный.
-            context.bot_data["exchange"] = test_client
-
-            free = float(bal.get("free", {}).get("USDT", 0) or 0)
-            total = float(bal.get("total", {}).get("USDT", 0) or 0)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=("✅ *MEXC ключи обновлены и работают.*\n\n"
-                      f"Баланс: free `{free:.2f}` / equity `{total:.2f}` USDT"),
-                parse_mode="Markdown",
-            )
+            if config:
+                setattr(config, attr, cast(val))
+                from bot import db as db_mod
+                db_mod.set_config(attr, str(val))
+                label = f"${val:.2f}" if unit == "$" else f"{val:.0f}%"
+                labels = {"bet": "Ставка", "tp": "Тейкпрофит", "sl": "Стоплосс"}
+                await update.message.reply_text(
+                    f"✅ *{labels[pending]}* применён: `{label}`", parse_mode="Markdown"
+                )
+                if pending in ("tp", "sl"):
+                    from bot.handlers.trading import _reapply_tpsl_all
+                    await _reapply_tpsl_all(context.application, config)
+            context.user_data.pop("pending_set", None)
             return
-
-    # (wizard.handle_text был перенесён в начало функции — wizard приоритетнее
-    # pending_transfer/pending_mexc, чтобы ввод '100' на шаге плеча не уходил
-    # как сумма перевода или MEXC secret.)
-
-    client = context.bot_data.get("exchange")
 
     # ── TP/SL change ─────────────────────────────────────────────
     tp_pct = sl_pct = None
@@ -208,6 +300,7 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sl_pct = _parse_float(m2.group(1))
 
     if tp_pct is not None or sl_pct is not None:
+        # Determine target: all or specific symbol
         target_all = bool(_RE_TARGET.search(lo)) or "всех" in lo or "все" in lo
         target_sym = None
         if not target_all:
@@ -225,6 +318,7 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет открытых позиций.")
             return
 
+        # Filter
         if target_sym:
             targets = [p for p in positions
                        if p["symbol"].split("/")[0].upper() == target_sym]
@@ -273,38 +367,17 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not config or not client:
             await update.message.reply_text("❌ Бот не готов.")
             return
-        # Сначала проверяем существование контракта на MEXC. Без этого
-        # `client.futures_symbol("FARTCOIN")` сконструирует SYM/USDT:USDT и
-        # execute_open упадёт с криптической ошибкой биржи. Пользователь видит
-        # бесполезное сообщение типа «А он ине это прислал» и не понимает что не так.
-        from bot.ai.scanner import mexc_find_futures_symbol, mexc_suggest_tickers
-        symbol = await mexc_find_futures_symbol(client, sym_raw)
-        if not symbol:
-            suggestions = await mexc_suggest_tickers(client, sym_raw, n=3)
-            if suggestions:
-                hint = ", ".join(f"`{s}`" for s in suggestions)
-                await update.message.reply_text(
-                    f"❌ Фьючерс `{sym_raw}` не найден на MEXC.\n"
-                    f"Может имел в виду: {hint}?\n"
-                    f"Попробуй: `Открой {suggestions[0]}`",
-                    parse_mode="Markdown",
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ Фьючерс `{sym_raw}` не найден на MEXC и нет похожих тикеров.",
-                    parse_mode="Markdown",
-                )
-            return
+        symbol = client.futures_symbol(sym_raw)
         margin = float(getattr(config, "default_trade_usdt", 1.0))
         leverage = int(getattr(config, "default_leverage", 0)) or None
         tp_pct = float(getattr(config, "tp_pct", 500))
         sl_pct = float(getattr(config, "sl_pct", 500))
-        coin = symbol.split("/")[0]
-        await update.message.reply_text(f"⏳ Открываю шорт `{coin}`...", parse_mode="Markdown")
+        await update.message.reply_text(f"⏳ Открываю шорт `{sym_raw}`...", parse_mode="Markdown")
         try:
             from bot.handlers.trading import execute_open
             result = await execute_open(client, context.application, symbol, "sell",
                                         margin, leverage, tp_pct=tp_pct, sl_pct=sl_pct)
+            coin = symbol.split("/")[0]
             await update.message.reply_text(
                 f"✅ *Шорт открыт* `{coin}`\n"
                 f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']}\n"
@@ -312,17 +385,7 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            # Расшифровываем известные ошибки MEXC чтобы пользователь понимал
-            # что делать. 'API Key expired' было в инциденте 02.05.2026.
-            err_text = str(e).lower()
-            if "api key" in err_text and ("expired" in err_text or "invalid" in err_text):
-                await update.message.reply_text(
-                    f"❌ Ключи MEXC не работают (`{e}`).\n"
-                    f"Запусти `/setmexc` чтобы заменить ключи.",
-                    parse_mode="Markdown",
-                )
-            else:
-                await update.message.reply_text(f"❌ Ошибка открытия: {e}")
+            await update.message.reply_text(f"❌ Ошибка открытия: {e}")
         return
 
     # ── Close all / close symbol (with confirmation) ──────────────
@@ -406,17 +469,23 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await stats_handler(update, context)
         return
 
-    # ── Setting shortcuts → wizards ───────────────────────────────
+    # ── Two-step setting dialogs ───────────────────────────────────
     if any(w in lo for w in ("setbet", "сетбет", "ставка", "bet")):
-        await _start_setting_wizard(update, context, "setbet")
+        context.user_data["pending_set"] = "bet"
+        _, prompt, _, _ = _PENDING_PROMPTS["bet"]
+        await update.message.reply_text(prompt, parse_mode="Markdown")
         return
 
     if any(w in lo for w in ("setstop", "setstops", "сетстоп", "стоп", "стоплосс", "sl")):
-        await _start_setting_wizard(update, context, "setstop")
+        context.user_data["pending_set"] = "sl"
+        _, prompt, _, _ = _PENDING_PROMPTS["sl"]
+        await update.message.reply_text(prompt, parse_mode="Markdown")
         return
 
     if any(w in lo for w in ("settp", "settakes", "сеттп", "тейк", "тейкпрофит", "tp")):
-        await _start_setting_wizard(update, context, "settp")
+        context.user_data["pending_set"] = "tp"
+        _, prompt, _, _ = _PENDING_PROMPTS["tp"]
+        await update.message.reply_text(prompt, parse_mode="Markdown")
         return
 
 
@@ -463,6 +532,7 @@ async def nlp_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.edit_message_text("Закрыто:\n" + "\n".join(results), parse_mode="Markdown")
         return
 
+    # nlp_close_SYMBOL
     sym_raw = q.data.removeprefix("nlp_close_").upper()
     try:
         positions = await client.get_positions()

@@ -9,27 +9,6 @@ import ccxt.async_support as ccxt
 
 logger = logging.getLogger(__name__)
 
-_MEXC_DEFAULT_MIN_NOTIONAL = 5.0
-
-
-def calc_min_order_margin(price: float, contract_size: float, leverage: int,
-                          min_notional: float = 0.0, buffer: float = 1.05) -> float:
-    """Margin that guarantees MEXC minimum notional after contract rounding.
-
-    MEXC validates integer contract volume. `min_notional / leverage` can still
-    become one contract too small for symbols with large contract steps, so we
-    first round up to the minimum valid contract count and only then derive the
-    margin.
-    """
-    if price <= 0 or contract_size <= 0 or leverage <= 0:
-        return 0.0
-    one_contract_notional = price * contract_size
-    if min_notional > 0:
-        contracts = max(1, math.ceil(min_notional / one_contract_notional))
-    else:
-        contracts = 1
-    return contracts * one_contract_notional / leverage * buffer
-
 
 def _with_retry(tries: int = 3, base_delay: float = 0.8):
     def deco(fn):
@@ -323,17 +302,6 @@ class ExchangeClient:
 
         amount_base = (amount_usdt * leverage) / price
         contracts = max(1, math.ceil(amount_base / contract_size))
-        min_notional = float(
-            (market.get("limits") or {}).get("cost", {}).get("min", 0)
-            or _MEXC_DEFAULT_MIN_NOTIONAL
-        )
-        if min_notional > 0:
-            min_contracts = max(1, math.ceil(min_notional / (price * contract_size)))
-            if contracts < min_contracts:
-                contracts = min_contracts
-                amount_usdt = contracts * price * contract_size / leverage
-                logger.info("%s: bump order to %d contracts for MEXC min notional $%.2f (margin $%.3f)",
-                            sym, contracts, min_notional, amount_usdt)
 
         logger.info("Futures order: %s %s contracts=%d lev=%dx margin=$%.2f",
                     side.upper(), sym, contracts, leverage, amount_usdt)
@@ -385,7 +353,6 @@ class ExchangeClient:
         logger.info("MEXC futures order placed: %s (id=%s)", mexc_symbol, order_id)
         return {"id": order_id, "symbol": sym, "side": side,
                 "amount": contracts, "price": price, "leverage": leverage,
-                "margin": amount_usdt,
                 "margin_mode": margin_mode, "info": result}
 
     @_with_retry(tries=2, base_delay=1.0)
@@ -639,18 +606,8 @@ class ExchangeClient:
                 break
         return parsed
 
-    # Возвращаемые значения cancel_tp_sl_orders:
-    #   N > 0  — успешно отменено N orders
-    #   0      — не было активных orders / транзитная ошибка
-    #   -1     — контракт делистнут (Contract does not exist, code 1001).
-    #            Только tpsl_enforce_job использует -1 как сигнал чтобы помечать
-    #            позицию как закрытую в DB. Остальные callers просто игнорируют
-    #            return value (если делистнут — закрывать TP/SL и так нечего).
-    CANCEL_DELISTED = -1
-
     async def cancel_tp_sl_orders(self, symbol: str) -> int:
-        """Cancel all active plan (TP/SL trigger) orders for a symbol.
-        Returns count cancelled, 0 on transient error, -1 if contract delisted."""
+        """Cancel all active plan (TP/SL trigger) orders for a symbol. Returns count cancelled."""
         sym = self.futures_symbol(symbol)
         try:
             await self._exchange.load_markets()
@@ -666,13 +623,9 @@ class ExchangeClient:
             await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
             logger.info("cancel_tp_sl_orders %s: CancelAll sent (had %d orders)", symbol, before_count)
         except Exception as e:
-            err_text = str(e).lower()
-            # MEXC возвращает code:1001 + "Contract does not exist" когда фьючерс
-            # делистнут. Любой повтор будет давать ту же ошибку — сигнализируем
-            # вызывающему чтобы он перевёл позицию в closed.
-            if "1001" in err_text or "contract does not exist" in err_text:
-                logger.info("cancel_tp_sl_orders %s: contract delisted (1001)", symbol)
-                return self.CANCEL_DELISTED
+            if "1001" in str(e):
+                logger.debug("cancel_tp_sl_orders %s: 1001 (no orders / transient) — skipped", symbol)
+                return 0
             logger.warning("cancel_tp_sl_orders %s: CancelAll failed: %s", symbol, e)
             return 0
 
@@ -698,8 +651,7 @@ class ExchangeClient:
         except Exception:
             return 100
 
-    async def get_min_order_usdt(self, symbol: str, leverage: int,
-                                 min_notional: float | None = None) -> float:
+    async def get_min_order_usdt(self, symbol: str, leverage: int) -> float:
         """Return minimum USDT margin needed for an order at given leverage.
 
         Uses exchange minimum notional (limits.cost.min) when available,
@@ -711,15 +663,14 @@ class ExchangeClient:
             await self._exchange.load_markets()
             market = self._exchange.market(sym)
             # MEXC enforces minimum notional (position value), not margin
-            if min_notional is None:
-                min_notional = float(
-                    (market.get("limits") or {}).get("cost", {}).get("min", 0)
-                    or _MEXC_DEFAULT_MIN_NOTIONAL
-                )
+            min_notional = float((market.get("limits") or {}).get("cost", {}).get("min", 0) or 0)
+            if min_notional > 0:
+                return min_notional / max(leverage, 1)
+            # Fallback: margin for 1 contract
             contract_size = float(market.get("contractSize", 0.0001))
             ticker = await self.get_ticker(sym)
             price = float(ticker["last"])
-            return calc_min_order_margin(price, contract_size, max(leverage, 1), float(min_notional or 0))
+            return contract_size * price / max(leverage, 1)
         except Exception:
             return 0.0
 
