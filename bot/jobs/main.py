@@ -614,11 +614,13 @@ async def averaging_job(app):
 
 async def _resolve_close_reason(client, symbol: str, pos_side_str: str,
                                 opened_at_ms: int | None,
-                                entry_price: float) -> tuple[bool | None, bool]:
-    """Returns (closed_by_tp, profitable_sl).
+                                entry_price: float) -> tuple[bool | None, bool, float | None]:
+    """Returns (closed_by_tp, profitable_sl, exit_price).
     closed_by_tp: True=TP, False=SL, None=unknown.
-    profitable_sl: True if SL triggered but at a price better than entry (profit-lock SL)."""
+    profitable_sl: True if SL triggered but at a price better than entry (profit-lock SL).
+    exit_price: trigger price from the close order, or mark-price fallback when needed."""
     is_tp, trigger_price = await client.was_closed_by_tp(symbol, pos_side_str, opened_at_ms)
+    exit_price = trigger_price
 
     profitable_sl = False
     if is_tp is False and trigger_price and entry_price > 0:
@@ -634,10 +636,12 @@ async def _resolve_close_reason(client, symbol: str, pos_side_str: str,
             mark = float(ticker.get("last", 0) or 0)
             if mark > 0:
                 is_tp = (mark < entry_price) if pos_side_str == "short" else (mark > entry_price)
+                if exit_price is None:
+                    exit_price = mark
         except Exception as e:
             logger.debug("_resolve_close_reason price fallback %s: %s", symbol, e)
 
-    return is_tp, profitable_sl
+    return is_tp, profitable_sl, exit_price
 
 
 async def reentry_job(app):
@@ -684,6 +688,8 @@ async def reentry_job(app):
         ph = db_mod.get_last_position_history(symbol)
         opened_at_ms = None
         entry_price = float(ph["entry_price"]) if ph and ph.get("entry_price") else 0.0
+        ph_total_invested = float(ph.get("total_invested") or 0) if ph else 0.0
+        ph_leverage = int(ph.get("leverage") or 0) if ph else 0
         if ph and ph.get("opened_at"):
             try:
                 import datetime as _dt
@@ -693,30 +699,46 @@ async def reentry_job(app):
             except Exception:
                 pass
 
+        pnl_margin = ph_total_invested or float(re_cfg.get("margin") or 1.0)
+        pnl_lev = ph_leverage or int(re_cfg.get("leverage") or 0) or 1
+
+        from bot.fmt import calc_close_pnl, format_close_pnl
+
+        def _close_pnl(exit_price: float | None) -> tuple[str, float]:
+            if not exit_price or entry_price <= 0:
+                return "", 0.0
+            pnl_usdt, _ = calc_close_pnl(entry_price, exit_price, pos_side_str,
+                                         pnl_lev, pnl_margin)
+            text = format_close_pnl(entry_price, exit_price, pos_side_str,
+                                    pnl_lev, pnl_margin)
+            return (f" · PnL {text}" if text else "", pnl_usdt)
+
         if max_cycles == 0:
-            closed_by_tp, profitable_sl = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
+            closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
             if closed_by_tp is None:
                 continue
             close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
-            db_mod.log_trade(symbol, "close", note=close_note)
-            db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason=close_note)
+            pnl_text, pnl_usdt = _close_pnl(exit_price)
+            db_mod.log_trade(symbol, "close", pnl=pnl_usdt, note=close_note)
+            db_mod.close_position_history(symbol, exit_price=exit_price or 0, pnl=pnl_usdt, close_reason=close_note)
             icon = "✅" if (closed_by_tp or profitable_sl) else "🛑"
             label = "по тейку" if closed_by_tp else ("по профит-локк SL" if profitable_sl else "по стопу")
-            await _notify_all(app, f"{icon} *{coin}* {label} (перезаход отключён)")
+            await _notify_all(app, f"{icon} *{coin}* {label}{pnl_text} (перезаход отключён)")
             db_mod.delete_reentry(symbol)
             continue
 
         if cycle_count >= max_cycles:
             logger.info("Re-entry: %s exhausted (%d/%d cycles)", symbol, cycle_count, max_cycles)
-            closed_by_tp, profitable_sl = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
+            closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
             if closed_by_tp is None:
                 continue
             close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
-            db_mod.log_trade(symbol, "close", note=close_note)
-            db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason=close_note)
+            pnl_text, pnl_usdt = _close_pnl(exit_price)
+            db_mod.log_trade(symbol, "close", pnl=pnl_usdt, note=close_note)
+            db_mod.close_position_history(symbol, exit_price=exit_price or 0, pnl=pnl_usdt, close_reason=close_note)
             icon = "✅" if (closed_by_tp or profitable_sl) else "🛑"
             label = "по тейку" if closed_by_tp else ("по профит-локк SL" if profitable_sl else "по стопу")
-            await _notify_all(app, f"{icon} *{coin}* {label} — циклы исчерпаны ({cycle_count}/{max_cycles})")
+            await _notify_all(app, f"{icon} *{coin}* {label}{pnl_text} — циклы исчерпаны ({cycle_count}/{max_cycles})")
             db_mod.delete_reentry(symbol)
             continue
 
@@ -735,18 +757,19 @@ async def reentry_job(app):
         logger.info("Re-entry #%d %s %s $%.2f", cycle_count + 1, symbol, side, margin)
 
         # Determine close reason: TP or profitable-SL → re-enter, loss-SL → skip
-        closed_by_tp, profitable_sl = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
+        closed_by_tp, profitable_sl, exit_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
 
         if closed_by_tp is None:
             logger.info("Re-entry: %s close reason unknown, retrying next cycle", symbol)
             continue
 
         close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
+        pnl_text, pnl_usdt = _close_pnl(exit_price)
         still_open = db_mod.get_open_position(symbol) is not None
         if still_open:
             db_mod.close_position(symbol)
-            db_mod.log_trade(symbol, "close", note=close_note)
-            db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason=close_note)
+            db_mod.log_trade(symbol, "close", pnl=pnl_usdt, note=close_note)
+            db_mod.close_position_history(symbol, exit_price=exit_price or 0, pnl=pnl_usdt, close_reason=close_note)
 
         # Fallback: if price bounced above entry before reentry_job ran,
         # _resolve_close_reason misses the profit-lock. Check persistent flag.
@@ -758,7 +781,7 @@ async def reentry_job(app):
 
         if not closed_by_tp and not profitable_sl:
             await _notify_all(app,
-                f"🛑 *{coin}* закрыта по стопу — перезаход пропущен")
+                f"🛑 *{coin}* закрыта по стопу{pnl_text} — перезаход пропущен")
             db_mod.delete_reentry(symbol)
             continue
 
@@ -780,7 +803,7 @@ async def reentry_job(app):
             notified_exhausted.discard(symbol)
             close_label = "по TP" if closed_by_tp else "в прибыль (профит-локк SL)"
             msg = (
-                f"✅ *{coin}* закрыта {close_label} → перезаход #{new_cycle}/{max_cycles}\n"
+                f"✅ *{coin}* закрыта {close_label}{pnl_text} → перезаход #{new_cycle}/{max_cycles}\n"
                 f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']}\n"
                 f"TP: `{result.get('tp_price', 0):.6g}` | SL: `{result.get('sl_price', 0):.6g}`"
             )
