@@ -84,18 +84,6 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     avg_count = int(db_rec.get("averaging_count", 0)) if db_rec else 0
     max_avg = int(getattr(config, "max_averaging_count", 100)) if config else 100
     invested = float(db_rec.get("total_invested", margin)) if db_rec else margin
-    # Effective threshold from dynamic rules
-    eff_threshold = threshold
-    try:
-        import json as _json
-        from bot import db as _db_pf
-        _dyn_raw = _db_pf.get_config("avg_dynamic_rules", "")
-        if _dyn_raw:
-            for rule in sorted(_json.loads(_dyn_raw), key=lambda r: r["after"]):
-                if avg_count >= rule["after"]:
-                    eff_threshold = float(rule["pnl"])
-    except Exception:
-        pass
     # Re-entry reopen margin
     reopen_margin = float(re_rec.get("margin", margin)) if re_rec else margin
 
@@ -119,11 +107,8 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
             extra.append(f"лимит ${max_pos_usdt:,.0f}")
         lines.append("⚙️ " + " · ".join(extra))
 
-    _thr_str = f"{eff_threshold:.0f}%"
-    if eff_threshold != threshold:
-        _thr_str += f" _(dyn)_"
     lines.append(
-        f"🔁 Докупка: при PnL ≤ {_thr_str} · +${avg_amount:.2f}"
+        f"🔁 Докупка: при PnL ≤ {threshold:.0f}% · +${avg_amount:.2f}"
         f" · шагов {avg_count}/{max_avg} · вложено ${invested:.2f}"
     )
     lines.append(

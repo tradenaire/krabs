@@ -396,8 +396,7 @@ class ExchangeClient:
 
     async def set_tp_sl(self, symbol: str, tp_price: float | None = None,
                         sl_price: float | None = None,
-                        pos_data: dict | None = None,
-                        sl_limit_price: float | None = None) -> list[dict]:
+                        pos_data: dict | None = None) -> list[dict]:
         sym = self.futures_symbol(symbol)
 
         if pos_data:
@@ -452,13 +451,12 @@ class ExchangeClient:
 
         results = []
 
-        async def _place(kind: str, price: float, trigger_type: int,
-                         exec_price: float = 0) -> dict:
+        async def _place(kind: str, price: float, trigger_type: int) -> dict:
             last_err: Exception | None = None
             for attempt in range(3):
                 try:
                     r = await self._exchange.contractPrivatePostPlanorderPlace({
-                        "symbol": mexc_sym, "price": exec_price, "vol": contracts,
+                        "symbol": mexc_sym, "price": 0, "vol": contracts,
                         "side": close_side, "orderType": 5, "openType": open_type,
                         "triggerPrice": str(price), "triggerType": trigger_type,
                         "trend": 1, "executeCycle": 2,
@@ -480,8 +478,7 @@ class ExchangeClient:
 
         if sl_price:
             tt = 2 if side == "long" else 1
-            exec_p = round(sl_limit_price, 8) if sl_limit_price else 0
-            results.append(await _place("SL", sl_price, tt, exec_price=exec_p))
+            results.append(await _place("SL", sl_price, tt))
 
         return results
 

@@ -9,12 +9,6 @@ class Config:
     mexc_api_key: str = ""
     mexc_secret: str = ""
 
-    ai_base_url: str = "https://codex.aimulticast.org/v1"
-    ai_api_key: str = ""
-    ai_model: str = "PROXY-CODEX-5.4"
-    ai_web_search: bool = True
-
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: str = ""
     openrouter_model: str = "x-ai/grok-4-fast:online"
     anthropic_api_key: str = ""
@@ -35,8 +29,6 @@ class Config:
 
     # Re-entry
     max_reentry_cycles: int = 3
-    reentry_on_sl: bool = False          # re-enter after SL (tight-stop strategy, not Martingale)
-    reentry_sl_cooldown_min: int = 10    # minutes to wait after SL before re-entering
 
     # Auto scan
     auto_scan_enabled: bool = False

@@ -3,6 +3,5 @@ ccxt>=4.5.46
 apscheduler>=3.10
 pandas>=2.0
 pandas-ta>=0.3.14b
-openai>=1.55          # for OpenAI-compatible AI provider calls
-ddgs>=9.0             # DuckDuckGo search for trusted web context
+openai>=1.30          # for OpenRouter calls
 anthropic>=0.39       # optional: Claude backend

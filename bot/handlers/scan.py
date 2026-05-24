@@ -3,7 +3,8 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from bot.ai.scanner import scan_overbought, analyze_single_coin, mexc_find_futures_symbol, format_coin_card
+from bot.ai.scanner import (scan_overbought, analyze_single_coin, mexc_find_futures_symbol,
+                            format_coin_card, validate_short_pick)
 from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks, extract_sentiment,
                              format_usage_footer, DEFAULT_MODEL, FALLBACK_MODEL)
 
@@ -14,13 +15,6 @@ logger = logging.getLogger(__name__)
 _MEXC_DEFAULT_MIN_NOTIONAL = 5.0
 
 
-async def _reply_no_preview(message, text: str, **kwargs):
-    try:
-        return await message.reply_text(text, disable_web_page_preview=True, **kwargs)
-    except TypeError:
-        return await message.reply_text(text, **kwargs)
-
-
 def _get_min_notional(symbol: str, bot_data: dict) -> float:
     """Minimum USDT notional (position value) for an order on this symbol."""
     cache = bot_data.get("_min_order_cache", {})
@@ -28,8 +22,21 @@ def _get_min_notional(symbol: str, bot_data: dict) -> float:
 
 
 def _get_min_avg_margin(symbol: str, leverage: int, bot_data: dict) -> float:
-    """Actual margin to use for averaging (with 5% buffer for contract rounding)."""
+    """Fallback min averaging margin when live market metadata is unavailable."""
     return _get_min_notional(symbol, bot_data) / max(leverage, 1) * 1.05
+
+
+async def _get_live_min_avg_margin(client, symbol: str, leverage: int, bot_data: dict) -> float:
+    """Contract-rounded MEXC min margin, falling back to cached notional math."""
+    fallback = _get_min_avg_margin(symbol, leverage, bot_data)
+    cached_notional = bot_data.get("_min_order_cache", {}).get(symbol)
+    try:
+        live = await client.get_min_order_usdt(
+            symbol, leverage, min_notional=cached_notional
+        )
+        return live or fallback
+    except Exception:
+        return fallback
 
 
 def _can_avg_at_configured(symbol: str, leverage: int, averaging_amount: float, bot_data: dict) -> bool:
@@ -37,25 +44,23 @@ def _can_avg_at_configured(symbol: str, leverage: int, averaging_amount: float, 
     return averaging_amount * max(leverage, 1) >= _get_min_notional(symbol, bot_data)
 
 
-def _check_budget(free_balance: float, margin: float, config) -> dict:
+def _check_budget(free_balance: float, margin: float, config,
+                  eff_avg_amount: float | None = None) -> dict:
     """
     Check whether free_balance covers the full position risk budget.
     Formula (same as auto_scan_job):
         base_budget = margin + averaging_budget
         full_budget = base_budget * (sl_pct / 100)   -- unless profit_lock is set
     This is the worst-case capital at risk per position.
+    eff_avg_amount: override for symbol-specific minimum (e.g. MEXC 7008 cache)
     """
-    avg_amount = float(getattr(config, "averaging_amount", 0.10))
+    avg_amount = eff_avg_amount or float(getattr(config, "averaging_amount", 0.10))
     avg_budget = float(getattr(config, "averaging_budget", 5.00))
     sl_pct = float(getattr(config, "sl_pct", 500))
     profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
 
     base_budget = margin + avg_budget
-    if profit_lock_trigger > 0:
-        # Profit-lock moves SL to breakeven — max loss is just the margin invested
-        full_budget = base_budget
-    else:
-        full_budget = base_budget * (sl_pct / 100.0)
+    full_budget = base_budget * (sl_pct / 100.0)
 
     max_steps = int(avg_budget / avg_amount) if avg_amount > 0 else 0
     # How many full positions the current balance can support
@@ -83,15 +88,14 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError):
         n = 5
 
-    api_key = getattr(config, "ai_api_key", "") or getattr(config, "openrouter_api_key", "")
-    base_url = getattr(config, "ai_base_url", "") or getattr(config, "openrouter_base_url", "")
+    api_key = config.openrouter_api_key
     if not api_key:
         await update.message.reply_text(
-            "Нет AI ключа. Добавь через /setkey ai_api_key <key>"
+            "Нет OpenRouter ключа. Добавь через /setkey openrouter_api_key sk-or-..."
         )
         return
 
-    status = await update.message.reply_text("🧠 Думаю...")
+    status = await update.message.reply_text("📡 Собираю MEXC snapshot...")
 
     try:
         local_results, _total = await scan_overbought(client, 65.0, 10.0)
@@ -99,42 +103,22 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Local scan failed: %s", e)
         local_results = []
 
-    model = getattr(config, "ai_model", "") or getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
-    web_search = bool(getattr(config, "ai_web_search", True))
-    await status.edit_text(f"🔍 Анализирую через {model}...")
+    model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
+    await status.edit_text(f"🔍 Передаю MEXC snapshot в {model}...")
 
-    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n,
-                                          base_url=base_url, web_search=web_search)
+    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n)
 
-    if ai_result.error and not ai_result.text and FALLBACK_MODEL != model:
+    if ai_result.error and not ai_result.text:
         logger.warning("Primary model failed, trying fallback %s", FALLBACK_MODEL)
         await status.edit_text(f"🌐 Пробую {FALLBACK_MODEL}...")
-        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=n,
-                                              base_url=base_url, web_search=web_search)
+        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=n)
 
     if ai_result.error and not ai_result.text:
         await status.edit_text(f"❌ AI недоступен: {ai_result.error}")
         return
 
-    try:
-        from bot import db as db_mod
-        db_mod.log_ai_usage("scan", ai_result.model, ai_result.cost_usd,
-                            ai_result.input_tokens, ai_result.output_tokens,
-                            ai_result.web_searches)
-    except Exception as e:
-        logger.warning("AI usage log failed: %s", e)
-
     picks = parse_analyst_blocks(ai_result.text, n=n)
     if not picks:
-        sentiment = extract_sentiment(ai_result.text)
-        if sentiment:
-            await status.edit_text(
-                f"📝 AI не выбрал монеты для MEXC-проверки.\n\n"
-                f"SENTIMENT: {sentiment[:2500]}\n\n"
-                f"{format_usage_footer(ai_result)}",
-                parse_mode="Markdown",
-            )
-            return
         await status.edit_text(
             f"📝 AI ответил не по формату:\n\n{ai_result.text[:3000]}\n\n"
             f"{format_usage_footer(ai_result)}",
@@ -142,7 +126,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await status.edit_text(f"✅ AI выдал {len(picks)} монет. Проверяю MEXC...")
+    await status.edit_text(f"✅ AI выдал {len(picks)} монет. Валидирую MEXC trend/MSB/risk...")
 
     try:
         open_positions = await client.get_positions()
@@ -157,6 +141,11 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing_picks: list[tuple[str, dict]] = []  # (fut_sym, pick) for already-open coins
     skipped: list[tuple[str, str]] = []
     seen: set[str] = set()
+    local_by_coin = {
+        str(r.get("symbol", "")).split("/")[0].upper(): r
+        for r in local_results
+        if r.get("symbol")
+    }
 
     for pick in picks:
         ticker = pick["ticker"].upper()
@@ -164,7 +153,8 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         seen.add(ticker)
 
-        fut_sym = await mexc_find_futures_symbol(client, ticker)
+        local_tech = local_by_coin.get(ticker)
+        fut_sym = local_tech.get("symbol") if local_tech else await mexc_find_futures_symbol(client, ticker)
         if not fut_sym:
             skipped.append((ticker, "нет на MEXC"))
             continue
@@ -174,13 +164,20 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             existing_picks.append((fut_sym, pick))
             continue
 
-        tech = await analyze_single_coin(client, fut_sym)
+        tech = dict(local_tech) if local_tech else await analyze_single_coin(client, fut_sym)
         if not tech:
             skipped.append((ticker, "нет OHLCV"))
+            continue
+        validation_status, validation_errors = validate_short_pick(tech)
+        tech["validation_status"] = validation_status
+        tech["validation_errors"] = validation_errors
+        if validation_status != "VALIDATED":
+            skipped.append((ticker, "; ".join(validation_errors[:2]) or validation_status))
             continue
         tech["_ai_fund"] = pick.get("fund", "")
         tech["_ai_funding"] = pick.get("funding", "")
         tech["_ai_risk"] = pick.get("risk", "")
+        tech["_ai_risk_num"] = pick.get("risk_num")
         validated.append(tech)
 
     try:
@@ -199,32 +196,24 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     budget_info = _check_budget(free_balance, default_bet, config)
 
     # Compute leverage and averaging-risk for each validated coin
-    from bot.handlers.trading import _max_leverage_by_vol
     for tech in validated:
         sym = tech["symbol"]
         try:
             sym_max = await client.get_max_leverage(sym)
         except Exception:
             sym_max = 100
-        # Apply the same vol-cap that execute_open uses, so displayed leverage is accurate
-        try:
-            ticker_lev = await client.get_ticker(sym)
-            vol_24h = float(ticker_lev.get("quoteVolume") or ticker_lev.get("baseVolume") or 0)
-            vol_cap = _max_leverage_by_vol(vol_24h)
-            sym_max = min(sym_max, vol_cap)
-        except Exception:
-            pass
         user_lev = int(getattr(config, "default_leverage", 0) or 0)
         lev_eff = min(user_lev, sym_max) if user_lev > 0 else sym_max
         tech["_lev_eff"] = lev_eff
-        min_avg = _get_min_avg_margin(sym, lev_eff, context.bot_data)
+        min_avg = await _get_live_min_avg_margin(client, sym, lev_eff, context.bot_data)
         tech["_min_avg"] = min_avg
-        tech["_avg_ok"] = _can_avg_at_configured(sym, lev_eff, averaging_amount, context.bot_data)
+        tech["_avg_ok"] = averaging_amount + 0.001 >= min_avg
 
     # Sort: OK averaging first, risky (impossible to avg at configured amount) last
     validated.sort(key=lambda t: (0 if t["_avg_ok"] else 1))
 
-    header = f"*🎯 AI top-{len(validated)} шорт ({ai_result.model})*"
+    header = f"*🎯 SmartScan top-{len(validated)} шорт ({ai_result.model})*"
+    header += "\n_Источник цены/тренда/risk: MEXC post-validation_"
     if existing_picks:
         header += f"\n_уже в позиции: {', '.join(s.split('/')[0] for s, _ in existing_picks)}_"
     if skipped:
@@ -249,11 +238,8 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         min_avg = r["_min_avg"]
         avg_ok = r["_avg_ok"]
 
-        card = format_coin_card(
-            r, i, ai_note=r.get("_ai_fund", ""), max_lev=lev_eff, margin=default_bet,
-            tp_pct=float(getattr(config, "tp_pct", 0) or 0),
-            sl_pct=float(getattr(config, "sl_pct", 0) or 0),
-        )
+        card = format_coin_card(r, i, ai_note=r.get("_ai_fund", ""),
+                                max_lev=lev_eff, margin=default_bet)
         if r.get("_ai_funding"):
             card += f"\n   Фандинг (AI): {r['_ai_funding']}"
         if r.get("_ai_risk"):
@@ -261,12 +247,12 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         icon = "🔻" if direction == "short" else "🔺"
 
-        if avg_ok:
+        if r.get("validation_status") == "VALIDATED" and avg_ok:
             btn = InlineKeyboardButton(
                 f"{icon} ${default_bet:g} · {lev_eff}x",
                 callback_data=f"open_{side_code}_{sym}",
             )
-        else:
+        elif r.get("validation_status") == "VALIDATED":
             # Averaging minimum exceeds configured amount — show warning
             card += (
                 f"\n   ⚠️ *Мин. докупка MEXC* `${min_avg:.2f}` > настройка `${averaging_amount:.2f}`"
@@ -276,12 +262,15 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ Открыть (докупка ~${min_avg:.2f})",
                 callback_data=f"open_anyway_{side_code}_{sym}",
             )
+        else:
+            card += "\n   ⛔ Открытие заблокировано: MEXC validation не пройдена"
+            btn = InlineKeyboardButton("⛔ Не actionable", callback_data="noop_scan_blocked")
 
         kb = InlineKeyboardMarkup([[btn]])
         try:
-            await _reply_no_preview(update.message, card, parse_mode="Markdown", reply_markup=kb)
+            await update.message.reply_text(card, parse_mode="Markdown", reply_markup=kb)
         except Exception:
-            await _reply_no_preview(update.message, card, reply_markup=kb)
+            await update.message.reply_text(card, reply_markup=kb)
 
     # Output existing-position cards
     if existing_picks:
@@ -300,7 +289,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 avg_count = db_rec.get("averaging_count", 0)
             max_count = int(getattr(config, "max_averaging_count", 100))
 
-            min_avg = _get_min_avg_margin(fut_sym, lev, context.bot_data)
+            min_avg = await _get_live_min_avg_margin(client, fut_sym, lev, context.bot_data)
             step = max(averaging_amount, min_avg)
             step_note = f" (мин MEXC)" if min_avg > averaging_amount else ""
 
@@ -340,18 +329,15 @@ async def _do_execute_open(q, client, app, symbol: str, side: str,
     """Shared open logic used by open_callback and open_confirm_callback."""
     coin = symbol.split("/")[0]
     side_ru = "SHORT" if side == "sell" else "LONG"
-    await q.message.reply_text(f"🚀 Открываю {side_ru} `{coin}`...", parse_mode="Markdown")
+    await q.message.reply_text(f"🚀 Открываю {side_ru} `{coin}` ${margin:g} ×{leverage}...",
+                                parse_mode="Markdown")
     from bot.handlers.trading import execute_open
     result = await execute_open(client, app, symbol, side, margin, leverage)
-    actual_margin = result.get("margin", margin)
-    actual_lev = result["leverage"]
     icon = "🔻" if side == "sell" else "🟩"
     lines = [
-        f"*{coin}* {icon}×{actual_lev} `${actual_margin:.2f}`",
+        f"*{coin}* {icon}×{result['leverage']} `${margin:.2f}`",
         f"▶ Entry: `{result['entry_price']:.6g}`",
     ]
-    if actual_margin > margin + 0.001:
-        lines.append(f"⚠️ Маржа поднята `${margin:.2f}` → `${actual_margin:.2f}` (мин MEXC)")
     if result.get("liquidation_price"):
         lines.append(f"💀 Liq: `{result['liquidation_price']:.6g}`")
     if result.get("tp_price"):
@@ -380,7 +366,11 @@ async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         free = await client.get_free_futures_balance()
     except Exception:
         free = float(context.bot_data.get("_bal_cache", 0.0))
-    budget = _check_budget(free, margin, config)
+    _cfg_avg = float(getattr(config, "averaging_amount", 0.10))
+    _lev_for_chk = int(getattr(config, "default_leverage", 10) or 10)
+    _min_avg_open = await _get_live_min_avg_margin(client, symbol, _lev_for_chk, context.bot_data)
+    _eff_avg = max(_cfg_avg, _min_avg_open)
+    budget = _check_budget(free, margin, config, eff_avg_amount=_eff_avg)
 
     if not budget["can_open"]:
         await q.message.reply_text(
@@ -399,11 +389,16 @@ async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"open_confirm_{side}_{margin_milli}_{symbol}",
             )
         ]])
+        _avg_note = (
+            f"\n⚠️ Докупка: `${_eff_avg:.2f}`/шаг (мин. MEXC), настроено `${_cfg_avg:.2f}`"
+            if _eff_avg > _cfg_avg + 0.001 else ""
+        )
         await q.message.reply_text(
             f"⚠️ *{coin}* {side_ru}: недостаточный бюджет\n"
             f"Свободно `${free:.2f}` · нужно `${budget['full_budget']:.2f}` на 1 поз\n"
-            f"_(маржа+докупки `${budget['base_budget']:.2f}` × SL {budget['sl_pct']:.0f}%)_\n"
-            f"Хватит на `{budget['positions_possible']}` полных позиций. Открыть всё равно?",
+            f"_(маржа+докупки `${budget['base_budget']:.2f}` × SL {budget['sl_pct']:.0f}%)_"
+            + _avg_note +
+            f"\nХватит на `{budget['positions_possible']}` полных позиций. Открыть всё равно?",
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -416,6 +411,24 @@ async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym_max = 100
     leverage = min(user_lev, sym_max) if user_lev > 0 else sym_max
 
+    if _eff_avg > _cfg_avg + 0.001:
+        _coin = symbol.split("/")[0]
+        _side_ru = "SHORT" if side == "sell" else "LONG"
+        _margin_milli = int(margin * 1000)
+        _kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"✅ Открыть {_side_ru} (докупки ${_eff_avg:.2f}/шаг)",
+                callback_data=f"open_confirm_{side}_{_margin_milli}_{symbol}",
+            )
+        ]])
+        await q.message.reply_text(
+            f"⚠️ *{_coin}* {_side_ru}: мин. докупка `${_eff_avg:.2f}`/шаг (MEXC), "
+            f"настроено `${_cfg_avg:.2f}`\n"
+            f"Открыть позицию с учётом повышенного мин. ордера?",
+            parse_mode="Markdown",
+            reply_markup=_kb,
+        )
+        return
     try:
         await _do_execute_open(q, client, context.application, symbol, side, margin, leverage)
     except Exception as e:
@@ -471,39 +484,25 @@ async def open_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         sym_max = 100
     leverage = min(user_lev, sym_max) if user_lev > 0 else sym_max
 
-    # Cache the minimum so averaging_job uses correct amount from first attempt
-    min_avg = _get_min_avg_margin(symbol, leverage, context.bot_data)
-    # The min notional to cache (reverse from margin)
-    min_notional = min_avg * max(leverage, 1) / 1.05
-    cache = context.bot_data.setdefault("_min_order_cache", {})
-    cache[symbol] = min_notional
-    try:
-        from bot import db as db_mod
-        db_mod.set_min_order_notional(symbol, min_notional)
-    except Exception:
-        pass
-    logger.info("open_anyway: cached min notional $%.1f for %s (avg will use $%.3f)",
-                min_notional, symbol, min_avg)
+    min_avg = await _get_live_min_avg_margin(client, symbol, leverage, context.bot_data)
+    logger.info("open_anyway: %s avg will use MEXC min margin $%.3f", symbol, min_avg)
 
     coin = symbol.split("/")[0]
     side_ru = "SHORT" if side == "sell" else "LONG"
     await q.message.reply_text(
-        f"🚀 Открываю {side_ru} `{coin}`...",
+        f"🚀 Открываю {side_ru} `{coin}` ${margin:g} ×{leverage}\n"
+        f"⚠️ Докупка будет по `${min_avg:.2f}` (мин MEXC)",
         parse_mode="Markdown",
     )
 
     try:
         from bot.handlers.trading import execute_open
         result = await execute_open(client, context.application, symbol, side, margin, leverage)
-        actual_margin = result.get("margin", margin)
-        actual_lev = result["leverage"]
         icon = "🔻" if side == "sell" else "🟩"
         lines = [
-            f"*{coin}* {icon}×{actual_lev} `${actual_margin:.2f}`",
+            f"*{coin}* {icon}×{result['leverage']} `${margin:.2f}`",
             f"▶ Entry: `{result['entry_price']:.6g}`",
         ]
-        if actual_margin > margin + 0.001:
-            lines.append(f"⚠️ Маржа поднята `${margin:.2f}` → `${actual_margin:.2f}` (мин MEXC)")
         if result.get("liquidation_price"):
             lines.append(f"💀 Liq: `{result['liquidation_price']:.6g}`")
         if result.get("tp_price"):
@@ -543,7 +542,7 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     avg_side = "sell" if side == "short" else "buy"
     margin_mode = pos.get("margin_mode")
 
-    min_avg = _get_min_avg_margin(symbol, lev, context.bot_data)
+    min_avg = await _get_live_min_avg_margin(client, symbol, lev, context.bot_data)
     step = max(averaging_amount, min_avg)
 
     # Check free balance
@@ -563,7 +562,8 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(f"⏳ Докупаю `{coin}` +`${step:.2f}`...", parse_mode="Markdown")
 
     try:
-        await client.place_futures_order(symbol, avg_side, step, lev, margin_mode=margin_mode)
+        order_result = await client.place_futures_order(symbol, avg_side, step, lev, margin_mode=margin_mode)
+        step = max(step, float(order_result.get("margin") or 0))
     except Exception as e:
         await q.message.reply_text(f"❌ Ошибка докупки {coin}: {e}")
         return
@@ -622,7 +622,7 @@ async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     avg_side = "sell" if side == "short" else "buy"
     margin_mode = pos.get("margin_mode")
 
-    min_avg = _get_min_avg_margin(symbol, lev, context.bot_data)
+    min_avg = await _get_live_min_avg_margin(client, symbol, lev, context.bot_data)
 
     await q.message.reply_text(
         f"⏳ Принудительная докупка `{coin}` +`${min_avg:.2f}` (мин MEXC)...",
@@ -630,7 +630,8 @@ async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     try:
-        await client.place_futures_order(symbol, avg_side, min_avg, lev, margin_mode=margin_mode)
+        order_result = await client.place_futures_order(symbol, avg_side, min_avg, lev, margin_mode=margin_mode)
+        min_avg = max(min_avg, float(order_result.get("margin") or 0))
     except Exception as e:
         await q.message.reply_text(f"❌ Ошибка докупки {coin}: {e}")
         return
