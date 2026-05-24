@@ -13,7 +13,8 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
                         tp_sl_pcts: dict, db_map: dict, re_map: dict,
                         config, daily_stats: dict,
                         lev_cache: dict | None = None,
-                        spot_raw: dict | None = None) -> str:
+                        spot_raw: dict | None = None,
+                        ai_stats: dict | None = None) -> str:
     from bot.pos_format import format_position_block
 
     free = float(futures_raw.get("free", {}).get("USDT", 0) or 0)
@@ -63,6 +64,14 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
         day_trades = int(daily_stats.get("trades", 0) or 0)
         icon = "📈" if day_pnl >= 0 else "📉"
         bal_lines.append(f"{icon} Сегодня: `{fmt_usd(day_pnl)}` ({day_trades} сд.)")
+    if ai_stats:
+        day_ai = float(ai_stats.get("day_cost_usd", 0) or 0)
+        total_ai = float(ai_stats.get("total_cost_usd", 0) or 0)
+        day_calls = int(ai_stats.get("day_calls", 0) or 0)
+        total_calls = int(ai_stats.get("total_calls", 0) or 0)
+        bal_lines.append(
+            f"🧠 AI API: сегодня `${day_ai:.4f}` ({day_calls}) · всего `${total_ai:.4f}` ({total_calls})"
+        )
     lines.append("\n".join(bal_lines))
 
     # Margin requirements block — shown below balance, before buttons
@@ -183,21 +192,23 @@ async def _fetch_all(client, context):
     config = context.bot_data.get("config")
     tp_sl_pcts = context.bot_data.get("tp_sl_pcts", {})
     daily_stats = db_mod.get_daily_stats(date.today().isoformat())
+    ai_stats = db_mod.get_ai_usage_stats(date.today().isoformat())
     lev_cache = await _fetch_lev_cache(client, positions)
 
-    return futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal
+    return futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, ai_stats
 
 
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = context.bot_data["exchange"]
     try:
-        futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
+        futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, ai_stats = \
             await _fetch_all(client, context)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
         return
 
-    text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
+    text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config,
+                               daily_stats, lev_cache, spot_bal, ai_stats)
     kb = _build_close_kb(positions)
     # Split if Telegram limit exceeded (4096 chars)
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
@@ -218,28 +229,6 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    if q.data.startswith("bal_close_confirm_"):
-        symbol = q.data[len("bal_close_confirm_"):]
-        coin = symbol.split("/")[0]
-        client = context.bot_data["exchange"]
-        try:
-            await q.edit_message_text(f"⏳ Закрываю `{coin}`...", parse_mode="Markdown")
-            pos = await client.get_position(symbol)
-            pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
-            margin = float(pos.get("margin", 0)) if pos else 0.0
-            exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
-            await client.cancel_tp_sl_orders(symbol)
-            await client.close_futures_position(symbol)
-            from bot import db as db_mod
-            db_mod.close_position(symbol)
-            db_mod.delete_reentry(symbol)
-            db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note="manual")
-            db_mod.close_position_history(symbol, exit_price, pnl, "manual")
-            await q.edit_message_text(f"✅ *{coin}* закрыт.", parse_mode="Markdown")
-        except Exception as e:
-            await q.edit_message_text(f"❌ Ошибка закрытия {coin}: {e}")
-        return
-
     if q.data == "bal_close_cancel":
         await q.answer("Отменено")
         await q.delete_message()
@@ -249,24 +238,25 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = q.data[len("bal_close_"):]
         coin = symbol.split("/")[0]
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Да, закрыть {coin}", callback_data=f"bal_close_confirm_{symbol}")],
+            [InlineKeyboardButton("🔄 С перезаходом", callback_data=f"close_reentry_{symbol}"),
+             InlineKeyboardButton("❌ Насовсем", callback_data=f"close_final_{symbol}")],
             [InlineKeyboardButton("◀ Отмена", callback_data="bal_close_cancel")],
         ])
         await q.message.reply_text(
-            f"⚠️ Закрыть *{coin}* по рынку?",
-            parse_mode="Markdown", reply_markup=kb,
+            f"Закрыть `{coin}`?", parse_mode="Markdown", reply_markup=kb,
         )
         return
 
     if q.data in ("balance_refresh", "balance_futures"):
         client = context.bot_data["exchange"]
         try:
-            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
+            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, ai_stats = \
                 await _fetch_all(client, context)
         except Exception as e:
             await q.answer(f"Ошибка: {e}", show_alert=True)
             return
-        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
+        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config,
+                                   daily_stats, lev_cache, spot_bal, ai_stats)
         kb = _build_close_kb(positions)
         chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
         try:

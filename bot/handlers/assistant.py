@@ -56,8 +56,8 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Avg picker (single-field editor) ─────────────────────────
     avg_pending = context.user_data.get("avg_pending")
     if avg_pending is not None:
-        from bot.handlers.trading import (_build_avg_select_kb, apply_avg_pending_value,
-                                          avg_question_text)
+        from bot.handlers.trading import AVG_WIZARD_STEPS, _avg_fmt, _build_avg_select_kb
+        from bot import db as db_mod
 
         if lo in ("отмена", "стоп", "cancel", "выход"):
             context.user_data.pop("avg_pending", None)
@@ -68,35 +68,39 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        key = avg_pending["key"]
+        attr = avg_pending["attr"]
+        cast = {"float": float, "int": int}.get(avg_pending["cast"], float)
+        label = avg_pending["label"]
+        unit = avg_pending["unit"]
         config = context.bot_data.get("config")
+
         try:
-            result = await apply_avg_pending_value(context, avg_pending, msg)
-        except ValueError as e:
-            await update.message.reply_text(
-                f"❌ {e}\n\n" + avg_question_text(config, avg_pending),
-                parse_mode="Markdown",
-            )
+            val = cast(msg.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("Не похоже на число. Введи значение или `отмена`.")
             return
+
+        setattr(config, attr, val)
+        db_mod.set_config(attr, str(val))
         context.user_data.pop("avg_pending", None)
+
+        if key in ("tp", "sl"):
+            from bot.handlers.trading import _reapply_tpsl_all
+            await _reapply_tpsl_all(context.application, config)
+        if key == "interval":
+            from bot.jobs.main import reschedule_averaging
+            reschedule_averaging(context.application, int(val))
+        if key in ("amount", "maxavg"):
+            new_budget = config.max_averaging_count * config.averaging_amount
+            with db_mod._connect() as conn:
+                conn.execute("UPDATE positions SET averaging_budget=? WHERE status='open'", (new_budget,))
+
+        fmt_val = f"${val:.2f}" if unit == "$" else (str(int(val)) if unit == "#" else f"{val:.0f}%")
         await update.message.reply_text(
-            f"✅ {result}\n\nВыбери следующий номер `1`-`14` или нажми *Готово*:",
+            f"✅ *{label}* → `{fmt_val}`\n\nВыбери следующий параметр или нажми *Готово*:",
             parse_mode="Markdown",
             reply_markup=_build_avg_select_kb(config),
-        )
-        return
-
-    if context.user_data.get("avg_select_mode") and msg.isdigit():
-        from bot.handlers.trading import avg_pending_for_number, avg_question_text
-        config = context.bot_data.get("config")
-        pending = avg_pending_for_number(int(msg))
-        if not pending:
-            await update.message.reply_text("Номер должен быть от 1 до 14.")
-            return
-        context.user_data["avg_pending"] = pending
-        await update.message.reply_text(
-            avg_question_text(config, pending),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data="avg_back")]]),
         )
         return
 
@@ -165,33 +169,14 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await update.message.reply_text("Введи число (например `-50` или `50`).", parse_mode="Markdown")
                 return
-            dyn["_cur_pnl"] = pnl
-            dyn["phase"] = "amount"
-            await update.message.reply_text(
-                f"*Ступень {step_n} из {total}*\nСумма докупки в $ (например `0.10`):",
-                parse_mode="Markdown", reply_markup=cancel_kb,
-            )
-            return
-
-        # ── Phase: enter averaging amount ────────────────────────────
-        if phase == "amount":
-            try:
-                amt = float(msg.replace(",", "."))
-                if amt <= 0:
-                    raise ValueError
-            except ValueError:
-                await update.message.reply_text("Введи положительное число (например `0.10`).", parse_mode="Markdown")
-                return
 
             dyn["rules"].append({
                 "after": dyn.pop("_cur_after"),
-                "pnl": dyn.pop("_cur_pnl"),
-                "amount": amt,
+                "pnl": pnl,
             })
             dyn["current"] += 1
 
             if dyn["current"] >= total:
-                # All steps collected — save and done
                 rules = sorted(dyn["rules"], key=lambda r: r["after"])
                 db_mod.set_config("avg_dynamic_rules", _json.dumps(rules))
                 context.user_data.pop("dyn_wizard", None)
@@ -199,8 +184,7 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines = ["✅ *Динамика докупки сохранена:*", ""]
                 for i, r in enumerate(rules, 1):
                     lines.append(
-                        f"  Ступень {i}: после `{r['after']}` докупок → "
-                        f"PnL ≤ `{r['pnl']:.0f}%`, сумма `${r['amount']:.2f}`"
+                        f"  Ступень {i}: после `{r['after']}` докупок → PnL ≤ `{r['pnl']:.0f}%`"
                     )
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
             else:

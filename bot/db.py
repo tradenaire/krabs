@@ -98,6 +98,17 @@ def init_db():
                 note TEXT DEFAULT '',
                 created_at TEXT DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS ai_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'scan',
+                model TEXT NOT NULL DEFAULT '',
+                cost_usd REAL NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                web_searches INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
             CREATE TABLE IF NOT EXISTS position_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
@@ -163,13 +174,15 @@ def get_config(key: str, default: str = "") -> str:
 
 def upsert_position(symbol: str, side: str, entry_price: float, leverage: int,
                     margin: float, tp_pct: float = 500, sl_pct: float = 500,
-                    budget: float = 5.0) -> int:
+                    budget: float = 5.0, total_invested: float = 0,
+                    avg_count: int = 0) -> int:
+    ti = total_invested if total_invested > 0 else margin
     with _connect() as conn:
         conn.execute("""
             INSERT OR IGNORE INTO positions (symbol, side, entry_price, leverage, margin,
-                total_invested, averaging_budget, tp_pct, sl_pct, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
-        """, (symbol, side, entry_price, leverage, margin, margin, budget, tp_pct, sl_pct))
+                total_invested, averaging_count, averaging_budget, tp_pct, sl_pct, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+        """, (symbol, side, entry_price, leverage, margin, ti, avg_count, budget, tp_pct, sl_pct))
         row = conn.execute(
             "SELECT id FROM positions WHERE symbol=? AND status='open' ORDER BY id DESC LIMIT 1",
             (symbol,)
@@ -354,6 +367,59 @@ def get_daily_stats(date_str: str | None = None) -> dict:
             "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND pnl <= 0 AND note != 'tp'", (d,)
         ).fetchone()[0]
     return stats
+
+
+# ── AI usage ──────────────────────────────────────────────────────
+
+def log_ai_usage(source: str, model: str, cost_usd: float = 0,
+                 input_tokens: int = 0, output_tokens: int = 0,
+                 web_searches: int = 0):
+    from datetime import date
+    today = date.today().isoformat()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO ai_usage
+            (date, source, model, cost_usd, input_tokens, output_tokens, web_searches)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (today, source, model, float(cost_usd or 0), int(input_tokens or 0),
+             int(output_tokens or 0), int(web_searches or 0)),
+        )
+
+
+def get_ai_usage_stats(date_str: str | None = None) -> dict:
+    from datetime import date
+    d = date_str or date.today().isoformat()
+    with _connect() as conn:
+        day = conn.execute(
+            """
+            SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0),
+                   COALESCE(SUM(output_tokens), 0), COALESCE(SUM(web_searches), 0), COUNT(*)
+            FROM ai_usage WHERE date=?
+            """,
+            (d,),
+        ).fetchone()
+        total = conn.execute(
+            """
+            SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0),
+                   COALESCE(SUM(output_tokens), 0), COALESCE(SUM(web_searches), 0), COUNT(*)
+            FROM ai_usage
+            """
+        ).fetchone()
+    return {
+        "date": d,
+        "day_cost_usd": float(day[0] or 0),
+        "day_input_tokens": int(day[1] or 0),
+        "day_output_tokens": int(day[2] or 0),
+        "day_web_searches": int(day[3] or 0),
+        "day_calls": int(day[4] or 0),
+        "total_cost_usd": float(total[0] or 0),
+        "total_input_tokens": int(total[1] or 0),
+        "total_output_tokens": int(total[2] or 0),
+        "total_web_searches": int(total[3] or 0),
+        "total_calls": int(total[4] or 0),
+    }
 
 
 # ── position_history ──────────────────────────────────────────────

@@ -8,8 +8,23 @@ import asyncio
 import logging
 import pandas as pd
 import pandas_ta as ta
+import re
 
 logger = logging.getLogger(__name__)
+
+_SOURCE_NAMES = {
+    "coingecko.com": "CoinGecko",
+    "coinmarketcap.com": "CoinMarketCap",
+    "token.unlocks.app": "TokenUnlocks",
+    "cryptorank.io": "CryptoRank",
+    "theblock.co": "TheBlock",
+    "coindesk.com": "CoinDesk",
+    "cointelegraph.com": "Cointelegraph",
+    "decrypt.co": "Decrypt",
+    "sec.gov": "SEC",
+    "binance.com": "Binance",
+    "mexc.com": "MEXC",
+}
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -22,6 +37,19 @@ def _safe_float(value, default: float = 0.0) -> float:
         return v
     except (TypeError, ValueError):
         return default
+
+
+def _clean_ai_note(text: str) -> str:
+    if not text:
+        return ""
+    out = str(text)
+    for domain, name in _SOURCE_NAMES.items():
+        out = re.sub(rf"\(?\b(?:www\.)?{re.escape(domain)}\b\)?", name, out, flags=re.IGNORECASE)
+    out = re.sub(r"https?://\S+", "", out)
+    out = re.sub(r"\(\s*\)", "", out)
+    out = re.sub(r"\s+([,.;:])", r"\1", out)
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out[:500]
 
 
 def _rsi_last(df: pd.DataFrame) -> float | None:
@@ -496,17 +524,29 @@ def _deep_analyze(symbol: str, ohlcv: list, ticker: dict, daily_change: float,
 
 
 def format_coin_card(r: dict, index: int, ai_note: str = "",
-                     max_lev: int = 0, margin: float = 0.0) -> str:
+                     max_lev: int = 0, margin: float = 0.0,
+                     tp_pct: float = 0.0, sl_pct: float = 0.0) -> str:
     coin = r["symbol"].split("/")[0]
     dir_emoji = "🔻" if r["direction"] == "short" else "🔺"
     reasons_text = "\n".join(f"    • {x}" for x in r["reasons"][:4])
     vol_24h = r.get("volume_24h", 0)
     vol_str = f"${vol_24h/1e6:.1f}M" if vol_24h >= 1e6 else f"${vol_24h/1e3:.0f}K"
+    ai_note = _clean_ai_note(ai_note)
     note_line = f"\n   📰 {ai_note}" if ai_note else ""
     lev_line = ""
     if max_lev > 0 and margin > 0:
         notional = margin * max_lev
         lev_line = f"\n   ⚙️ Плечо `×{max_lev}` | Маржа `${margin:.2f}` | Поза `~${notional:.0f}`"
+    per_dollar_line = ""
+    if tp_pct or sl_pct or max_lev > 0:
+        parts = []
+        if tp_pct:
+            parts.append(f"TP `+${tp_pct / 100:.2f}`")
+        if sl_pct:
+            parts.append(f"SL `-${sl_pct / 100:.2f}`")
+        if max_lev > 0:
+            parts.append(f"1% цены `≈${max_lev / 100:.2f}`")
+        per_dollar_line = "\n   💵 На `$1` маржи: " + " · ".join(parts)
     tf = r.get("timeframes", {}) or {}
     tf_bits = []
     for name in ("1h", "4h", "1d"):
@@ -527,6 +567,6 @@ def format_coin_card(r: dict, index: int, ai_note: str = "",
         f"{index}. {dir_emoji} *{coin}*\n"
         f"   RSI `{r['rsi']}` | 24ч `{r['daily_change_pct']:+.1f}%` | Объём `{vol_str}`\n"
         f"   Тренд: {r['ema_trend']} | BB: `{r['bb_position']:.0%}`{note_line}"
-        f"{smart_line}{gate_line}{lev_line}\n"
+        f"{smart_line}{gate_line}{lev_line}{per_dollar_line}\n"
         f"   *Почему:*\n{reasons_text}"
     )
