@@ -356,6 +356,44 @@ class ExchangeClient:
                 "margin_mode": margin_mode, "info": result}
 
     @_with_retry(tries=2, base_delay=1.0)
+    async def partial_close_futures_position(self, symbol: str, contracts: int) -> dict:
+        """Close `contracts` contracts of an open position (partial close)."""
+        sym = self.futures_symbol(symbol)
+        pos = await self.get_position(symbol)
+        if not pos:
+            raise ValueError(f"No open position for {sym}")
+
+        side = pos["side"]
+        total_contracts = int(round(pos["contracts"]))
+        contracts = max(1, min(contracts, total_contracts))
+        mexc_side = 4 if side == "long" else 2
+        margin_mode = pos.get("margin_mode") or "cross"
+        open_type = 1 if margin_mode == "isolated" else 2
+
+        await self._exchange.load_markets()
+        market = self._exchange.market(sym)
+        mexc_symbol = self._mexc_contract_symbol(market, sym)
+
+        params = {
+            "symbol": mexc_symbol,
+            "price": 0,
+            "vol": contracts,
+            "side": mexc_side,
+            "type": 5,
+            "openType": open_type,
+        }
+        pos_id = pos.get("position_id")
+        if pos_id:
+            params["positionId"] = pos_id
+
+        result = await self._exchange.contractPrivatePostOrderSubmit(params)
+        if not result.get("success", False):
+            raise RuntimeError(f"MEXC partial close failed: {result.get('message', result)}")
+
+        logger.info("Partial close: %s %s %d/%d contracts", sym, side, contracts, total_contracts)
+        return {"id": str(result.get("data", "")), "symbol": sym,
+                "contracts_closed": contracts, "info": result}
+
     async def close_futures_position(self, symbol: str) -> dict:
         sym = self.futures_symbol(symbol)
         pos = await self.get_position(symbol)
@@ -394,9 +432,18 @@ class ExchangeClient:
 
     # ── TP/SL ────────────────────────────────────────────────────────
 
+    async def cancel_plan_orders(self, symbol: str) -> None:
+        mexc_sym = self.futures_symbol(symbol).replace("/", "_").replace(":USDT", "")
+        try:
+            await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
+            logger.info("cancel_plan_orders(%s): done", symbol)
+        except Exception as e:
+            logger.warning("cancel_plan_orders(%s): %s", symbol, e)
+
     async def set_tp_sl(self, symbol: str, tp_price: float | None = None,
                         sl_price: float | None = None,
-                        pos_data: dict | None = None) -> list[dict]:
+                        pos_data: dict | None = None,
+                        sl_limit_price: float | None = None) -> list[dict]:
         sym = self.futures_symbol(symbol)
 
         if pos_data:
@@ -417,7 +464,19 @@ class ExchangeClient:
         mexc_sym = self._mexc_contract_symbol(market, sym)
         close_side = 4 if side == "long" else 2
 
-        # Idempotency check
+        # Idempotency check — skip if prices within 0.3% to prevent rapid cancel+replace
+        # that exhausts MEXC plan order quota (err=2009) during fast averaging cycles
+        _SKIP_THRESHOLD = 0.003
+
+        def _within(new_price_set, existing_set):
+            if new_price_set is None:
+                return True  # not being changed
+            if not existing_set:
+                return False  # no existing order — must place
+            ex = next(iter(existing_set))
+            new = next(iter(new_price_set))
+            return ex > 0 and abs(new - ex) / ex < _SKIP_THRESHOLD
+
         try:
             existing = await self.get_tp_sl_orders(symbol)
         except Exception:
@@ -430,9 +489,9 @@ class ExchangeClient:
                            for t in existing if t.get("trigger_type") == sl_type}
             want_tp = None if tp_price is None else {round(tp_price, 6)}
             want_sl = None if sl_price is None else {round(sl_price, 6)}
-            if (want_tp is None or existing_tp == want_tp) and \
-               (want_sl is None or existing_sl == want_sl):
-                logger.info("set_tp_sl(%s): triggers exact match, skipping", sym)
+            if _within(want_tp, existing_tp) and _within(want_sl, existing_sl):
+                logger.info("set_tp_sl(%s): triggers within %.1f%% threshold, skipping",
+                            sym, _SKIP_THRESHOLD * 100)
                 return [{"type": "skip", "result": {"success": True}}]
 
         # Cancel all then re-place
@@ -451,12 +510,13 @@ class ExchangeClient:
 
         results = []
 
-        async def _place(kind: str, price: float, trigger_type: int) -> dict:
+        async def _place(kind: str, price: float, trigger_type: int,
+                         exec_price: float = 0) -> dict:
             last_err: Exception | None = None
             for attempt in range(3):
                 try:
                     r = await self._exchange.contractPrivatePostPlanorderPlace({
-                        "symbol": mexc_sym, "price": 0, "vol": contracts,
+                        "symbol": mexc_sym, "price": exec_price, "vol": contracts,
                         "side": close_side, "orderType": 5, "openType": open_type,
                         "triggerPrice": str(price), "triggerType": trigger_type,
                         "trend": 1, "executeCycle": 2,
@@ -478,7 +538,8 @@ class ExchangeClient:
 
         if sl_price:
             tt = 2 if side == "long" else 1
-            results.append(await _place("SL", sl_price, tt))
+            exec_p = round(sl_limit_price, 8) if sl_limit_price else 0
+            results.append(await _place("SL", sl_price, tt, exec_price=exec_p))
 
         return results
 

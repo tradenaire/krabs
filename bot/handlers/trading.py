@@ -50,18 +50,91 @@ def _calc_sl_price(entry: float, leverage: int, sl_pct: float, side: str) -> flo
     return entry + move if side == "short" else entry - move
 
 
+def _max_leverage_by_vol(vol_24h_usdt: float) -> int:
+    """Cap leverage based on 24h quote volume as liquidity/volatility proxy."""
+    if vol_24h_usdt >= 500_000_000:
+        return 20
+    if vol_24h_usdt >= 50_000_000:
+        return 10
+    return 5
+
+
+class MinOrderUpgradeNeeded(Exception):
+    def __init__(self, min_margin: float, leverage: int):
+        self.min_margin = min_margin
+        self.leverage = leverage
+        super().__init__(f"min_margin={min_margin:.4f} lev={leverage}")
+
+
 async def execute_open(client, app, symbol: str, side: str,
                        margin: float, leverage: int | None = None,
-                       tp_pct: float = 500, sl_pct: float = 500) -> dict:
-    """Open a futures position with TP/SL and register re-entry."""
+                       tp_pct: float = 500, sl_pct: float = 500,
+                       interactive: bool = False) -> dict:
+    """Open a futures position with TP/SL and register re-entry.
+
+    interactive=True: raises MinOrderUpgradeNeeded instead of silently upgrading margin.
+    """
     config = app.bot_data.get("config")
 
+    user_set = leverage is not None and leverage > 0
+
     # Resolve max leverage if not given
-    if leverage is None or leverage <= 0:
+    if not user_set:
         try:
             leverage = await client.get_max_leverage(symbol)
         except Exception:
             leverage = 25
+
+    # Cap leverage by 24h volume only when leverage was NOT explicitly set by user
+    if not user_set:
+        try:
+            ticker = await client.get_ticker(symbol)
+            vol_24h = float(ticker.get("quoteVolume") or ticker.get("baseVolume") or 0)
+            vol_cap = _max_leverage_by_vol(vol_24h)
+            if leverage > vol_cap:
+                logger.info("Leverage capped %s: %d→%d (vol_24h=$%.0f)", symbol, leverage, vol_cap, vol_24h)
+                leverage = vol_cap
+        except Exception:
+            pass
+
+    # BTC trend warning for manual shorts (non-blocking)
+    if side in ("sell", "short"):
+        try:
+            from bot.jobs.main import _get_btc_rsi_4h
+            btc_rsi = await _get_btc_rsi_4h(client)
+            btc_threshold = float(getattr(config, "btc_rsi_filter", 65.0)) if config else 65.0
+            if btc_rsi is not None and btc_rsi > btc_threshold:
+                from bot.jobs.main import _notify_all
+                await _notify_all(app,
+                    f"⚠️ BTC RSI 4h = `{btc_rsi:.0f}` > `{btc_threshold:.0f}` — бычий рынок\n"
+                    f"Шорт открывается, но осторожно")
+        except Exception:
+            pass
+
+    # Enforce minimum order notional AFTER leverage caps (MEXC error 7008).
+    # MEXC enforces $5 minimum notional; many symbols lack limits.cost.min in market data,
+    # so get_min_order_usdt falls back to 1-contract (too small). Floor at $5.
+    _MEXC_MIN_NOTIONAL = 5.0
+    _min_cache: dict = app.bot_data.setdefault("_min_order_cache", {})
+    _cached_notional = _min_cache.get(symbol, 0)
+    if _cached_notional > 0:
+        effective_notional = max(_cached_notional, _MEXC_MIN_NOTIONAL)
+        _min_margin = effective_notional / max(leverage, 1) * 1.05
+    else:
+        try:
+            _min_margin_api = await client.get_min_order_usdt(symbol, leverage)
+            raw_notional = _min_margin_api * leverage if _min_margin_api > 0 else 0.0
+        except Exception:
+            raw_notional = 0.0
+        effective_notional = max(raw_notional, _MEXC_MIN_NOTIONAL)
+        _min_cache[symbol] = effective_notional
+        _min_margin = effective_notional / max(leverage, 1) * 1.05
+
+    if _min_margin > 0 and margin < _min_margin - 0.0001:
+        if interactive:
+            raise MinOrderUpgradeNeeded(_min_margin, leverage)
+        logger.info("execute_open %s: margin upgraded $%.4f→$%.4f (×%d)", symbol, margin, _min_margin, leverage)
+        margin = _min_margin
 
     order = await client.place_futures_order(symbol, side, margin, leverage)
     actual_lev = order.get("leverage", leverage) or leverage
@@ -149,17 +222,34 @@ async def execute_open(client, app, symbol: str, side: str,
 
 
 async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/short SYMBOL [amount] — открыть шорт с максимальным плечом."""
+    """/short SYMBOL [amount] [xLEV] — открыть шорт. Плечо: x100 или х100."""
     args = context.args or []
     if not args:
-        await update.message.reply_text("Использование: /short SYMBOL [amount_usdt]")
+        await update.message.reply_text("Использование: /short SYMBOL [amount_usdt] [xLEV]")
         return
 
     symbol_raw = args[0].upper()
     config = context.bot_data["config"]
     client = context.bot_data["exchange"]
     default_margin = float(getattr(config, "default_trade_usdt", 0.20))
-    margin = float(args[1]) if len(args) > 1 else default_margin
+
+    # Parse remaining args: xNN = leverage, float = margin
+    inline_lev: int | None = None
+    margin = default_margin
+    import re as _re
+    for a in args[1:]:
+        m = _re.match(r'^[xхXХ](\d+)$', a, _re.IGNORECASE)
+        if m:
+            inline_lev = int(m.group(1))
+        else:
+            try:
+                margin = float(a)
+            except ValueError:
+                pass
+
+    cfg_lev = int(getattr(config, "default_leverage", 0) or 0)
+    leverage = inline_lev or cfg_lev or None
+
     tp_pct = float(getattr(config, "tp_pct", 500))
     sl_pct = float(getattr(config, "sl_pct", 500))
 
@@ -182,17 +272,21 @@ async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if funding_warn:
         await update.message.reply_text(funding_warn, parse_mode="Markdown")
 
-    await update.message.reply_text(f"🔻 Открываю SHORT `{coin}` ${margin:g}...",
+    lev_str = f"×{leverage}" if leverage else "×макс"
+    await update.message.reply_text(f"🔻 Открываю SHORT `{coin}` ${margin:g} {lev_str}...",
                                      parse_mode="Markdown")
     try:
         result = await execute_open(
             client, context.application, sym, "sell", margin,
-            tp_pct=tp_pct, sl_pct=sl_pct,
+            leverage=leverage, tp_pct=tp_pct, sl_pct=sl_pct,
         )
+        actual_margin = result.get("margin", margin)
         lines = [
-            f"*{coin}* 🔻×{result['leverage']} `${margin:.2f}`",
+            f"*{coin}* 🔻×{result['leverage']} `${actual_margin:.2f}`",
             f"▶ Entry: `{result['entry_price']:.6g}`",
         ]
+        if actual_margin > margin + 0.001:
+            lines.append(f"⚠️ Маржа поднята до мин MEXC: `${margin:.2f}` → `${actual_margin:.2f}`")
         if result.get("liquidation_price"):
             lines.append(f"💀 Liq: `{result['liquidation_price']:.6g}`")
         if result.get("tp_price"):
@@ -206,7 +300,7 @@ async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/close SYMBOL — закрыть позицию."""
+    """/close SYMBOL — показывает выбор: с перезаходом или насовсем."""
     args = context.args or []
     if not args:
         await update.message.reply_text("Использование: /close SYMBOL")
@@ -221,37 +315,124 @@ async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = client.futures_symbol(symbol_raw)
 
     coin = sym.split("/")[0]
-    await update.message.reply_text(f"Закрываю `{coin}`...", parse_mode="Markdown")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 С перезаходом", callback_data=f"close_reentry_{sym}"),
+         InlineKeyboardButton("❌ Насовсем", callback_data=f"close_final_{sym}")],
+        [InlineKeyboardButton("◀ Отмена", callback_data=f"close_cancel_{sym}")],
+    ])
+    await update.message.reply_text(
+        f"Закрыть `{coin}`?", parse_mode="Markdown", reply_markup=kb
+    )
+
+
+async def _do_close(client, context, symbol: str, keep_reentry: bool):
+    """Shared close logic. Returns (coin, pnl, cycles_left_or_none)."""
+    from bot import db as db_mod
+    pos = await client.get_position(symbol)
+    pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
+    margin = float(pos.get("margin", 0)) if pos else 0.0
+    exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
+
+    if keep_reentry:
+        # Ensure reentry record exists before closing DB position
+        re_rec = db_mod.get_reentry(symbol)
+        if not re_rec:
+            db_rec = db_mod.get_open_position(symbol)
+            config = context.bot_data.get("config")
+            max_cycles = int(getattr(config, "max_reentry_cycles", 3)) if config else 3
+            if db_rec and max_cycles > 0:
+                db_mod.upsert_reentry(
+                    symbol=symbol,
+                    side="sell" if db_rec.get("side") == "short" else "buy",
+                    margin=margin or float(db_rec.get("margin", 0.2)),
+                    leverage=int(db_rec.get("leverage", 1)),
+                    tp_pct=float(db_rec.get("tp_pct", 500)),
+                    sl_pct=float(db_rec.get("sl_pct", 500)),
+                    max_cycles=max_cycles,
+                )
+
+    await client.cancel_tp_sl_orders(symbol)
+    await client.close_futures_position(symbol)
+    db_mod.close_position(symbol)
+    note = "manual_reentry" if keep_reentry else "manual"
+    db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note=note)
+    db_mod.close_position_history(symbol, exit_price, pnl, note)
+
+    if not keep_reentry:
+        db_mod.delete_reentry(symbol)
+        return pnl, None
+
+    re_rec = db_mod.get_reentry(symbol)
+    cycles_left = 0
+    if re_rec:
+        mc = re_rec.get("max_cycles") or 0
+        cc = re_rec.get("cycle_count") or 0
+        cycles_left = max(0, int(mc) - int(cc))
+    return pnl, cycles_left
+
+
+async def close_reentry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """close_reentry_{symbol} — закрыть с сохранением перезахода."""
+    q = update.callback_query
+    await q.answer()
+    symbol = q.data[len("close_reentry_"):]
+    client = context.bot_data["exchange"]
+    coin = symbol.split("/")[0]
     try:
-        pos = await client.get_position(sym)
-        pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
-        margin = float(pos.get("margin", 0)) if pos else 0.0
-        exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
-        await client.cancel_tp_sl_orders(sym)
-        await client.close_futures_position(sym)
-        from bot import db as db_mod
-        db_mod.close_position(sym)
-        db_mod.delete_reentry(sym)
-        db_mod.log_trade(sym, "close", amount=margin, pnl=pnl, note="manual")
-        db_mod.close_position_history(sym, exit_price, pnl, "manual")
-        await update.message.reply_text(f"✅ *{coin}* закрыт.", parse_mode="Markdown")
+        pnl, cycles_left = await _do_close(client, context, symbol, keep_reentry=True)
+        pnl_s = f"`{pnl:+.2f}$`" if pnl != 0 else ""
+        await q.edit_message_text(
+            f"✅ *{coin}* закрыт{(' ' + pnl_s) if pnl_s else ''}\n"
+            f"🔄 Перезаход через ~30с (осталось: {cycles_left})",
+            parse_mode="Markdown",
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка закрытия: {e}")
+        await q.edit_message_text(f"❌ Ошибка: {e}")
+
+
+async def close_final_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """close_final_{symbol} — закрыть насовсем без перезахода."""
+    q = update.callback_query
+    await q.answer()
+    symbol = q.data[len("close_final_"):]
+    client = context.bot_data["exchange"]
+    coin = symbol.split("/")[0]
+    try:
+        pnl, _ = await _do_close(client, context, symbol, keep_reentry=False)
+        pnl_s = f" `{pnl:+.2f}$`" if pnl != 0 else ""
+        await q.edit_message_text(f"✅ *{coin}* закрыт{pnl_s}.", parse_mode="Markdown")
+    except Exception as e:
+        await q.edit_message_text(f"❌ Ошибка: {e}")
+
+
+async def close_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """close_cancel_{symbol} — отмена закрытия."""
+    q = update.callback_query
+    await q.answer()
+    try:
+        await q.delete_message()
+    except Exception:
+        await q.edit_message_text("Отменено.")
 
 
 # ── Avg wizard ────────────────────────────────────────────────────
 
 AVG_WIZARD_STEPS = [
-    (1, "bet",       "default_trade_usdt",     float, "Маржа",        "$"),
-    (2, "leverage",  "default_leverage",       int,   "Плечо",        "#"),
-    (3, "tp",        "tp_pct",                 float, "TP",           "%"),
-    (4, "sl",        "sl_pct",                 float, "SL",           "%"),
-    (5, "threshold", "averaging_threshold",    float, "При PnL",      "%"),
-    (6, "amount",    "averaging_amount",       float, "Сумма",        "$"),
-    (7, "maxavg",    "max_averaging_count",    int,   "Макс",         "#"),
-    (8, "interval",  "averaging_interval",     int,   "Интервал",     "s"),
-    (10, "scan_cap", "auto_scan_capital_pct",  float, "Авто-капитал", "%"),
+    (1,  "bet",       "default_trade_usdt",            float, "Маржа",           "$"),
+    (2,  "leverage",  "default_leverage",              int,   "Плечо",           "#"),
+    (3,  "tp",        "tp_pct",                        float, "TP",              "%"),
+    (4,  "sl",        "sl_pct",                        float, "SL",              "%"),
+    (5,  "threshold", "averaging_threshold",           float, "При PnL",         "%"),
+    (6,  "amount",    "averaging_amount",              float, "Сумма",           "$"),
+    (7,  "maxavg",    "max_averaging_count",           int,   "Макс",            "#"),
+    (8,  "interval",  "averaging_interval",            int,   "Интервал",        "s"),
+    (10, "scan_cap",        "auto_scan_capital_pct",            float, "Авто-капитал",    "%"),
+    (15, "margin_emergency", "margin_emergency_threshold_pct",  float, "Аварийное закрытие", "%"),
 ]
+# Legacy steps not in numbered list (kept for backward compat):
+# ("reentry",      "max_reentry_cycles",              int,   "Перезаходов макс",  "#"),
+# ("lock_trigger", "averaging_profit_lock_trigger",   float, "Локк SL при профите ≥", "%"),
+# ("lock_sl",      "averaging_profit_lock_sl_pct",    float, "Поставить SL на PnL",  "%"),
 
 _AVG_BY_NUM = {num: (key, attr, cast, label, unit) for num, key, attr, cast, label, unit in AVG_WIZARD_STEPS}
 _AVG_BY_KEY = {key: (num, attr, cast, label, unit) for num, key, attr, cast, label, unit in AVG_WIZARD_STEPS}
@@ -304,17 +485,6 @@ def _fmt_dyn_rule(rule: dict | None) -> str:
     if not rule:
         return "выкл"
     return f"после `{int(rule['after'])}` докупок → PnL ≤ `{float(rule['pnl']):.0f}%`, сумма `${float(rule['amount']):.2f}`"
-
-
-def _avg_fmt(config, attr: str, unit: str) -> str:
-    val = getattr(config, attr, 0)
-    if unit == "$":
-        return f"${float(val):.2f}"
-    if unit == "#":
-        return str(int(val))
-    if unit == "s":
-        return f"{int(val)}s"
-    return f"{float(val):.0f}%"
 
 
 def avg_pending_for_number(num: int) -> dict | None:
@@ -451,11 +621,22 @@ async def apply_avg_pending_value(context: ContextTypes.DEFAULT_TYPE,
     raise ValueError("неизвестный пункт настройки")
 
 
+def _avg_fmt(config, attr: str, unit: str) -> str:
+    val = getattr(config, attr, 0)
+    if unit == "$":
+        return f"${float(val):.2f}"
+    if unit == "#":
+        return str(int(val))
+    if unit == "s":
+        return f"{int(val)}s"
+    return f"{float(val):.0f}%"
+
+
 def _build_avg_select_kb(config) -> InlineKeyboardMarkup:
-    """Keyboard with one button per numbered setting."""
+    """Keyboard with one button per setting showing current value."""
     rows = []
     pair = []
-    for num in range(1, 15):
+    for num in range(1, 16):
         pending = avg_pending_for_number(num)
         if not pending:
             continue
@@ -471,9 +652,9 @@ def _build_avg_select_kb(config) -> InlineKeyboardMarkup:
 
 
 async def send_avg_wizard_step(bot, chat_id: int, step_idx: int, config) -> None:
-    _num, _key, attr, _cast, label, unit = AVG_WIZARD_STEPS[step_idx]
+    _, key, attr, _, label, unit = AVG_WIZARD_STEPS[step_idx]
     cur = _avg_fmt(config, attr, unit)
-    total = 14
+    total = len(AVG_WIZARD_STEPS)
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("⏭ Пропустить", callback_data=f"avg_skip_{step_idx}"),
         InlineKeyboardButton("✖ Отмена", callback_data="avg_cancel"),
@@ -530,8 +711,11 @@ def _build_avg_text(config, free_balance: float | None = None, open_count: int =
         f"8. Интервал: `{config.averaging_interval}s`",
         lock_line,
         scan_risk_line,
+        f"15. Аварийное закрытие: `{float(getattr(config, 'margin_emergency_threshold_pct', 0)):.0f}%`"
+        + (" _(выкл)_" if not float(getattr(config, 'margin_emergency_threshold_pct', 0)) else
+           " _(avail < X% free → закрыть 10% поз, пауза 5м)_"),
         "",
-        "_Напиши номер `1`-`14`, чтобы изменить конкретный пункт._",
+        "_Напиши номер `1`-`15`, чтобы изменить конкретный пункт._",
     ]
     dyn = _load_avg_dynamic_rules()
     lines.append("")
@@ -583,15 +767,17 @@ async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 avg_question_text(config, pending),
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data="avg_back")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀ Отмена", callback_data="avg_back")]]),
             )
             return
+        # Value provided inline: /avg 1 0.50
         try:
             result = await apply_avg_pending_value(context, pending, " ".join(args[1:]))
         except ValueError as e:
             await update.message.reply_text(f"❌ {e}", parse_mode="Markdown")
             return
-        await update.message.reply_text(f"✅ {result}", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ {result}", parse_mode="Markdown",
+                                         reply_markup=_build_avg_select_kb(config))
         return
 
     if len(args) < 2:
@@ -699,7 +885,6 @@ async def avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data in ("avg_edit", "avg_back"):
         context.user_data.pop("avg_pending", None)
-        context.user_data["avg_select_mode"] = True
         await q.edit_message_text(
             _build_avg_text(config) + "\n\n_Выбери параметр для изменения:_",
             parse_mode="Markdown",
@@ -709,7 +894,6 @@ async def avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "avg_done":
         context.user_data.pop("avg_pending", None)
-        context.user_data.pop("avg_select_mode", None)
         client = context.bot_data.get("exchange")
         free_balance: float | None = None
         open_count = 0
@@ -734,7 +918,6 @@ async def avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Неизвестный параметр")
             return
         context.user_data["avg_pending"] = pending
-        context.user_data["avg_select_mode"] = True
         await q.edit_message_text(
             avg_question_text(config, pending),
             parse_mode="Markdown",
@@ -745,7 +928,6 @@ async def avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "avg_cancel":
         context.user_data.pop("avg_pending", None)
         context.user_data.pop("avg_wizard", None)
-        context.user_data.pop("avg_select_mode", None)
         await q.edit_message_text("✖ Изменение настроек отменено.")
         return
 
@@ -759,7 +941,7 @@ async def avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if dyn:
                     rows_txt = []
                     for i, r in enumerate(dyn, 1):
-                        rows_txt.append(f"  {i}. после {r['after']} докупок → PnL≤{r['pnl']:.0f}%, ${r['amount']:.2f}")
+                        rows_txt.append(f"  {i}. после {r['after']} докупок → PnL≤{r['pnl']:.0f}%")
                     cur_text = "\n*Текущие правила:*\n" + "\n".join(rows_txt) + "\n\n"
             except Exception:
                 pass
@@ -802,7 +984,7 @@ async def _finish_wizard(chat_id: int, context, changed: dict, config) -> None:
         await context.bot.send_message(chat_id=chat_id, text="Ничего не изменено.")
         return
     lines = ["✅ *Настройки обновлены:*", ""]
-    unit_map = {key: unit for _num, key, _attr, _cast, _label, unit in AVG_WIZARD_STEPS}
+    unit_map = {key: unit for _, key, _, _, _, unit in AVG_WIZARD_STEPS}
     for key, val in changed.items():
         unit = unit_map.get(key, "")
         fmt = f"${val:.2f}" if unit == "$" else (str(int(val)) if unit == "#" else f"{val:.0f}%")
@@ -862,7 +1044,9 @@ async def setkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Update live config
     try:
         attr = getattr(config, key)
-        if isinstance(attr, float):
+        if isinstance(attr, bool):
+            setattr(config, key, value.lower() in ("1", "true", "yes", "on"))
+        elif isinstance(attr, float):
             setattr(config, key, float(value))
         elif isinstance(attr, int):
             setattr(config, key, int(value))
@@ -871,3 +1055,68 @@ async def setkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         setattr(config, key, value)
     await update.message.reply_text(f"✅ Сохранено: `{key}` = `{value}`", parse_mode="Markdown")
+
+
+async def min_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback для подтверждения открытия с минимальным ордером."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "min_open_no":
+        context.user_data.pop("pending_min_open", None)
+        await query.edit_message_text("❌ Отменено")
+        return
+
+    pending = context.user_data.pop("pending_min_open", None)
+    if not pending:
+        await query.edit_message_text("❌ Нет данных — попробуй снова")
+        return
+
+    client = context.bot_data["exchange"]
+    coin = pending["symbol"].split("/")[0]
+    margin = pending["margin"]
+    await query.edit_message_text(
+        f"🔻 Открываю SHORT `{coin}` ${margin:.2f}...", parse_mode="Markdown"
+    )
+    try:
+        result = await execute_open(
+            client, context.application,
+            pending["symbol"], pending["side"], margin, pending["leverage"],
+            tp_pct=pending["tp_pct"], sl_pct=pending["sl_pct"],
+        )
+        lines = [
+            f"*{coin}* 🔻×{result['leverage']} `${margin:.2f}`",
+            f"▶ Entry: `{result['entry_price']:.6g}`",
+        ]
+        if result.get("liquidation_price"):
+            lines.append(f"💀 Liq: `{result['liquidation_price']:.6g}`")
+        if result.get("tp_price"):
+            lines.append(f"✅ TP: `{result['tp_price']:.6g}` (+{pending['tp_pct']:.0f}%)")
+        if result.get("sl_price"):
+            lines.append(f"🛑 SL: `{result['sl_price']:.6g}` (-{pending['sl_pct']:.0f}%)")
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await query.edit_message_text(f"❌ Ошибка: {e}")
+
+
+async def avgunlock_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разблокировать докупки для символа (убрать из avg_exhausted)."""
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data[len("avgunlock_"):]
+    notified_exhausted: set = context.bot_data.setdefault("_avg_notified_exhausted", set())
+    coin = symbol.split("/")[0]
+    if symbol in notified_exhausted:
+        notified_exhausted.discard(symbol)
+        from bot.jobs.main import _save_exhausted
+        _save_exhausted(notified_exhausted)
+        await query.edit_message_text(
+            f"🔓 *Докупки `{coin}` разблокированы*\n"
+            f"Бот возобновит докупки при PnL ≤ порога",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.edit_message_text(
+            f"✅ `{coin}` уже не заблокирован",
+            parse_mode="Markdown"
+        )

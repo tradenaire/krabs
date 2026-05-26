@@ -85,6 +85,7 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Avg select mode: digit shortcuts ─────────────────────────
     if context.user_data.get("avg_select_mode") and msg.isdigit():
         from bot.handlers.trading import avg_pending_for_number, avg_question_text
         config = context.bot_data.get("config")
@@ -165,6 +166,7 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await update.message.reply_text("Введи число (например `-50` или `50`).", parse_mode="Markdown")
                 return
+
             dyn["_cur_pnl"] = pnl
             dyn["phase"] = "amount"
             await update.message.reply_text(
@@ -173,7 +175,7 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # ── Phase: enter averaging amount ────────────────────────────
+        # ── Phase: enter averaging amount ───────────────────────────
         if phase == "amount":
             try:
                 amt = float(msg.replace(",", "."))
@@ -191,7 +193,6 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dyn["current"] += 1
 
             if dyn["current"] >= total:
-                # All steps collected — save and done
                 rules = sorted(dyn["rules"], key=lambda r: r["after"])
                 db_mod.set_config("avg_dynamic_rules", _json.dumps(rules))
                 context.user_data.pop("dyn_wizard", None)

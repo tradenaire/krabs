@@ -43,7 +43,12 @@ def init_db():
                 close_price REAL DEFAULT 0,
                 realized_pnl REAL DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now')),
-                closed_at TEXT
+                closed_at TEXT,
+                funding_accrued REAL DEFAULT 0,
+                last_funding_ts TEXT DEFAULT NULL,
+                profit_lock_step REAL DEFAULT 0,
+                liquidation_price REAL DEFAULT 0,
+                source TEXT DEFAULT 'scan'
             );
             CREATE TABLE IF NOT EXISTS paper_trade_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,13 +168,15 @@ def get_config(key: str, default: str = "") -> str:
 
 def upsert_position(symbol: str, side: str, entry_price: float, leverage: int,
                     margin: float, tp_pct: float = 500, sl_pct: float = 500,
-                    budget: float = 5.0) -> int:
+                    budget: float = 5.0, total_invested: float = 0,
+                    avg_count: int = 0) -> int:
+    ti = total_invested if total_invested > 0 else margin
     with _connect() as conn:
         conn.execute("""
             INSERT OR IGNORE INTO positions (symbol, side, entry_price, leverage, margin,
-                total_invested, averaging_budget, tp_pct, sl_pct, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
-        """, (symbol, side, entry_price, leverage, margin, margin, budget, tp_pct, sl_pct))
+                total_invested, averaging_count, averaging_budget, tp_pct, sl_pct, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+        """, (symbol, side, entry_price, leverage, margin, ti, avg_count, budget, tp_pct, sl_pct))
         row = conn.execute(
             "SELECT id FROM positions WHERE symbol=? AND status='open' ORDER BY id DESC LIMIT 1",
             (symbol,)
@@ -445,6 +452,17 @@ def init_paper_account(initial_balance: float = 500.0):
             "INSERT OR IGNORE INTO paper_account (id, balance, initial_balance) VALUES (1, ?, ?)",
             (initial_balance, initial_balance)
         )
+        for col, definition in [
+            ("funding_accrued", "REAL DEFAULT 0"),
+            ("last_funding_ts", "TEXT DEFAULT NULL"),
+            ("profit_lock_step", "REAL DEFAULT 0"),
+            ("liquidation_price", "REAL DEFAULT 0"),
+            ("source", "TEXT DEFAULT 'scan'"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE paper_positions ADD COLUMN {col} {definition}")
+            except Exception:
+                pass  # column already exists
 
 
 def get_paper_account() -> dict:
@@ -460,14 +478,17 @@ def update_paper_balance(delta: float):
 
 def open_paper_position(symbol: str, side: str, entry_price: float, leverage: int,
                          margin: float, avg_budget: float,
-                         tp_pct: float = 500.0, sl_pct: float = 500.0) -> int:
+                         tp_pct: float = 500.0, sl_pct: float = 500.0,
+                         liq_price: float = 0.0, source: str = 'scan') -> int:
     with _connect() as conn:
         cur = conn.execute("""
             INSERT INTO paper_positions
                 (symbol, side, entry_price, leverage, margin, total_invested,
-                 averaging_count, averaging_budget, tp_pct, sl_pct, status)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'open')
-        """, (symbol, side, entry_price, leverage, margin, margin, avg_budget, tp_pct, sl_pct))
+                 averaging_count, averaging_budget, tp_pct, sl_pct, status,
+                 liquidation_price, source)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'open', ?, ?)
+        """, (symbol, side, entry_price, leverage, margin, margin, avg_budget, tp_pct, sl_pct,
+              liq_price, source))
         return cur.lastrowid
 
 
@@ -515,6 +536,30 @@ def log_paper_trade(symbol: str, action: str, side: str = "",
             "INSERT INTO paper_trade_log (date, symbol, action, side, entry_price, close_price, margin, pnl, note) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (today, symbol, action, side, entry_price, close_price, margin, pnl, note)
+        )
+
+
+def update_paper_funding(pos_id: int, delta_usd: float, ts_iso: str):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE paper_positions SET funding_accrued = funding_accrued + ?, last_funding_ts = ? WHERE id = ?",
+            (delta_usd, ts_iso, pos_id)
+        )
+
+
+def update_paper_profit_lock(pos_id: int, step: float):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE paper_positions SET profit_lock_step = ? WHERE id = ?",
+            (step, pos_id)
+        )
+
+
+def update_paper_liq_price(pos_id: int, liq_price: float):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE paper_positions SET liquidation_price = ? WHERE id = ?",
+            (liq_price, pos_id)
         )
 
 

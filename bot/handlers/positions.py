@@ -1,10 +1,29 @@
 """/positions — список с эмодзи-кнопками, детальный вид, закрытие."""
+import json
 import logging
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ContextTypes
 from bot.fmt import fmt_pct, fmt_usd
 
 logger = logging.getLogger(__name__)
+
+_PLOCK_PATH = Path(__file__).parent.parent.parent / "data" / "profit_lock_disabled.json"
+
+
+def _load_plock() -> set:
+    try:
+        return set(json.loads(_PLOCK_PATH.read_text()))
+    except Exception:
+        return set()
+
+
+def _save_plock(s: set) -> None:
+    try:
+        _PLOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PLOCK_PATH.write_text(json.dumps(list(s)))
+    except Exception as e:
+        logger.warning("_save_plock: %s", e)
 
 # Numbered emoji 1️⃣–9️⃣
 _NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -195,30 +214,47 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
         )
         lines.append(block)
 
-    # Inline buttons: one per row with close
+    # Inline buttons: close + profit-lock toggle per position
+    plock_disabled: set = context.bot_data.setdefault("_profit_lock_disabled", _load_plock())
+    plock_step: dict = context.bot_data.get("_profit_lock_step", {})
     btn_rows = []
-    total = len(positions)
     for i, pos in enumerate(positions, 1):
-        coin = pos["symbol"].split("/")[0]
+        sym = pos["symbol"]
+        coin = sym.split("/")[0]
         pnl = float(pos.get("unrealized_pnl", 0))
         pct = float(pos.get("percentage", 0))
         icon = "✅" if pnl >= 0 else "🔻"
         label = f"{i}. {icon} {coin}  {fmt_pct(pct)}  {fmt_usd(pnl)}"
-        btn_rows.append([InlineKeyboardButton(label, callback_data=f"pos_close_{pos['symbol']}")])
+        if sym in plock_disabled:
+            lock_label = "🔓 лок выкл"
+        elif sym in plock_step:
+            lock_sl = plock_step[sym] - 50
+            lock_label = f"🔒 SL+{lock_sl}%"
+        else:
+            lock_label = "🔒 лок"
+        btn_rows.append([
+            InlineKeyboardButton(label, callback_data=f"pos_close_{sym}"),
+            InlineKeyboardButton(lock_label, callback_data=f"pos_plock_{sym}"),
+        ])
     btn_rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="positions_refresh")])
 
     kb = InlineKeyboardMarkup(btn_rows)
     text = "\n".join(lines)
-    try:
-        if edit:
-            await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
-        else:
-            await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-    except Exception:
-        if edit:
-            await message.edit_text(text, reply_markup=kb)
-        else:
-            await message.reply_text(text, reply_markup=kb)
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    for idx, chunk in enumerate(chunks):
+        is_last = idx == len(chunks) - 1
+        try:
+            if edit and idx == 0:
+                await message.edit_text(chunk, parse_mode="Markdown",
+                                        reply_markup=kb if is_last else None)
+            else:
+                await message.reply_text(chunk, parse_mode="Markdown",
+                                         reply_markup=kb if is_last else None)
+        except Exception:
+            if edit and idx == 0:
+                await message.edit_text(chunk, reply_markup=kb if is_last else None)
+            else:
+                await message.reply_text(chunk, reply_markup=kb if is_last else None)
 
 
 async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -227,6 +263,75 @@ async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data = q.data
 
     if data == "positions_refresh":
+        await _send_positions(q.message, context, edit=True)
+        return
+
+    if data.startswith("pos_plock_"):
+        symbol = data[len("pos_plock_"):]
+        plock_disabled: set = context.bot_data.setdefault("_profit_lock_disabled", _load_plock())
+        plock_step_map: dict = context.bot_data.setdefault("_profit_lock_step", {})
+        coin = symbol.split("/")[0]
+        client = context.bot_data.get("exchange")
+        config = context.bot_data.get("config")
+
+        from bot.jobs.main import _calc_tp_price, _calc_sl_price
+
+        def _lev(pos):
+            cfg_lev = int(getattr(config, "default_leverage", 0) or 0) if config else 0
+            return cfg_lev or int(pos.get("leverage", 1) or 1)
+
+        if symbol in plock_disabled:
+            # ── Включить профит-лок ──────────────────────────────────
+            plock_disabled.discard(symbol)
+            _save_plock(plock_disabled)
+            # Если уже в профите — сразу выставить нужный шаг
+            try:
+                pos = await client.get_position(symbol)
+                pnl_pct = float(pos.get("percentage", 0)) if pos else 0.0
+                plt = float(getattr(config, "averaging_profit_lock_trigger", 0)) if config else 0
+                if pos and plt > 0 and pnl_pct >= 100:
+                    _PL_STEP = 50
+                    new_step = (int(pnl_pct) // _PL_STEP) * _PL_STEP
+                    lock_sl_pct = new_step - _PL_STEP
+                    entry = float(pos.get("entry_price", 0) or 0)
+                    side = pos.get("side", "short")
+                    lev = _lev(pos)
+                    tp_stored = context.bot_data.get("tp_sl_pcts", {}).get(symbol, {})
+                    tp_pct_v = tp_stored.get("tp_pct") or float(getattr(config, "tp_pct", 500))
+                    new_tp = _calc_tp_price(entry, lev, tp_pct_v, side)
+                    new_sl = _calc_tp_price(entry, lev, lock_sl_pct, side)
+                    sl_lim = new_sl * 1.005 if side == "short" else new_sl * 0.995
+                    await client.set_tp_sl(symbol, tp_price=new_tp, sl_price=new_sl,
+                                           pos_data=pos, sl_limit_price=sl_lim)
+                    plock_step_map[symbol] = new_step
+                    await q.answer(f"🔒 Лок ВКЛ → SL выставлен +{lock_sl_pct}%", show_alert=True)
+                else:
+                    await q.answer(f"🔒 Лок {coin}: включён (сработает при +100%)", show_alert=False)
+            except Exception as e:
+                await q.answer(f"🔒 Лок вкл, SL: {e}", show_alert=True)
+        else:
+            # ── Выключить профит-лок → вернуть обычный SL ───────────
+            plock_disabled.add(symbol)
+            plock_step_map.pop(symbol, None)
+            _save_plock(plock_disabled)
+            try:
+                pos = await client.get_position(symbol)
+                if pos and config:
+                    entry = float(pos.get("entry_price", 0) or 0)
+                    side = pos.get("side", "short")
+                    lev = _lev(pos)
+                    tp_stored = context.bot_data.get("tp_sl_pcts", {}).get(symbol, {})
+                    tp_pct_v = tp_stored.get("tp_pct") or float(getattr(config, "tp_pct", 500))
+                    sl_pct_v = tp_stored.get("sl_pct") or float(getattr(config, "sl_pct", 500))
+                    new_tp = _calc_tp_price(entry, lev, tp_pct_v, side)
+                    new_sl = _calc_sl_price(entry, lev, sl_pct_v, side)
+                    await client.set_tp_sl(symbol, tp_price=new_tp, sl_price=new_sl, pos_data=pos)
+                    await q.answer(f"🔓 Лок ВЫКЛ → SL возвращён -{sl_pct_v:.0f}%", show_alert=True)
+                else:
+                    await q.answer(f"🔓 Лок {coin}: отключён", show_alert=False)
+            except Exception as e:
+                await q.answer(f"🔓 Лок выкл, SL: {e}", show_alert=True)
+
         await _send_positions(q.message, context, edit=True)
         return
 
@@ -282,40 +387,16 @@ async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if data.startswith("pos_close_"):
         symbol = data.replace("pos_close_", "")
-        client = context.bot_data["exchange"]
         coin = symbol.split("/")[0]
-        # Confirm close
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Да, закрыть", callback_data=f"pos_close_confirm_{symbol}"),
-            InlineKeyboardButton("◀ Отмена", callback_data=f"pos_detail_{symbol}"),
-        ]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 С перезаходом", callback_data=f"close_reentry_{symbol}"),
+             InlineKeyboardButton("❌ Насовсем", callback_data=f"close_final_{symbol}")],
+            [InlineKeyboardButton("◀ Отмена", callback_data="positions_refresh")],
+        ])
         try:
             await q.edit_message_text(
-                f"⚠️ Закрыть *{coin}* по рынку?",
-                parse_mode="Markdown",
-                reply_markup=kb,
+                f"Закрыть `{coin}`?", parse_mode="Markdown", reply_markup=kb
             )
         except Exception:
             pass
-        return
-
-    if data.startswith("pos_close_confirm_"):
-        symbol = data.replace("pos_close_confirm_", "")
-        client = context.bot_data["exchange"]
-        coin = symbol.split("/")[0]
-        try:
-            pos = await client.get_position(symbol)
-            pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
-            margin = float(pos.get("margin", 0)) if pos else 0.0
-            exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
-            await client.cancel_tp_sl_orders(symbol)
-            await client.close_futures_position(symbol)
-            from bot import db as db_mod
-            db_mod.close_position(symbol)
-            db_mod.delete_reentry(symbol)
-            db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note="manual")
-            db_mod.close_position_history(symbol, exit_price, pnl, "manual")
-            await q.edit_message_text(f"✅ *{coin}* закрыт.", parse_mode="Markdown")
-        except Exception as e:
-            await q.edit_message_text(f"❌ Ошибка закрытия {coin}: {e}")
         return

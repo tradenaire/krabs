@@ -55,6 +55,7 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
         spot_free = float((spot_raw.get("free") or {}).get("USDT", 0) or 0)
     bal_lines = [
         f"💵 Фьючерсы: `${total:.2f}` · Свободно: `${free:.2f}` · Avail: `${avail_open:.2f}`"
+        + (f" (`{avail_open / free * 100:.0f}%`)" if free > 0 else "")
     ]
     if spot_raw is not None:
         bal_lines.append(f"💳 Спот: `${spot_free:.2f}`")
@@ -126,7 +127,7 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
     return "\n".join(lines)
 
 
-def _build_close_kb(positions: list[dict]) -> InlineKeyboardMarkup:
+def _build_close_kb(positions: list[dict], config=None) -> InlineKeyboardMarkup:
     rows = []
     from bot.fmt import fmt_pct, fmt_usd
     for i, pos in enumerate(positions, 1):
@@ -143,6 +144,23 @@ def _build_close_kb(positions: list[dict]) -> InlineKeyboardMarkup:
         InlineKeyboardButton("💱 Перевести", callback_data="transfer_start"),
     ])
     rows.append([InlineKeyboardButton("📊 Позиции", callback_data="positions_show")])
+    avg_on = getattr(config, "averaging_enabled", True) if config else True
+    scan_on = getattr(config, "auto_scan_enabled", False) if config else False
+    paper_on = getattr(config, "paper_enabled", True) if config else True
+    rows.append([
+        InlineKeyboardButton(
+            f"{'✅' if avg_on else '❌'} Докупки",
+            callback_data="bal_toggle_avg",
+        ),
+        InlineKeyboardButton(
+            f"{'✅' if scan_on else '❌'} Авто-поиск",
+            callback_data="bal_toggle_scan",
+        ),
+        InlineKeyboardButton(
+            f"{'✅' if paper_on else '❌'} Бумага",
+            callback_data="bal_toggle_paper",
+        ),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -198,7 +216,7 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
-    kb = _build_close_kb(positions)
+    kb = _build_close_kb(positions, config)
     # Split if Telegram limit exceeded (4096 chars)
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for i, chunk in enumerate(chunks):
@@ -218,28 +236,6 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    if q.data.startswith("bal_close_confirm_"):
-        symbol = q.data[len("bal_close_confirm_"):]
-        coin = symbol.split("/")[0]
-        client = context.bot_data["exchange"]
-        try:
-            await q.edit_message_text(f"⏳ Закрываю `{coin}`...", parse_mode="Markdown")
-            pos = await client.get_position(symbol)
-            pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
-            margin = float(pos.get("margin", 0)) if pos else 0.0
-            exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
-            await client.cancel_tp_sl_orders(symbol)
-            await client.close_futures_position(symbol)
-            from bot import db as db_mod
-            db_mod.close_position(symbol)
-            db_mod.delete_reentry(symbol)
-            db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note="manual")
-            db_mod.close_position_history(symbol, exit_price, pnl, "manual")
-            await q.edit_message_text(f"✅ *{coin}* закрыт.", parse_mode="Markdown")
-        except Exception as e:
-            await q.edit_message_text(f"❌ Ошибка закрытия {coin}: {e}")
-        return
-
     if q.data == "bal_close_cancel":
         await q.answer("Отменено")
         await q.delete_message()
@@ -249,12 +245,12 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = q.data[len("bal_close_"):]
         coin = symbol.split("/")[0]
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Да, закрыть {coin}", callback_data=f"bal_close_confirm_{symbol}")],
+            [InlineKeyboardButton("🔄 С перезаходом", callback_data=f"close_reentry_{symbol}"),
+             InlineKeyboardButton("❌ Насовсем", callback_data=f"close_final_{symbol}")],
             [InlineKeyboardButton("◀ Отмена", callback_data="bal_close_cancel")],
         ])
         await q.message.reply_text(
-            f"⚠️ Закрыть *{coin}* по рынку?",
-            parse_mode="Markdown", reply_markup=kb,
+            f"Закрыть `{coin}`?", parse_mode="Markdown", reply_markup=kb,
         )
         return
 
@@ -267,7 +263,7 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer(f"Ошибка: {e}", show_alert=True)
             return
         text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
-        kb = _build_close_kb(positions)
+        kb = _build_close_kb(positions, config)
         chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
         try:
             await q.edit_message_text(chunks[0], parse_mode="Markdown",
@@ -338,4 +334,47 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💱 *{label}*\nДоступно: `${avail:.2f}`\n\nВведи сумму USDT:",
             parse_mode="Markdown",
         )
+        return
+
+    if q.data in ("bal_toggle_avg", "bal_toggle_scan", "bal_toggle_paper"):
+        from bot import db as db_mod
+        config = context.bot_data.get("config")
+        if not config:
+            await q.answer("Конфиг недоступен", show_alert=True)
+            return
+        if q.data == "bal_toggle_avg":
+            new_val = not getattr(config, "averaging_enabled", True)
+            config.averaging_enabled = new_val
+            db_mod.set_config("averaging_enabled", "true" if new_val else "false")
+            state = "включены ✅" if new_val else "отключены ❌"
+            await q.answer(f"Докупки {state}", show_alert=False)
+        elif q.data == "bal_toggle_scan":
+            new_val = not getattr(config, "auto_scan_enabled", False)
+            config.auto_scan_enabled = new_val
+            db_mod.set_config("auto_scan_enabled", "true" if new_val else "false")
+            state = "включён ✅" if new_val else "отключён ❌"
+            await q.answer(f"Авто-поиск {state}", show_alert=False)
+        else:
+            new_val = not getattr(config, "paper_enabled", True)
+            config.paper_enabled = new_val
+            db_mod.set_config("paper_enabled", "true" if new_val else "false")
+            state = "включена ✅" if new_val else "выключена ❌"
+            await q.answer(f"Бумага {state}", show_alert=False)
+        # Refresh balance message with updated buttons
+        client = context.bot_data["exchange"]
+        try:
+            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
+                await _fetch_all(client, context)
+        except Exception as e:
+            await q.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
+        kb = _build_close_kb(positions, config)
+        try:
+            await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            try:
+                await q.edit_message_text(text, reply_markup=kb)
+            except Exception:
+                pass
         return

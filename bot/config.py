@@ -20,15 +20,19 @@ class Config:
     sl_pct: float = 500.0
 
     # Averaging
+    averaging_enabled: bool = True               # master on/off toggle
     averaging_threshold: float = -100.0          # trigger at PnL ≤ this %
     averaging_amount: float = 0.50               # add per step
     averaging_interval: int = 10                 # seconds
     max_averaging_count: int = 100               # hard cap
     averaging_profit_lock_trigger: float = 0.0   # move SL to profit when PnL ≥ this % (0=off)
     averaging_profit_lock_sl_pct: float = 0.0    # lock SL at this PnL % (e.g. 100 = lock at +100%)
+    margin_emergency_threshold_pct: float = 0.0  # close 10% positions when avail < X% of free (0=off)
 
     # Re-entry
     max_reentry_cycles: int = 3
+    reentry_on_sl: bool = False          # re-enter after SL (tight-stop strategy, not Martingale)
+    reentry_sl_cooldown_min: int = 10    # minutes to wait after SL before re-entering
 
     # Auto scan
     auto_scan_enabled: bool = False

@@ -3,7 +3,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from bot import db as db_mod
 from bot.fmt import fmt_pct, fmt_usd
-from bot.paper_trading import calc_pnl_pct, _remaining_budget, PAPER_INITIAL_BALANCE, PAPER_TP_PCT, PAPER_SL_PCT
+from bot.paper_trading import calc_pnl_pct, _remaining_budget, PAPER_INITIAL_BALANCE
 import logging
 
 logger = logging.getLogger(__name__)
@@ -21,8 +21,8 @@ def _fmt_paper_pos_block(pos: dict, mark_price: float) -> str:
     total_inv = float(pos["total_invested"])
     avg_count = int(pos["averaging_count"])
     budget = float(pos.get("averaging_budget", 0))
-    tp_pct = float(pos.get("tp_pct", PAPER_TP_PCT))
-    sl_pct = float(pos.get("sl_pct", PAPER_SL_PCT))
+    tp_pct = float(pos.get("tp_pct") or 500.0)
+    sl_pct = float(pos.get("sl_pct") or 500.0)
 
     pnl_pct = calc_pnl_pct(entry, mark_price, lev, side) if mark_price > 0 else 0.0
     pnl_usd = total_inv * pnl_pct / 100
