@@ -11,7 +11,10 @@ logger = logging.getLogger(__name__)
 OPENROUTER_PRICES = {
     "x-ai/grok-4-fast:online":      {"input": 0.20, "output": 0.50},
     "anthropic/claude-sonnet-4.6":  {"input": 3.00, "output": 15.00},
-    "gpt-5.5:online":               {"input": 0.00, "output": 0.00},
+    "gpt-5.5":                      {"input": 5.00, "output": 30.00},
+    "gpt-5.5:online":               {"input": 5.00, "output": 30.00},
+    "openai/gpt-5.5":               {"input": 5.00, "output": 30.00},
+    "openai/gpt-5.5:online":        {"input": 5.00, "output": 30.00},
 }
 
 DEFAULT_MODEL = "x-ai/grok-4-fast:online"
