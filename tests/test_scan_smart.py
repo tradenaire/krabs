@@ -107,6 +107,23 @@ RISK: 5/10
     assert parsed[0]["ticker"] == "ETH"
 
 
+def test_parse_analyst_blocks_accepts_web_research_markdown_table():
+    text = """
+| Тикер | Текущая цена | Техническая причина (RSI/Graph) | Фундаментальный триггер (Новости/Разблокировки) | Рекомендуемая зона входа и Стоп-лосс | Риск (1-10) |
+|---|---:|---|---|---|---:|
+| HYPE | $46.12 | RSI 4H 77, 1D 73; отклонение от EMA20 | token unlock через 4 дня | вход $45-47, SL $49.2 | 6 |
+| FAKE/USDT | $1 | no data | no data | x | 99 |
+
+Sentiment Analysis: рынок перегрет, но нужен MEXC-фильтр.
+"""
+    parsed = parse_analyst_blocks(text, n=5)
+    assert [p["ticker"] for p in parsed] == ["HYPE"]
+    assert parsed[0]["risk_num"] == 6
+    assert "RSI 4H 77" in parsed[0]["tech"]
+    assert "token unlock" in parsed[0]["fund"]
+    assert "SL $49.2" in parsed[0]["entry"]
+
+
 def test_prompt_contains_mexc_snapshot_gate_fields():
     prompt = _build_user_msg([_valid_short_candidate(score=88)], n=1)
     assert "mexc_symbol=BTC/USDT:USDT" in prompt

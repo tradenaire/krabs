@@ -3,7 +3,7 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from bot.ai.scanner import scan_overbought, analyze_single_coin, mexc_find_futures_symbol, format_coin_card
+from bot.ai.scanner import analyze_single_coin, mexc_find_futures_symbol, format_coin_card
 from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks, extract_sentiment,
                              format_usage_footer, DEFAULT_MODEL, FALLBACK_MODEL)
 
@@ -97,16 +97,11 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status = await update.message.reply_text("🧠 Думаю...")
-
-    try:
-        local_results, _total = await scan_overbought(client, 65.0, 10.0)
-    except Exception as e:
-        logger.warning("Local scan failed: %s", e)
-        local_results = []
+    status = await update.message.reply_text("🧠 Ищу перегретые монеты в интернете...")
+    local_results = []
 
     model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
-    await status.edit_text(f"🔍 Анализирую через {model}...")
+    await status.edit_text(f"🔍 Ищу и анализирую через {model}...")
 
     ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n)
 
