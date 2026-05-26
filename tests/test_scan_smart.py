@@ -132,6 +132,13 @@ def test_prompt_contains_mexc_snapshot_gate_fields():
     assert "msb=True" in prompt
 
 
+def test_web_first_prompt_starts_from_market_research_before_mexc_match():
+    prompt = _build_user_msg([], n=5, web_first=True)
+    assert "web-search" in prompt
+    assert "MEXC futures" in prompt
+    assert "не придумывай COIN" not in prompt
+
+
 def test_scan_avg_callback_not_shadowed_by_scan_wizard_prefix():
     main_py = Path("bot/main.py").read_text(encoding="utf-8")
     assert '"scan"' not in main_py.split("for _p in", 1)[1].split("):", 1)[0]

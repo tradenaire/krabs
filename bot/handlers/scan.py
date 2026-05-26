@@ -103,12 +103,12 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
     await status.edit_text(f"🔍 Ищу и анализирую через {model}...")
 
-    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n)
+    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n, web_first=True)
 
     if ai_result.error and not ai_result.text:
         logger.warning("Primary model failed, trying fallback %s", FALLBACK_MODEL)
         await status.edit_text(f"🌐 Пробую {FALLBACK_MODEL}...")
-        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=n)
+        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=n, web_first=True)
 
     if ai_result.error and not ai_result.text:
         await status.edit_text(f"❌ AI недоступен: {ai_result.error}")
