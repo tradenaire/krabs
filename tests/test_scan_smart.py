@@ -7,7 +7,7 @@ import asyncio
 from pathlib import Path
 
 from bot.ai.analyst import _build_user_msg, parse_analyst_blocks
-from bot.ai.scanner import _enrich_multi_timeframe, validate_short_pick
+from bot.ai.scanner import _enrich_multi_timeframe, format_coin_card, validate_short_pick
 from bot.exchange.client import calc_min_order_margin
 
 
@@ -137,6 +137,26 @@ def test_web_first_prompt_starts_from_market_research_before_mexc_match():
     assert "web-search" in prompt
     assert "MEXC futures" in prompt
     assert "не придумывай COIN" not in prompt
+
+
+def test_scan_card_strips_domains_and_shows_profit_per_dollar():
+    card = format_coin_card(
+        _valid_short_candidate(
+            symbol="HYPE/USDT:USDT",
+            reasons=["RSI перегрет"],
+            volume_24h=404_900_000,
+            bb_position=0.50,
+            ema_trend="медвежий",
+        ),
+        1,
+        ai_note="FXStreet says reversal is likely (fxstreet.com) https://www.fxstreet.com/news/x",
+        max_lev=10,
+        margin=5.0,
+        tp_pct=500.0,
+    )
+    assert "fxstreet.com" not in card.lower()
+    assert "https://" not in card.lower()
+    assert "Доход с `$1`: `+$5.00`" in card
 
 
 def test_scan_avg_callback_not_shadowed_by_scan_wizard_prefix():

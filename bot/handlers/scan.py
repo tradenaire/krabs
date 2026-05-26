@@ -230,8 +230,13 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         min_avg = r["_min_avg"]
         avg_ok = r["_avg_ok"]
 
-        card = format_coin_card(r, i, ai_note=r.get("_ai_fund", ""),
-                                max_lev=lev_eff, margin=default_bet)
+        card = format_coin_card(
+            r, i,
+            ai_note=r.get("_ai_fund", ""),
+            max_lev=lev_eff,
+            margin=default_bet,
+            tp_pct=float(getattr(config, "tp_pct", 0) or 0),
+        )
         if r.get("_ai_funding"):
             card += f"\n   Фандинг (AI): {r['_ai_funding']}"
         if r.get("_ai_risk"):

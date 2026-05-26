@@ -6,6 +6,7 @@ facts next to each candidate and let the Telegram handler block weak picks.
 """
 import asyncio
 import logging
+import re
 import pandas as pd
 import pandas_ta as ta
 
@@ -495,18 +496,36 @@ def _deep_analyze(symbol: str, ohlcv: list, ticker: dict, daily_change: float,
     }
 
 
+_LINK_PREVIEW_RE = re.compile(
+    r"https?://\S+|www\.\S+|\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z]{2,})+(?:/\S*)?",
+    re.IGNORECASE,
+)
+
+
+def _clean_ai_note(ai_note: str) -> str:
+    note = _LINK_PREVIEW_RE.sub("", ai_note or "")
+    note = re.sub(r"\(\s*\)", "", note)
+    note = re.sub(r"\s+([,.;:!?])", r"\1", note)
+    note = re.sub(r"[ \t]{2,}", " ", note)
+    return note.strip(" \t\r\n-—,;")
+
+
 def format_coin_card(r: dict, index: int, ai_note: str = "",
-                     max_lev: int = 0, margin: float = 0.0) -> str:
+                     max_lev: int = 0, margin: float = 0.0,
+                     tp_pct: float = 0.0) -> str:
     coin = r["symbol"].split("/")[0]
     dir_emoji = "🔻" if r["direction"] == "short" else "🔺"
     reasons_text = "\n".join(f"    • {x}" for x in r["reasons"][:4])
     vol_24h = r.get("volume_24h", 0)
     vol_str = f"${vol_24h/1e6:.1f}M" if vol_24h >= 1e6 else f"${vol_24h/1e3:.0f}K"
-    note_line = f"\n   📰 {ai_note}" if ai_note else ""
+    clean_note = _clean_ai_note(ai_note)
+    note_line = f"\n   📰 {clean_note}" if clean_note else ""
     lev_line = ""
     if max_lev > 0 and margin > 0:
         notional = margin * max_lev
         lev_line = f"\n   ⚙️ Плечо `×{max_lev}` | Маржа `${margin:.2f}` | Поза `~${notional:.0f}`"
+        if tp_pct > 0:
+            lev_line += f"\n   💵 Доход с `$1`: `+${tp_pct / 100:.2f}` при TP `{tp_pct:.0f}%`"
     tf = r.get("timeframes", {}) or {}
     tf_bits = []
     for name in ("1h", "4h", "1d"):
