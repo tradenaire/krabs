@@ -11,11 +11,12 @@ logger = logging.getLogger(__name__)
 OPENROUTER_PRICES = {
     "x-ai/grok-4-fast:online":      {"input": 0.20, "output": 0.50},
     "anthropic/claude-sonnet-4.6":  {"input": 3.00, "output": 15.00},
-    "google/gemini-3.1-pro-preview-customtools:online": {"input": 1.25, "output": 5.00},
+    "gpt-5.5:online":               {"input": 0.00, "output": 0.00},
 }
 
 DEFAULT_MODEL = "x-ai/grok-4-fast:online"
-FALLBACK_MODEL = "google/gemini-3.1-pro-preview-customtools:online"
+FALLBACK_MODEL = "gpt-5.5:online"
+OPENROUTER_REASONING = {"effort": "low"}
 
 
 def _normalize_coin(value: str) -> str:
@@ -207,6 +208,7 @@ async def deep_short_analysis(candidates: list[dict], api_key: str,
             ],
             max_tokens=max(2500, n * 500),
             temperature=0.2,
+            extra_body={"reasoning": OPENROUTER_REASONING},
         )
         raw = (result.choices[0].message.content or "").strip()
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
