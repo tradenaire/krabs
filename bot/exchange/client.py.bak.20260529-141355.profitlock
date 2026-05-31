@@ -521,8 +521,6 @@ class ExchangeClient:
                         "triggerPrice": str(price), "triggerType": trigger_type,
                         "trend": 1, "executeCycle": 2,
                     })
-                    if isinstance(r, dict) and r.get("success") is False:
-                        raise RuntimeError(f"MEXC {kind} plan rejected: {r.get('message', r)}")
                     return {"type": kind, "price": price, "result": r}
                 except Exception as e:
                     last_err = e
@@ -532,7 +530,7 @@ class ExchangeClient:
                     logger.warning("%s place attempt %d/3 for %s: %s", kind, attempt+1, sym, e)
                     await asyncio.sleep(0.8 * (attempt + 1))
             logger.error("%s place FAILED for %s: %s", kind, sym, last_err)
-            raise RuntimeError(f"{kind} place failed for {sym}: {last_err}")
+            return {"type": kind, "price": price, "error": str(last_err)}
 
         if tp_price:
             tt = 1 if side == "long" else 2

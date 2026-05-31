@@ -27,7 +27,7 @@ class Config:
     max_averaging_count: int = 100               # hard cap
     averaging_profit_lock_trigger: float = 0.0   # move SL to profit when PnL ≥ this % (0=off)
     averaging_profit_lock_sl_pct: float = 0.0    # lock SL at this PnL % (e.g. 100 = lock at +100%)
-    margin_emergency_threshold_pct: float = 0.0  # close 10% positions when avail < X% of free (0=off)
+    margin_emergency_threshold_pct: float = 10.0  # trim 5% positions when avail < X% of free (0=off)
 
     # Re-entry
     max_reentry_cycles: int = 3

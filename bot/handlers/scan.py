@@ -3,7 +3,7 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from bot.ai.scanner import analyze_single_coin, mexc_find_futures_symbol, format_coin_card
+from bot.ai.scanner import scan_overbought, analyze_single_coin, mexc_find_futures_symbol, format_coin_card
 from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks, extract_sentiment,
                              format_usage_footer, DEFAULT_MODEL, FALLBACK_MODEL)
 
@@ -97,18 +97,23 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status = await update.message.reply_text("🧠 Ищу перегретые монеты в интернете...")
-    local_results = []
+    status = await update.message.reply_text("🧠 Думаю...")
+
+    try:
+        local_results, _total = await scan_overbought(client, 65.0, 10.0)
+    except Exception as e:
+        logger.warning("Local scan failed: %s", e)
+        local_results = []
 
     model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
-    await status.edit_text(f"🔍 Ищу и анализирую через {model}...")
+    await status.edit_text(f"🔍 Анализирую через {model}...")
 
-    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n, web_first=True)
+    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n)
 
     if ai_result.error and not ai_result.text:
         logger.warning("Primary model failed, trying fallback %s", FALLBACK_MODEL)
         await status.edit_text(f"🌐 Пробую {FALLBACK_MODEL}...")
-        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=n, web_first=True)
+        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=n)
 
     if ai_result.error and not ai_result.text:
         await status.edit_text(f"❌ AI недоступен: {ai_result.error}")
@@ -230,13 +235,8 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         min_avg = r["_min_avg"]
         avg_ok = r["_avg_ok"]
 
-        card = format_coin_card(
-            r, i,
-            ai_note=r.get("_ai_fund", ""),
-            max_lev=lev_eff,
-            margin=default_bet,
-            tp_pct=float(getattr(config, "tp_pct", 0) or 0),
-        )
+        card = format_coin_card(r, i, ai_note=r.get("_ai_fund", ""),
+                                max_lev=lev_eff, margin=default_bet)
         if r.get("_ai_funding"):
             card += f"\n   Фандинг (AI): {r['_ai_funding']}"
         if r.get("_ai_risk"):

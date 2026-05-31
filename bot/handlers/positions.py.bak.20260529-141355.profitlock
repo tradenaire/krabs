@@ -274,7 +274,7 @@ async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         client = context.bot_data.get("exchange")
         config = context.bot_data.get("config")
 
-        from bot.jobs.main import _calc_tp_price, _calc_sl_price, _set_tp_sl_verified
+        from bot.jobs.main import _calc_tp_price, _calc_sl_price
 
         def _lev(pos):
             cfg_lev = int(getattr(config, "default_leverage", 0) or 0) if config else 0
@@ -301,9 +301,8 @@ async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     new_tp = _calc_tp_price(entry, lev, tp_pct_v, side)
                     new_sl = _calc_tp_price(entry, lev, lock_sl_pct, side)
                     sl_lim = new_sl * 1.005 if side == "short" else new_sl * 0.995
-                    await _set_tp_sl_verified(
-                        client, symbol, side, new_tp, new_sl, pos, sl_limit_price=sl_lim
-                    )
+                    await client.set_tp_sl(symbol, tp_price=new_tp, sl_price=new_sl,
+                                           pos_data=pos, sl_limit_price=sl_lim)
                     plock_step_map[symbol] = new_step
                     await q.answer(f"🔒 Лок ВКЛ → SL выставлен +{lock_sl_pct}%", show_alert=True)
                 else:

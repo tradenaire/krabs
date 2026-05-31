@@ -47,38 +47,6 @@ def _calc_sl_price(entry: float, leverage: int, sl_pct: float, side: str) -> flo
     return entry + move if side == "short" else entry - move
 
 
-def _trigger_price_matches(want: float, got: float, rel_tol: float = 0.003) -> bool:
-    if want <= 0 or got <= 0:
-        return False
-    return abs(got - want) / want <= rel_tol
-
-
-async def _verify_active_sl(client, symbol: str, side: str, sl_price: float) -> None:
-    sl_type = 2 if side == "long" else 1
-    orders = await client.get_tp_sl_orders(symbol)
-    for order in orders:
-        if int(order.get("trigger_type", 0) or 0) != sl_type:
-            continue
-        if _trigger_price_matches(sl_price, float(order.get("trigger_price", 0) or 0)):
-            return
-    raise RuntimeError(f"active SL not found at {sl_price:.6g}")
-
-
-async def _set_tp_sl_verified(client, symbol: str, side: str,
-                              tp_price: float | None, sl_price: float,
-                              pos_data: dict, **kwargs) -> None:
-    results = await client.set_tp_sl(
-        symbol, tp_price=tp_price, sl_price=sl_price, pos_data=pos_data, **kwargs
-    )
-    for result in results or []:
-        if result.get("error"):
-            raise RuntimeError(result["error"])
-        body = result.get("result")
-        if isinstance(body, dict) and body.get("success") is False:
-            raise RuntimeError(str(body.get("message", body)))
-    await _verify_active_sl(client, symbol, side, sl_price)
-
-
 # ── Live positions monitor (pinned message, 3s) ───────────────────
 
 def _format_live_text(bal: dict, positions: list[dict],
@@ -507,9 +475,10 @@ async def averaging_job(app):
                     _new_tp = _calc_tp_price(_pl_entry, _pl_lev, _tp_pct_val, _pl_side)
                     _new_sl = _calc_tp_price(_pl_entry, _pl_lev, lock_sl_pct, _pl_side)
                     _profit_lock_step[symbol] = new_pl_step  # guard before await
+                    app.bot_data.setdefault("_was_profit_locked", set()).add(symbol)
                     try:
-                        await _set_tp_sl_verified(client, symbol, _pl_side, _new_tp, _new_sl, pos)
-                        app.bot_data.setdefault("_was_profit_locked", set()).add(symbol)
+                        await client.set_tp_sl(symbol, tp_price=_new_tp, sl_price=_new_sl,
+                                               pos_data=pos)
                         _pl_coin = symbol.split("/")[0]
                         await _notify_all(app,
                             f"🔒 *{_pl_coin}* профит-лок +{new_pl_step}%\n"
@@ -517,7 +486,6 @@ async def averaging_job(app):
                             f"Триггер: `{_new_sl:.6g}`")
                     except Exception as _pl_e:
                         _profit_lock_step[symbol] = current_pl_step  # rollback
-                        app.bot_data.setdefault("_was_profit_locked", set()).discard(symbol)
                         logger.warning("Profit lock SL %s: %s", symbol, _pl_e)
 
         # Skip if position-limit or count-exhausted (notified_exhausted acts as permanent block)

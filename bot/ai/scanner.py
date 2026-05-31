@@ -1,190 +1,14 @@
-"""Technical coin scanner — RSI, MACD, BB, Stoch, EMA, volume.
-
-Scan is used as decision support for real futures trades, so LLM output is
-never enough by itself. The helpers below keep the MEXC-derived trend/MSB/risk
-facts next to each candidate and let the Telegram handler block weak picks.
-"""
-import asyncio
+"""Technical coin scanner — RSI, MACD, BB, Stoch, EMA, volume."""
 import logging
-import re
 import pandas as pd
 import pandas_ta as ta
 
 logger = logging.getLogger(__name__)
 
 
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        v = float(value)
-        if pd.isna(v):
-            return default
-        return v
-    except (TypeError, ValueError):
-        return default
-
-
-def _rsi_last(df: pd.DataFrame) -> float | None:
-    rsi = ta.rsi(df["close"], length=14)
-    if rsi is None or rsi.empty or pd.isna(rsi.iloc[-1]):
-        return None
-    return float(rsi.iloc[-1])
-
-
-def _ema_trend(df: pd.DataFrame) -> str:
-    ema20 = ta.ema(df["close"], length=20)
-    ema50 = ta.ema(df["close"], length=50)
-    if ema20 is None or ema50 is None or ema20.empty or ema50.empty:
-        return "UNKNOWN"
-    if pd.isna(ema20.iloc[-1]) or pd.isna(ema50.iloc[-1]):
-        return "UNKNOWN"
-    return "BEARISH" if float(ema20.iloc[-1]) < float(ema50.iloc[-1]) else "BULLISH"
-
-
-def _ohlcv_df(ohlcv: list) -> pd.DataFrame | None:
-    if not ohlcv or len(ohlcv) < 30:
-        return None
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    return df
-
-
-def _detect_bearish_msb(df: pd.DataFrame) -> bool:
-    """Small deterministic bearish market-structure-break detector.
-
-    We do not try to be a full TA engine here. For scan safety we only require
-    a simple pattern: recent lower-high plus close below a recent swing low with
-    non-trivial volume. If data is noisy, return False and the candidate becomes
-    WATCHLIST/REJECTED instead of actionable.
-    """
-    if len(df) < 24:
-        return False
-    recent = df.tail(24).reset_index(drop=True)
-    highs = recent["high"]
-    lows = recent["low"]
-    closes = recent["close"]
-    volumes = recent["volume"]
-
-    first_high = float(highs.iloc[:12].max())
-    second_high = float(highs.iloc[12:20].max())
-    prior_swing_low = float(lows.iloc[6:20].min())
-    last_close = float(closes.iloc[-1])
-    median_vol = float(volumes.iloc[:-1].median()) or 0.0
-    last_vol = float(volumes.iloc[-1])
-
-    lower_high = second_high < first_high * 0.998
-    broke_low = last_close < prior_swing_low
-    volume_ok = median_vol <= 0 or last_vol >= median_vol * 1.1
-    return lower_high and broke_low and volume_ok
-
-
-def _trend_change_short(df: pd.DataFrame) -> bool:
-    if len(df) < 55:
-        return False
-    rsi = ta.rsi(df["close"], length=14)
-    ema20 = ta.ema(df["close"], length=20)
-    ema50 = ta.ema(df["close"], length=50)
-    if rsi is None or ema20 is None or ema50 is None:
-        return False
-    if rsi.empty or ema20.empty or ema50.empty:
-        return False
-
-    rsi_now = _safe_float(rsi.iloc[-1], 50)
-    rsi_prev = _safe_float(rsi.iloc[-4], rsi_now) if len(rsi) >= 4 else rsi_now
-    ema_bearish = _safe_float(ema20.iloc[-1]) < _safe_float(ema50.iloc[-1])
-    price_below_ema20 = _safe_float(df["close"].iloc[-1]) < _safe_float(ema20.iloc[-1])
-    return sum((rsi_prev >= 68 and rsi_now < rsi_prev, ema_bearish, price_below_ema20)) >= 2
-
-
-def _risk_score(analysis: dict) -> int:
-    score = 5
-    funding = float(analysis.get("funding_rate", 0) or 0)
-    if funding < -0.0005:
-        score += 2
-    elif funding < 0:
-        score += 1
-    elif funding > 0.0003:
-        score -= 1
-
-    if analysis.get("ema_trend") == "бычий":
-        score += 1
-    if float(analysis.get("vol_spike", 1) or 1) > 3:
-        score += 1
-
-    return max(1, min(10, score))
-
-
-def validate_short_pick(analysis: dict | None) -> tuple[str, list[str]]:
-    """Return scan validation status and human-readable blocking reasons."""
-    if not analysis:
-        return "UNKNOWN", ["нет технических данных"]
-    reasons: list[str] = []
-    if analysis.get("direction") != "short":
-        reasons.append("локальный сигнал не SHORT")
-    if int(analysis.get("risk_score", 10) or 10) > 7:
-        reasons.append(f"risk {analysis.get('risk_score')}/10 выше лимита")
-    if float(analysis.get("price", 0) or 0) <= 0:
-        reasons.append("нет live price MEXC")
-    if reasons:
-        return "REJECTED", reasons
-    return "VALIDATED", []
-
-
-async def _enrich_multi_timeframe(exchange, symbol: str, analysis: dict,
-                                  one_h_ohlcv: list | None = None) -> dict:
-    """Attach 4h/1d MEXC facts to a candidate without trusting LLM claims."""
-    timeframes = {"1h": _ohlcv_df(one_h_ohlcv) if one_h_ohlcv else None, "4h": None, "1d": None}
-    for tf in ("4h", "1d"):
-        try:
-            ohlcv = await exchange._exchange.fetch_ohlcv(symbol, tf, limit=100)
-            timeframes[tf] = _ohlcv_df(ohlcv)
-        except Exception as e:
-            logger.info("%s %s OHLCV failed: %s", symbol, tf, e)
-
-    tf_summary: dict[str, dict] = {}
-    trend_votes = 0
-    msb_votes = 0
-    for tf, df in timeframes.items():
-        if df is None:
-            tf_summary[tf] = {"rsi": None, "ema_trend": "UNKNOWN", "msb_short": False}
-            continue
-        rsi = _rsi_last(df)
-        ema_trend = _ema_trend(df)
-        msb_short = _detect_bearish_msb(df)
-        trend_short = _trend_change_short(df)
-        if trend_short:
-            trend_votes += 1
-        if msb_short:
-            msb_votes += 1
-        tf_summary[tf] = {
-            "rsi": None if rsi is None else round(rsi, 1),
-            "ema_trend": ema_trend,
-            "msb_short": msb_short,
-            "trend_change_short": trend_short,
-        }
-
-    analysis["timeframes"] = tf_summary
-    analysis["trend_change_short"] = trend_votes >= 1
-    analysis["msb_short"] = msb_votes >= 1
-    confirmation_bonus = 0
-    if analysis["trend_change_short"]:
-        confirmation_bonus += 8
-    if analysis["msb_short"]:
-        confirmation_bonus += 8
-    analysis["confirmation_bonus"] = confirmation_bonus
-    analysis["score"] = int(analysis.get("score", 0) or 0) + confirmation_bonus
-    analysis["risk_score"] = _risk_score(analysis)
-    status, errors = validate_short_pick(analysis)
-    analysis["validation_status"] = status
-    analysis["validation_errors"] = errors
-    return analysis
-
-
 async def scan_overbought(exchange, rsi_threshold: float = 65.0,
                           daily_change_threshold: float = 10.0,
-                          max_symbols: int = 40) -> tuple[list[dict], int]:
+                          max_symbols: int = 80) -> tuple[list[dict], int]:
     await exchange._exchange.load_markets()
 
     tradeable_symbols: set[str] = set()
@@ -216,41 +40,34 @@ async def scan_overbought(exchange, rsi_threshold: float = 65.0,
     candidates = [
         (sym, ticker, float(ticker.get("percentage", 0) or 0))
         for sym, ticker in all_tickers.items()
-        if float(ticker.get("percentage", 0) or 0) >= daily_change_threshold
+        if abs(float(ticker.get("percentage", 0) or 0)) >= daily_change_threshold
         and float(ticker.get("quoteVolume", 0) or 0) >= 10_000_000
     ]
-    candidates.sort(key=lambda x: x[2], reverse=True)
+    candidates.sort(key=lambda x: abs(x[2]), reverse=True)
     candidates = candidates[:max_symbols]
 
-    sem = asyncio.Semaphore(5)
-
-    async def _analyze_candidate(sym: str, ticker: dict, daily_change: float) -> tuple[dict, list] | None:
+    results = []
+    for sym, ticker, daily_change in candidates:
         try:
-            async with sem:
-                ohlcv = await exchange._exchange.fetch_ohlcv(sym, "1h", limit=100)
+            ohlcv = await exchange._exchange.fetch_ohlcv(sym, "1h", limit=100)
             if not ohlcv or len(ohlcv) < 30:
-                return None
+                continue
         except Exception:
-            return None
+            continue
         analysis = _deep_analyze(sym, ohlcv, ticker, daily_change)
-        if not analysis or analysis.get("direction") != "short":
-            return None
-        return analysis, ohlcv
+        if analysis:
+            results.append(analysis)
 
-    analyzed = await asyncio.gather(*(_analyze_candidate(*c) for c in candidates))
-    results = [item for item in analyzed if item]
-
-    results.sort(key=lambda x: x[0]["score"], reverse=True)
+    results.sort(key=lambda x: x["score"], reverse=True)
 
     verified = []
-    for r, one_h_ohlcv in results:
+    for r in results:
         if len(verified) >= 10:
             break
         try:
             ob = await exchange._exchange.fetch_order_book(r["symbol"], limit=5)
             if ob.get("bids") and ob.get("asks"):
-                enriched = await _enrich_multi_timeframe(exchange, r["symbol"], r, one_h_ohlcv)
-                verified.append(enriched)
+                verified.append(r)
         except Exception:
             pass
 
@@ -267,10 +84,7 @@ async def analyze_single_coin(exchange, symbol: str) -> dict | None:
         logger.info("analyze_single_coin(%s): %s", symbol, e)
         return None
     daily_change = float(ticker.get("percentage", 0) or 0)
-    analysis = _deep_analyze(symbol, ohlcv, ticker, daily_change, min_score=0)
-    if not analysis:
-        return None
-    return await _enrich_multi_timeframe(exchange, symbol, analysis, ohlcv)
+    return _deep_analyze(symbol, ohlcv, ticker, daily_change, min_score=0)
 
 
 async def mexc_find_futures_symbol(exchange, ticker: str) -> str | None:
@@ -288,63 +102,6 @@ async def mexc_find_futures_symbol(exchange, ticker: str) -> str | None:
                 and m.get("type") == "swap" and m.get("settle") == "USDT":
             return sym
     return None
-
-
-async def mexc_suggest_tickers(exchange, ticker: str, n: int = 3) -> list[str]:
-    """Найти N похожих активных USDT-фьючерсов для опечатки/неточного ввода.
-
-    Покрывает 4 случая:
-      1. Полное вхождение ticker внутрь base (FART → FARTCOIN3L) — топ приоритет.
-      2. base начинается с ticker (FART → FARTBOY).
-      3. ticker начинается с base (FARTCOIN → FART) — частая опечатка пользователя.
-      4. Фоллбэк: difflib similarity ≥ 0.6.
-
-    Возвращает список base-тикеров (BTC, FART, ...), не market-symbols.
-    Используется в assistant.py и trading.py для подсказки при не-найденном тикере.
-    """
-    try:
-        await exchange._exchange.load_markets()
-    except Exception:
-        return []
-    ticker_u = ticker.upper().strip()
-    if not ticker_u:
-        return []
-    bases: list[str] = []
-    for sym, m in exchange._exchange.markets.items():
-        if not (m.get("active") and m.get("type") == "swap" and m.get("settle") == "USDT"):
-            continue
-        mid = m.get("id", "")
-        if mid.endswith("_USDT"):
-            bases.append(mid.removesuffix("_USDT"))
-    if not bases:
-        return []
-
-    seen: set[str] = set()
-    out: list[str] = []
-    def _add(b: str) -> None:
-        if b and b not in seen:
-            seen.add(b)
-            out.append(b)
-
-    # Приоритет 1: полное вхождение ticker внутри base или наоборот.
-    for b in bases:
-        if ticker_u in b or b in ticker_u:
-            _add(b)
-        if len(out) >= n:
-            return out[:n]
-    # Приоритет 2: общий префикс ≥ 3 символов (FART vs FARMING).
-    if len(ticker_u) >= 3:
-        prefix = ticker_u[:3]
-        for b in bases:
-            if b.startswith(prefix):
-                _add(b)
-            if len(out) >= n:
-                return out[:n]
-    # Приоритет 3: difflib similarity.
-    import difflib
-    for b in difflib.get_close_matches(ticker_u, bases, n=n, cutoff=0.6):
-        _add(b)
-    return out[:n]
 
 
 def _deep_analyze(symbol: str, ohlcv: list, ticker: dict, daily_change: float,
@@ -416,11 +173,31 @@ def _deep_analyze(symbol: str, ohlcv: list, ticker: dict, daily_change: float,
     rsi_lower = rsi_now < float(rsi.iloc[-5]) if len(rsi) > 5 and pd.notna(rsi.iloc[-5]) else False
     bearish_divergence = price_higher and rsi_lower
 
+    # Price proximity to local high (last 20 candles) — fresh vs mid-correction
+    high_20 = float(df["high"].iloc[-20:].max())
+    near_local_high = high_20 > 0 and (high_20 - price) / high_20 <= 0.05
+
+    # RSI turning down from overbought
+    rsi_prev2 = float(rsi.iloc[-3]) if len(rsi) > 3 and pd.notna(rsi.iloc[-3]) else rsi_prev
+    rsi_turning_down = rsi_now < rsi_prev and rsi_prev >= 70
+
+    # At least one reversal signal required for short (not just overbought)
+    reversal_confirmed = (
+        bearish_divergence
+        or long_upper_wick
+        or stoch_bearish_cross
+        or rsi_turning_down
+    )
+
     score = 0
     direction = "short"
     reasons: list[str] = []
 
     if daily_change > 0:
+        # Mandatory reversal filter — skip if no confirmation signal
+        if not reversal_confirmed:
+            return None
+
         if rsi_now >= 80:
             score += 30; reasons.append(f"RSI {rsi_now:.0f} — сильно перекуплена")
         elif rsi_now >= 70:
@@ -453,6 +230,8 @@ def _deep_analyze(symbol: str, ohlcv: list, ticker: dict, daily_change: float,
             score -= 15; reasons.append(f"Funding {funding_rate*100:.3f}% — шорт дорогой")
         if ema_bullish and rsi_now < 80:
             score -= 10; reasons.append("EMA бычий тренд — осторожно")
+        if near_local_high:
+            score += 10; reasons.append(f"Цена у локального хая (-{(high_20-price)/high_20*100:.1f}%)")
 
     elif daily_change < -10:
         direction = "long"
@@ -493,59 +272,27 @@ def _deep_analyze(symbol: str, ohlcv: list, ticker: dict, daily_change: float,
         "potential_pct": round(potential_pct, 1),
         "score": score,
         "reasons": reasons,
+        "reversal_confirmed": reversal_confirmed,
+        "near_local_high": near_local_high,
     }
 
 
-_LINK_PREVIEW_RE = re.compile(
-    r"https?://\S+|www\.\S+|\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z]{2,})+(?:/\S*)?",
-    re.IGNORECASE,
-)
-
-
-def _clean_ai_note(ai_note: str) -> str:
-    note = _LINK_PREVIEW_RE.sub("", ai_note or "")
-    note = re.sub(r"\(\s*\)", "", note)
-    note = re.sub(r"\s+([,.;:!?])", r"\1", note)
-    note = re.sub(r"[ \t]{2,}", " ", note)
-    return note.strip(" \t\r\n-—,;")
-
-
 def format_coin_card(r: dict, index: int, ai_note: str = "",
-                     max_lev: int = 0, margin: float = 0.0,
-                     tp_pct: float = 0.0) -> str:
+                     max_lev: int = 0, margin: float = 0.0) -> str:
     coin = r["symbol"].split("/")[0]
     dir_emoji = "🔻" if r["direction"] == "short" else "🔺"
     reasons_text = "\n".join(f"    • {x}" for x in r["reasons"][:4])
     vol_24h = r.get("volume_24h", 0)
     vol_str = f"${vol_24h/1e6:.1f}M" if vol_24h >= 1e6 else f"${vol_24h/1e3:.0f}K"
-    clean_note = _clean_ai_note(ai_note)
-    note_line = f"\n   📰 {clean_note}" if clean_note else ""
+    note_line = f"\n   📰 {ai_note}" if ai_note else ""
     lev_line = ""
     if max_lev > 0 and margin > 0:
         notional = margin * max_lev
         lev_line = f"\n   ⚙️ Плечо `×{max_lev}` | Маржа `${margin:.2f}` | Поза `~${notional:.0f}`"
-        if tp_pct > 0:
-            lev_line += f"\n   💵 Доход с `$1`: `+${tp_pct / 100:.2f}` при TP `{tp_pct:.0f}%`"
-    tf = r.get("timeframes", {}) or {}
-    tf_bits = []
-    for name in ("1h", "4h", "1d"):
-        item = tf.get(name) or {}
-        rsi = item.get("rsi")
-        trend = item.get("ema_trend", "?")
-        if rsi is not None:
-            tf_bits.append(f"{name}: RSI {rsi}, {trend}")
-    smart_line = ""
-    if tf_bits:
-        smart_line = "\n   🧠 MEXC: " + " | ".join(tf_bits[:3])
-    gate_line = (
-        f"\n   ✅ Gate: `{r.get('validation_status', 'UNKNOWN')}` · "
-        f"trend `{bool(r.get('trend_change_short'))}` · "
-        f"MSB `{bool(r.get('msb_short'))}` · риск `{r.get('risk_score', '?')}/10`"
-    )
     return (
         f"{index}. {dir_emoji} *{coin}*\n"
         f"   RSI `{r['rsi']}` | 24ч `{r['daily_change_pct']:+.1f}%` | Объём `{vol_str}`\n"
         f"   Тренд: {r['ema_trend']} | BB: `{r['bb_position']:.0%}`{note_line}"
-        f"{smart_line}{gate_line}{lev_line}\n"
+        f"{lev_line}\n"
         f"   *Почему:*\n{reasons_text}"
     )
