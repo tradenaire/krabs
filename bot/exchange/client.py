@@ -7,6 +7,8 @@ import uuid
 import aiohttp
 import ccxt.async_support as ccxt
 
+from bot.event_logger import log_event, log_exception
+
 logger = logging.getLogger(__name__)
 
 
@@ -110,7 +112,12 @@ class ExchangeClient:
 
     async def get_futures_balance(self) -> dict:
         """Return futures balance using contract API directly (avoids spot auth)."""
-        raw = await self._exchange.contractPrivateGetAccountAssets()
+        try:
+            raw = await self._exchange.contractPrivateGetAccountAssets()
+            log_event("exchange", "mexc_raw_response", operation="get_futures_balance", raw=raw)
+        except Exception as e:
+            log_exception("exchange", "mexc_raw_error", e, operation="get_futures_balance")
+            raise
         assets = raw.get("data") or []
         usdt = next((a for a in assets if a.get("currency") == "USDT"), {})
         free = float(usdt.get("availableBalance", 0) or 0)
@@ -157,7 +164,9 @@ class ExchangeClient:
         """
         try:
             raw = await self._exchange.contractPrivateGetPositionOpenPositions()
+            log_event("exchange", "mexc_raw_response", operation="get_positions", raw=raw)
         except Exception as e:
+            log_exception("exchange", "mexc_raw_error", e, operation="get_positions")
             logger.error("contractPrivateGetPositionOpenPositions failed: %s", e)
             raise
 
@@ -285,6 +294,11 @@ class ExchangeClient:
 
     async def place_futures_order(self, symbol: str, side: str, amount_usdt: float,
                                   leverage: int, margin_mode: str | None = None) -> dict:
+        log_event(
+            "decisions", "place_futures_order_start",
+            symbol=symbol, side=side, amount_usdt=amount_usdt,
+            leverage=leverage, margin_mode=margin_mode,
+        )
         side = self._normalize_side(side)
         sym = self.futures_symbol(symbol)
 
@@ -336,7 +350,7 @@ class ExchangeClient:
         mexc_side = 1 if side == "buy" else 3
         mexc_symbol = self._mexc_contract_symbol(market, sym)
 
-        result = await self._exchange.contractPrivatePostOrderSubmit({
+        params = {
             "symbol": mexc_symbol,
             "price": 0,
             "vol": contracts,
@@ -344,13 +358,25 @@ class ExchangeClient:
             "type": 5,
             "openType": open_type,
             "leverage": leverage,
-        })
+        }
+        try:
+            result = await self._exchange.contractPrivatePostOrderSubmit(params)
+            log_event("exchange", "mexc_raw_response", operation="place_futures_order", params=params, raw=result)
+        except Exception as e:
+            log_exception("exchange", "mexc_raw_error", e, operation="place_futures_order", params=params)
+            raise
 
         if not result.get("success", False):
             raise RuntimeError(f"MEXC order rejected: {result.get('message', result)}")
 
         order_id = str(result.get("data", ""))
         logger.info("MEXC futures order placed: %s (id=%s)", mexc_symbol, order_id)
+        log_event(
+            "decisions", "place_futures_order_result",
+            symbol=sym, side=side, contracts=contracts, price=price,
+            leverage=leverage, margin_mode=margin_mode, order_id=order_id,
+            raw=result,
+        )
         return {"id": order_id, "symbol": sym, "side": side,
                 "amount": contracts, "price": price, "leverage": leverage,
                 "margin_mode": margin_mode, "info": result}
@@ -386,7 +412,12 @@ class ExchangeClient:
         if pos_id:
             params["positionId"] = pos_id
 
-        result = await self._exchange.contractPrivatePostOrderSubmit(params)
+        try:
+            result = await self._exchange.contractPrivatePostOrderSubmit(params)
+            log_event("exchange", "mexc_raw_response", operation="partial_close_futures_position", params=params, raw=result)
+        except Exception as e:
+            log_exception("exchange", "mexc_raw_error", e, operation="partial_close_futures_position", params=params)
+            raise
         if not result.get("success", False):
             raise RuntimeError(f"MEXC partial close failed: {result.get('message', result)}")
 
@@ -422,7 +453,12 @@ class ExchangeClient:
         if pos_id:
             params["positionId"] = pos_id
 
-        result = await self._exchange.contractPrivatePostOrderSubmit(params)
+        try:
+            result = await self._exchange.contractPrivatePostOrderSubmit(params)
+            log_event("exchange", "mexc_raw_response", operation="close_futures_position", params=params, raw=result)
+        except Exception as e:
+            log_exception("exchange", "mexc_raw_error", e, operation="close_futures_position", params=params)
+            raise
         if not result.get("success", False):
             raise RuntimeError(f"MEXC close failed: {result.get('message', result)}")
 
@@ -435,7 +471,8 @@ class ExchangeClient:
     async def cancel_plan_orders(self, symbol: str) -> None:
         mexc_sym = self.futures_symbol(symbol).replace("/", "_").replace(":USDT", "")
         try:
-            await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
+            r = await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
+            log_event("exchange", "mexc_raw_response", operation="cancel_plan_orders", params={"symbol": mexc_sym}, raw=r)
             logger.info("cancel_plan_orders(%s): done", symbol)
         except Exception as e:
             logger.warning("cancel_plan_orders(%s): %s", symbol, e)
@@ -445,6 +482,11 @@ class ExchangeClient:
                         pos_data: dict | None = None,
                         sl_limit_price: float | None = None) -> list[dict]:
         sym = self.futures_symbol(symbol)
+        log_event(
+            "decisions", "set_tp_sl_start", symbol=sym,
+            tp_price=tp_price, sl_price=sl_price, pos_data=pos_data,
+            sl_limit_price=sl_limit_price,
+        )
 
         if pos_data:
             side = pos_data["side"]
@@ -496,7 +538,8 @@ class ExchangeClient:
 
         # Cancel all then re-place
         try:
-            await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
+            cancel_result = await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
+            log_event("exchange", "mexc_raw_response", operation="set_tp_sl_cancel_all", params={"symbol": mexc_sym}, raw=cancel_result)
             for _ in range(8):
                 await asyncio.sleep(0.25)
                 try:
@@ -515,12 +558,14 @@ class ExchangeClient:
             last_err: Exception | None = None
             for attempt in range(3):
                 try:
-                    r = await self._exchange.contractPrivatePostPlanorderPlace({
+                    params = {
                         "symbol": mexc_sym, "price": exec_price, "vol": contracts,
                         "side": close_side, "orderType": 5, "openType": open_type,
                         "triggerPrice": str(price), "triggerType": trigger_type,
                         "trend": 1, "executeCycle": 2,
-                    })
+                    }
+                    r = await self._exchange.contractPrivatePostPlanorderPlace(params)
+                    log_event("exchange", "mexc_raw_response", operation=f"set_tp_sl_place_{kind.lower()}", params=params, raw=r)
                     if isinstance(r, dict) and r.get("success") is False:
                         raise RuntimeError(f"MEXC {kind} plan rejected: {r.get('message', r)}")
                     return {"type": kind, "price": price, "result": r}
@@ -532,6 +577,8 @@ class ExchangeClient:
                     logger.warning("%s place attempt %d/3 for %s: %s", kind, attempt+1, sym, e)
                     await asyncio.sleep(0.8 * (attempt + 1))
             logger.error("%s place FAILED for %s: %s", kind, sym, last_err)
+            if last_err:
+                log_exception("exchange", "mexc_raw_error", last_err, operation=f"set_tp_sl_place_{kind.lower()}", symbol=sym)
             raise RuntimeError(f"{kind} place failed for {sym}: {last_err}")
 
         if tp_price:
@@ -543,6 +590,7 @@ class ExchangeClient:
             exec_p = round(sl_limit_price, 8) if sl_limit_price else 0
             results.append(await _place("SL", sl_price, tt, exec_price=exec_p))
 
+        log_event("decisions", "set_tp_sl_result", symbol=sym, results=results)
         return results
 
     async def get_limit_close_orders(self, symbol: str) -> list[dict]:
@@ -606,6 +654,7 @@ class ExchangeClient:
             result = await self._exchange.contractPrivateGetPlanorderListOrders(
                 {"symbol": mexc_sym, "page_size": 10, "page_num": 1}
             )
+            log_event("exchange", "mexc_raw_response", operation="was_closed_by_tp", params={"symbol": mexc_sym}, raw=result)
             data = result.get("data") or {}
             orders = (data.get("resultList") or data.get("result_list") or []) \
                 if isinstance(data, dict) else (data or [])
@@ -645,6 +694,7 @@ class ExchangeClient:
             params = dict(base_params)
             params["page_num"] = page_num
             result = await self._exchange.contractPrivateGetPlanorderListOrders(params)
+            log_event("exchange", "mexc_raw_response", operation="get_tp_sl_orders", params=params, raw=result)
             data = result.get("data")
             orders = (data.get("resultList") or data.get("result_list") or []) \
                 if isinstance(data, dict) else (data or [])
@@ -683,7 +733,8 @@ class ExchangeClient:
         before_count = sum(1 for o in before if o.get("symbol", "") == mexc_sym)
 
         try:
-            await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
+            result = await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
+            log_event("exchange", "mexc_raw_response", operation="cancel_tp_sl_orders", params={"symbol": mexc_sym}, raw=result)
             logger.info("cancel_tp_sl_orders %s: CancelAll sent (had %d orders)", symbol, before_count)
         except Exception as e:
             if "1001" in str(e):

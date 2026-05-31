@@ -7,6 +7,8 @@ from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from bot.event_logger import log_event, set_correlation_id, snapshot_exchange_state
+
 logger = logging.getLogger(__name__)
 SCHEDULER = AsyncIOScheduler()
 
@@ -1091,12 +1093,15 @@ async def tpsl_enforce_job(app):
     from bot import db as db_mod
     client = app.bot_data["exchange"]
     tp_sl_pcts = app.bot_data.get("tp_sl_pcts", {})
+    set_correlation_id("job-tpsl-enforce")
 
     try:
         positions = await client.get_positions()
     except Exception as e:
+        log_event("errors", "tpsl_enforce_get_positions_failed", error=str(e))
         logger.error("TP/SL enforce: get_positions: %s", e)
         return
+    await snapshot_exchange_state(client, "tpsl_enforce_run")
 
     sem = asyncio.Semaphore(5)  # max 5 concurrent MEXC requests
 
@@ -1129,6 +1134,11 @@ async def tpsl_enforce_job(app):
                 if db_rec:
                     tp_sl_pcts[symbol] = {"tp_pct": _tp, "sl_pct": _sl}
                     app.bot_data.setdefault("tp_sl_pcts", {})[symbol] = {"tp_pct": _tp, "sl_pct": _sl}
+                    log_event(
+                        "decisions", "tpsl_enforce_auto_registered_position",
+                        symbol=symbol, tp_pct=_tp, sl_pct=_sl,
+                        margin=_cur_margin, avg_count=_est_count,
+                    )
                     logger.info("tpsl_enforce: auto-registered position %s in DB (id=%d)", symbol, db_rec["id"])
                 else:
                     return
@@ -1156,6 +1166,11 @@ async def tpsl_enforce_job(app):
                 logger.warning("Orphan order cleanup %s: %s", symbol, e)
 
     orphan_syms = db_open_symbols - exchange_symbols
+    log_event(
+        "decisions", "tpsl_enforce_summary",
+        exchange_symbols=sorted(exchange_symbols), db_open_symbols=sorted(db_open_symbols),
+        orphan_symbols=sorted(orphan_syms),
+    )
     if orphan_syms:
         await asyncio.gather(*[_cancel_orphan(s) for s in orphan_syms])
 

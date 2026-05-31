@@ -5,6 +5,8 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
+from bot.event_logger import log_event, snapshot_exchange_state
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,6 +77,15 @@ async def execute_open(client, app, symbol: str, side: str,
     interactive=True: raises MinOrderUpgradeNeeded instead of silently upgrading margin.
     """
     config = app.bot_data.get("config")
+    log_event(
+        "decisions", "execute_open_start", symbol=symbol, side=side,
+        requested_margin=margin, requested_leverage=leverage,
+        tp_pct=tp_pct, sl_pct=sl_pct, interactive=interactive,
+    )
+    await snapshot_exchange_state(
+        client, "before_open", symbol=symbol, requested_side=side,
+        requested_margin=margin, requested_leverage=leverage,
+    )
 
     user_set = leverage is not None and leverage > 0
 
@@ -138,10 +149,12 @@ async def execute_open(client, app, symbol: str, side: str,
 
     order = await client.place_futures_order(symbol, side, margin, leverage)
     actual_lev = order.get("leverage", leverage) or leverage
+    log_event("decisions", "execute_open_order_result", symbol=symbol, order=order)
 
     # Wait for MEXC to settle the position
     await asyncio.sleep(2)
     pos = await client.get_position(symbol)
+    await snapshot_exchange_state(client, "after_open_order", symbol=symbol, order=order)
 
     tp_price = sl_price = None
     entry = order.get("price", 0)
@@ -154,9 +167,21 @@ async def execute_open(client, app, symbol: str, side: str,
         tp_price = _calc_tp_price(entry, actual_lev, tp_pct, pos_side)
         sl_price = _calc_sl_price(entry, actual_lev, sl_pct, pos_side)
         try:
+            await snapshot_exchange_state(
+                client, "before_tpsl_set", symbol=symbol,
+                tp_price=tp_price, sl_price=sl_price,
+            )
             await client.cancel_tp_sl_orders(symbol)
             await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price)
+            await snapshot_exchange_state(
+                client, "after_tpsl_set", symbol=symbol,
+                tp_price=tp_price, sl_price=sl_price,
+            )
         except Exception as e:
+            log_event(
+                "errors", "execute_open_tpsl_failed", symbol=symbol,
+                tp_price=tp_price, sl_price=sl_price, error=str(e),
+            )
             logger.warning("TP/SL set failed for %s: %s", symbol, e)
 
     # Persist in DB
@@ -205,6 +230,11 @@ async def execute_open(client, app, symbol: str, side: str,
     # Store tp_sl_pcts for averaging recalc
     tp_sl_pcts = app.bot_data.setdefault("tp_sl_pcts", {})
     tp_sl_pcts[fsym] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
+    log_event(
+        "decisions", "execute_open_persisted", symbol=fsym,
+        entry_price=entry, leverage=actual_lev, margin=margin,
+        tp_price=tp_price, sl_price=sl_price, tp_pct=tp_pct, sl_pct=sl_pct,
+    )
 
     return {
         "symbol": symbol,

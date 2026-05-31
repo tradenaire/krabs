@@ -5,11 +5,13 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
-                          MessageHandler, filters)
+                          MessageHandler, TypeHandler, filters)
 
 from bot import db as db_mod
 from bot.config import Config
 from bot.exchange.client import ExchangeClient
+from bot.event_logger import (patch_bot_logging, telegram_error_logger,
+                              telegram_update_logger)
 from bot.handlers.scan import (scan_handler, open_callback, open_confirm_callback,
                                open_anyway_callback, scan_avg_callback, avg_force_callback)
 from bot.handlers.balance import balance_handler, balance_callback
@@ -81,6 +83,7 @@ def main():
     async def post_init(application: Application):
         application.bot_data["config"] = config
         application.bot_data["exchange"] = client
+        patch_bot_logging(application.bot)
         # Pre-populate tp_sl_pcts from config so tpsl_enforce_job uses correct values after restart
         tp_pct = float(getattr(config, "tp_pct", 500))
         sl_pct = float(getattr(config, "sl_pct", 500))
@@ -161,6 +164,8 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(TypeHandler(Update, telegram_update_logger), group=-100)
+    app.add_error_handler(telegram_error_logger)
     app.add_handler(CommandHandler("help", start_handler))
     app.add_handler(CommandHandler("scan", scan_handler))
     app.add_handler(CommandHandler("balance", balance_handler))
