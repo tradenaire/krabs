@@ -354,4 +354,18 @@ python -m compileall bot
 - [x] Grep confirms exchange raw logging is wired.
 - [x] Grep confirms restore-disabled TP/SL behavior remains unchanged.
 - [ ] Runtime proof after deploy: Telegram update creates `telegram-YYYY-MM-DD.jsonl`.
-- [ ] Runtime proof after deploy: exchange call creates `exchange-YYYY-MM-DD.jsonl`.
+- [x] Runtime proof after deploy: Telegram outgoing call creates `telegram-YYYY-MM-DD.jsonl`.
+- [x] Runtime proof after deploy: exchange call creates `exchange-YYYY-MM-DD.jsonl`.
+- [x] Runtime proof after deploy: job decision creates `decisions-YYYY-MM-DD.jsonl`.
+
+Runtime proof from Mumbai after deploy:
+
+```text
+systemctl is-active krabs3 -> active
+git rev-parse --short HEAD -> e1f7a76
+git rev-parse --short origin/main -> e1f7a76
+tpsl_enforce_job executed successfully after restart
+data/logs/telegram-2026-05-31.jsonl contains telegram_outgoing_result
+data/logs/exchange-2026-05-31.jsonl contains mexc_raw_response
+data/logs/decisions-2026-05-31.jsonl contains tpsl_enforce_summary
+```
