@@ -1087,7 +1087,7 @@ async def balance_alert_job(app):
 # ── TP/SL enforce job ─────────────────────────────────────────────
 
 async def tpsl_enforce_job(app):
-    """Каждые 60с проверяет — есть ли TP/SL у каждой позиции."""
+    """Sync closed positions and clean orphaned plan orders without restoring TP/SL."""
     from bot import db as db_mod
     client = app.bot_data["exchange"]
     tp_sl_pcts = app.bot_data.get("tp_sl_pcts", {})
@@ -1134,24 +1134,6 @@ async def tpsl_enforce_job(app):
                     return
             stored = {"tp_pct": db_rec.get("tp_pct", 500), "sl_pct": db_rec.get("sl_pct", 500)}
             tp_sl_pcts[symbol] = stored
-        async with sem:
-            try:
-                existing = await client.get_tp_sl_orders(symbol)
-            except Exception:
-                return
-        if not existing:
-            entry = float(pos.get("entry_price", 0) or 0)
-            _cfg = app.bot_data.get("config")
-            lev = int(getattr(_cfg, "default_leverage", 0) or 0) or int(pos.get("leverage", 1) or 1)
-            side = pos.get("side", "short")
-            async with sem:
-                try:
-                    tp = _calc_tp_price(entry, lev, stored["tp_pct"], side)
-                    sl = _calc_sl_price(entry, lev, stored["sl_pct"], side)
-                    await client.set_tp_sl(symbol, tp_price=tp, sl_price=sl, pos_data=pos)
-                    logger.info("TP/SL enforce: restored for %s (tp=%.6g sl=%.6g)", symbol, tp, sl)
-                except Exception as e:
-                    logger.error("TP/SL enforce failed for %s: %s", symbol, e)
 
     if len(positions) >= 5:
         await asyncio.gather(*[_check_pos(pos) for pos in positions])

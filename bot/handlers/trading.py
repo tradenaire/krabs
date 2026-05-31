@@ -292,7 +292,7 @@ async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.get("tp_price"):
             lines.append(f"✅ TP: `{result['tp_price']:.6g}` (+{tp_pct:.0f}%)")
         if result.get("sl_price"):
-            lines.append(f"🛑 SL: `{result['sl_price']:.6g}` (-{sl_pct:.0f}%)")
+            lines.append(f"🛑 SL: `-{sl_pct:.0f}%` (`{result['sl_price']:.6g}`)")
         lines.append(_funding_line(rate, result["leverage"]))
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
@@ -1093,7 +1093,7 @@ async def min_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.get("tp_price"):
             lines.append(f"✅ TP: `{result['tp_price']:.6g}` (+{pending['tp_pct']:.0f}%)")
         if result.get("sl_price"):
-            lines.append(f"🛑 SL: `{result['sl_price']:.6g}` (-{pending['sl_pct']:.0f}%)")
+            lines.append(f"🛑 SL: `-{pending['sl_pct']:.0f}%` (`{result['sl_price']:.6g}`)")
         await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка: {e}")

@@ -12,6 +12,14 @@ def _calc_sl_price(entry: float, lev: int, sl_pct: float, side: str) -> float:
     return entry + move if side == "short" else entry - move
 
 
+def _pnl_pct_at_price(entry: float, lev: int, price: float, side: str) -> float:
+    if entry <= 0:
+        return 0.0
+    if side == "short":
+        return (entry - price) / entry * lev * 100
+    return (price - entry) / entry * lev * 100
+
+
 def _fmt_funding(rate: float, lev: int, margin: float, next_ts: str | None = None) -> str:
     if rate == 0:
         return ""
@@ -107,7 +115,8 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     ]
     if liq > 0:
         lines.append(f"☠️ {liq:.6g}{dist_str}")
-    lines.append(f"SL:{sl_price:.6g} (-{sl_pct_val:.0f}%)")
+    sl_pnl_pct = _pnl_pct_at_price(entry, lev, sl_price, side)
+    lines.append(f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g})")
     lines.append(f"TP:{tp_price:.6g} (+{tp_pct_val:.0f}%)")
 
     # Max leverage / position limit (if provided)

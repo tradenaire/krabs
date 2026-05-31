@@ -34,12 +34,14 @@ def _fmt_paper_pos_block(pos: dict, mark_price: float) -> str:
     move_sl = entry * sl_pct / 100 / lev
     tp_price = entry - move_tp if side == "short" else entry + move_tp
     sl_price = entry + move_sl if side == "short" else entry - move_sl
+    sl_pnl_pct = ((entry - sl_price) / entry * lev * 100
+                  if side == "short" else (sl_price - entry) / entry * lev * 100)
 
     lines = [
         f"{coin} {side_icon} {lev}x ${total_inv:.2f}",
         f"▶️ {entry:.6g}" + (f" | Mark: {mark_price:.6g}" if mark_price > 0 else ""),
         f"{pnl_icon} {fmt_usd(pnl_usd)} ({fmt_pct(pnl_pct)})",
-        f"SL:{sl_price:.6g} (-{sl_pct:.0f}%)",
+        f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g})",
         f"TP:{tp_price:.6g} (+{tp_pct:.0f}%)",
         f"🔁 Докупок: {avg_count} | вложено ${total_inv:.2f}/${budget:.2f}",
     ]
