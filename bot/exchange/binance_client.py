@@ -1,9 +1,9 @@
-"""Binance USDM Futures exchange client with testnet support.
+"""Binance USDM Futures exchange client with demo trading support.
 
 Implements the same public surface as the MEXC client (bot/exchange/client.py)
 so engines/services/handlers work unchanged. Uses ccxt ``binanceusdm`` unified
-methods plus ``set_sandbox_mode(True)`` so real test orders go to Binance's
-futures testnet (testnet.binancefuture.com).
+methods plus ``enable_demo_trading(True)`` so test orders go to Binance Demo
+Trading.
 
 Key differences hidden by this adapter (see bot/exchange/base.py for the contract):
 - Binance sizes orders in base-asset quantity, not integer contracts;
@@ -71,7 +71,7 @@ class BinanceClient:
             "options": {"defaultType": "future"},
         })
         if testnet:
-            self._exchange.set_sandbox_mode(True)
+            self._exchange.enable_demo_trading(True)
         # Binance keeps spot/futures wallets separate, but for the bot's purposes
         # the futures wallet is what matters; spot reuses the same instance.
         self._spot = self._exchange

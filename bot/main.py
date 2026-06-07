@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 async def start_handler(update: Update, context):
     await update.message.reply_text(
-        "*Krabs3 — MEXC Futures Bot*\n\n"
+        "*Krabs3 — Binance Futures Bot*\n\n"
         "/scan — AI шорт-пикер (LLM + web search)\n"
         "/balance — фьючерсный баланс и маржа\n"
         "/positions — открытые позиции\n"
@@ -54,6 +54,15 @@ async def start_handler(update: Update, context):
         "/settakes — изменить тейкпрофит\n"
         "/stats — статистика за день\n"
         "/setkey KEY VALUE — сохранить API-ключ\n\n"
+        "*Binance API keys:*\n"
+        "Demo account: https://demo.binance.com/en/my/settings/api-management\n"
+        "`/setkey exchange_provider binance_testnet`\n"
+        "`/setkey binance_api_key YOUR_DEMO_API_KEY`\n"
+        "`/setkey binance_secret YOUR_DEMO_SECRET`\n\n"
+        "Real account: https://www.binance.com/en/my/settings/api-management\n"
+        "`/setkey exchange_provider binance`\n"
+        "`/setkey binance_api_key YOUR_REAL_API_KEY`\n"
+        "`/setkey binance_secret YOUR_REAL_SECRET`\n\n"
         "💬 *Текстовые команды (без /)* — пиши как хочешь:\n"
         "• `открой CHIP` — шорт со стандартными настройками\n"
         "• `закрой BTC` — закрыть (с подтверждением)\n"
