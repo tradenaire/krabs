@@ -27,6 +27,30 @@ _LEGACY_SCAN_MODELS = {
     "google/gemini-3.1-pro-preview-customtools:online",
 }
 _SCAN_PROMPT_PATH = Path(__file__).resolve().parents[2] / "SCAN-PROMPT.md"
+SCAN_OUTPUT_CONTRACT = """
+# BOT OUTPUT CONTRACT - OVERRIDES ANY TABLE FORMAT ABOVE
+Верни только данные для парсера бота. Никаких markdown-таблиц, рыночных обзоров,
+длинных объяснений, reasoning/thinking, дисклеймеров или инструкций марафона.
+
+Формат строго:
+
+COIN: TICKER
+SIDE: LONG или SHORT
+PRICE: $X.XX
+TECH: RSI/EMA/структура, одна короткая строка
+FUND: новость/катализатор/риск, одна короткая строка
+FUNDING: +X.XXX% (оценка для выбранной стороны)
+ENTRY: $X.XX-$X.XX
+TP1: $X.XX
+TP2: $X.XX
+TP3: $X.XX
+SL: $X.XX
+RISK: N/10
+
+Повтори этот блок ровно {n} раз для LONG и ровно {n} раз для SHORT.
+После всех COIN-блоков добавь одну строку:
+SENTIMENT: 1-2 коротких предложения о рынке.
+"""
 
 SYSTEM_PROMPT = """# ROLE
 Ты — старший крипто-аналитик и деривативный трейдер крупного хедж-фонда. Специализация — Binance USD-M futures, funding, open interest, ликвидность, импульс/mean reversion и риск по текущему счету.
@@ -479,7 +503,12 @@ def _build_system_prompt(mode: str, n: int) -> str:
         if prompt:
             today = _dt.date.today().strftime("%Y-%m-%d")
             task_tmpl, count_rule = _prompt_parts(mode, n)
-            return f"{prompt}\n\n{task_tmpl.format(today=today)}\n{count_rule}"
+            return (
+                f"{prompt}\n\n"
+                f"{task_tmpl.format(today=today)}\n"
+                f"{count_rule}\n\n"
+                f"{SCAN_OUTPUT_CONTRACT.format(n=n)}"
+            )
     today = _dt.date.today().strftime("%Y-%m-%d")
     task_tmpl, count_rule = _prompt_parts(mode, n)
     return SYSTEM_PROMPT.format(

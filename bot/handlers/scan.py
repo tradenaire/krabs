@@ -1,4 +1,4 @@
-﻿"""/scan вЂ” LLM + web-search market picker."""
+"""/scan — LLM + web-search market picker."""
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -67,11 +67,11 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_key = config.openrouter_api_key
     if not api_key:
         await update.message.reply_text(
-            "РќРµС‚ OpenRouter РєР»СЋС‡Р°. Р”РѕР±Р°РІСЊ С‡РµСЂРµР· /setkey openrouter_api_key sk-or-..."
+            "Нет OpenRouter ключа. Добавь через /setkey openrouter_api_key sk-or-..."
         )
         return
 
-    status = await update.message.reply_text("рџ§  Р”СѓРјР°СЋ...")
+    status = await update.message.reply_text("🧠 Думаю...")
 
     try:
         local_results, _total = await scan_overbought(client, 65.0, 10.0)
@@ -93,7 +93,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         getattr(config, "openrouter_model", DEFAULT_MODEL),
         force_default=True,
     )
-    await status.edit_text(f"рџ”Ќ РђРЅР°Р»РёР·РёСЂСѓСЋ С‡РµСЂРµР· {model}...")
+    await status.edit_text(f"🔍 Анализирую через {model}...")
 
     ai_result = await deep_short_analysis(
         local_results,
@@ -105,20 +105,20 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if ai_result.error and not ai_result.text:
-        await status.edit_text(f"вќЊ AI РЅРµРґРѕСЃС‚СѓРїРµРЅ: {ai_result.error}")
+        await status.edit_text(f"❌ AI недоступен: {ai_result.error}")
         return
 
     picks = parse_analyst_blocks(ai_result.text, n=ask_n * 2)
     if not picks:
         logger.warning("AI scan response unusable from %s: %s", ai_result.model, ai_result.text[:1200])
         await status.edit_text(
-            f"рџ“ќ GPT-5.5 РЅРµ РІРµСЂРЅСѓР» РЅСѓР¶РЅС‹Р№ С„РѕСЂРјР°С‚ COIN/SIDE.\n"
+            f"📝 GPT-5.5 не вернул нужный формат COIN/SIDE.\n"
             f"{format_usage_footer(ai_result)}",
             parse_mode="Markdown",
         )
         return
 
-    await status.edit_text(f"вњ… AI РІС‹РґР°Р» {len(picks)} РјРѕРЅРµС‚. РџСЂРѕРІРµСЂСЏСЋ СЂС‹РЅРѕРє Р±РёСЂР¶Рё...")
+    await status.edit_text(f"✅ AI выдал {len(picks)} монет. Проверяю рынок биржи...")
 
     open_coins = {p["symbol"].split("/")[0] for p in open_positions}
     open_pos_by_coin = {p["symbol"].split("/")[0]: p for p in open_positions}
@@ -137,7 +137,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         fut_sym = await mexc_find_futures_symbol(client, ticker)
         if not fut_sym:
-            skipped.append((ticker, "РЅРµС‚ РЅР° Р±РёСЂР¶Рµ"))
+            skipped.append((ticker, "нет на бирже"))
             continue
 
         coin = fut_sym.split("/")[0]
@@ -147,7 +147,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         tech = await analyze_single_coin(client, fut_sym)
         if not tech:
-            skipped.append((ticker, "РЅРµС‚ OHLCV"))
+            skipped.append((ticker, "нет OHLCV"))
             continue
         ai_side = pick.get("side")
         if ai_side in ("long", "short"):
@@ -169,7 +169,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not validated and not existing_picks:
         summary = ", ".join(f"{t} ({r})" for t, r in skipped[:5])
-        await update.message.reply_text(f"РќРёС‡РµРіРѕ РЅРµ РїСЂРѕС€Р»Рѕ РїСЂРѕРІРµСЂРєСѓ Р±РёСЂР¶Рё.\nРџСЂРѕРїСѓС‰РµРЅРѕ: {summary}")
+        await update.message.reply_text(f"Ничего не прошло проверку биржи.\nПропущено: {summary}")
         return
 
     default_bet = float(getattr(config, "default_trade_usdt", 0.20))
@@ -205,20 +205,20 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     long_count = sum(1 for r in validated if r.get("direction") == "long")
     short_count = sum(1 for r in validated if r.get("direction") == "short")
-    header = f"*рџЋЇ AI top-{requested} long + top-{requested} short ({ai_result.model})*"
-    header += f"\n_РїСЂРѕС€Р»Рѕ РїСЂРѕРІРµСЂРєСѓ: LONG {long_count}, SHORT {short_count}_"
+    header = f"*🎯 AI top-{requested} long + top-{requested} short ({ai_result.model})*"
+    header += f"\n_прошло проверку: LONG {long_count}, SHORT {short_count}_"
     if existing_picks:
-        header += f"\n_СѓР¶Рµ РІ РїРѕР·РёС†РёРё: {', '.join(s.split('/')[0] for s, _ in existing_picks)}_"
+        header += f"\n_уже в позиции: {', '.join(s.split('/')[0] for s, _ in existing_picks)}_"
     if skipped:
-        header += f"\n_РїСЂРѕРїСѓС‰РµРЅРѕ: {', '.join(t for t, _ in skipped[:5])}_"
+        header += f"\n_пропущено: {', '.join(t for t, _ in skipped[:5])}_"
     if not budget_info["can_open"]:
-        header += f"\nв›” *Р‘Р°Р»Р°РЅСЃ* `${free_balance:.2f}` вЂ” РЅРµРґРѕСЃС‚Р°С‚РѕС‡РЅРѕ РґР°Р¶Рµ РЅР° РѕС‚РєСЂС‹С‚РёРµ (`${default_bet:.2f}`)"
+        header += f"\n⛔ *Баланс* `${free_balance:.2f}` — недостаточно даже на открытие (`${default_bet:.2f}`)"
     elif not budget_info["can_full_budget"]:
         header += (
-            f"\nвљ пёЏ *Р‘Р°Р»Р°РЅСЃ* `${free_balance:.2f}` вЂ” С…РІР°С‚РёС‚ РЅР° "
-            f"`{budget_info['positions_possible']}` РїРѕР»РЅС‹С… РїРѕР·"
-            f" (РЅСѓР¶РЅРѕ `${budget_info['full_budget']:.2f}` РЅР° 1 РїРѕР· В· "
-            f"РјР°СЂР¶Р°+РґРѕРєСѓРїРєРё `${budget_info['base_budget']:.2f}` Г— SL {budget_info['sl_pct']:.0f}%)"
+            f"\n⚠️ *Баланс* `${free_balance:.2f}` — хватит на "
+            f"`{budget_info['positions_possible']}` полных поз"
+            f" (нужно `${budget_info['full_budget']:.2f}` на 1 поз · "
+            f"маржа+докупки `${budget_info['base_budget']:.2f}` × SL {budget_info['sl_pct']:.0f}%)"
         )
     await update.message.reply_text(header, parse_mode="Markdown")
 
@@ -234,25 +234,25 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         card = format_coin_card(r, i, ai_note=r.get("_ai_fund", ""),
                                 max_lev=lev_eff, margin=default_bet)
         if r.get("_ai_funding"):
-            card += f"\n   Р¤Р°РЅРґРёРЅРі (AI): {r['_ai_funding']}"
+            card += f"\n   Фандинг (AI): {r['_ai_funding']}"
         if r.get("_ai_risk"):
-            card += f"\n   Р РёСЃРє (AI): {r['_ai_risk']}"
+            card += f"\n   Риск (AI): {r['_ai_risk']}"
 
-        icon = "рџ”»" if direction == "short" else "рџ”є"
+        icon = "🔻" if direction == "short" else "🔺"
 
         if avg_ok:
             btn = InlineKeyboardButton(
-                f"{icon} ${default_bet:g} В· {lev_eff}x",
+                f"{icon} ${default_bet:g} · {lev_eff}x",
                 callback_data=f"open_{side_code}_{sym}",
             )
         else:
-            # Averaging minimum exceeds configured amount вЂ” show warning
+            # Averaging minimum exceeds configured amount — show warning
             card += (
-                f"\n   вљ пёЏ *РњРёРЅ. РґРѕРєСѓРїРєР° Р±РёСЂР¶Рё* `${min_avg:.2f}` > РЅР°СЃС‚СЂРѕР№РєР° `${averaging_amount:.2f}`"
-                f"\n   РџСЂРё РѕС‚РєСЂС‹С‚РёРё РґРѕРєСѓРїРєР° Р±СѓРґРµС‚ РїРѕ `${min_avg:.2f}`"
+                f"\n   ⚠️ *Мин. докупка биржи* `${min_avg:.2f}` > настройка `${averaging_amount:.2f}`"
+                f"\n   При открытии докупка будет по `${min_avg:.2f}`"
             )
             btn = InlineKeyboardButton(
-                f"вљ пёЏ РћС‚РєСЂС‹С‚СЊ (РґРѕРєСѓРїРєР° ~${min_avg:.2f})",
+                f"⚠️ Открыть (докупка ~${min_avg:.2f})",
                 callback_data=f"open_anyway_{side_code}_{sym}",
             )
 
@@ -264,7 +264,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Output existing-position cards
     if existing_picks:
-        await update.message.reply_text("*рџ“‚ РЈР¶Рµ РѕС‚РєСЂС‹С‚С‹:*", parse_mode="Markdown")
+        await update.message.reply_text("*📂 Уже открыты:*", parse_mode="Markdown")
         for fut_sym, pick in existing_picks:
             coin = fut_sym.split("/")[0]
             pos = open_pos_by_coin.get(coin, {})
@@ -281,17 +281,17 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             min_avg = await _get_live_min_avg_margin(client, fut_sym, lev, context.bot_data)
             step = max(averaging_amount, min_avg)
-            step_note = f" (РјРёРЅ Р±РёСЂР¶Рё)" if min_avg > averaging_amount else ""
+            step_note = f" (мин биржи)" if min_avg > averaging_amount else ""
 
             text = (
-                f"*{coin}* Г—{lev} | РњР°СЂР¶Р° `${margin:.3f}`\n"
+                f"*{coin}* ×{lev} | Маржа `${margin:.3f}`\n"
                 f"PnL: `{pnl_pct:+.1f}%` / `${pnl_usd:+.3f}`\n"
-                f"Р”РѕРєСѓРїРѕРє: `{avg_count}/{max_count}`\n"
-                f"AI: _{pick.get('fund', 'вЂ”')}_"
+                f"Докупок: `{avg_count}/{max_count}`\n"
+                f"AI: _{pick.get('fund', '—')}_"
             )
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    f"рџ“€ Р”РѕРєСѓРїРёС‚СЊ +${step:.2f}{step_note}",
+                    f"📈 Докупить +${step:.2f}{step_note}",
                     callback_data=f"scan_avg_{fut_sym}",
                 )
             ]])
@@ -304,7 +304,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tail = []
     sentiment = extract_sentiment(ai_result.text)
     if sentiment:
-        tail.append(f"рџ“ќ _{sentiment}_")
+        tail.append(f"📝 _{sentiment}_")
     tail.append(format_usage_footer(ai_result))
     try:
         await update.message.reply_text("\n\n".join(tail), parse_mode="Markdown")
@@ -319,29 +319,29 @@ async def _do_execute_open(q, client, app, symbol: str, side: str,
     """Shared open logic used by open_callback and open_confirm_callback."""
     coin = symbol.split("/")[0]
     side_ru = "SHORT" if side == "sell" else "LONG"
-    await q.message.reply_text(f"рџљЂ РћС‚РєСЂС‹РІР°СЋ {side_ru} `{coin}`...", parse_mode="Markdown")
+    await q.message.reply_text(f"🚀 Открываю {side_ru} `{coin}`...", parse_mode="Markdown")
     from bot.handlers.trading import execute_open
     result = await execute_open(client, app, symbol, side, margin, leverage)
     actual_margin = result.get("margin", margin)
     actual_lev = result["leverage"]
-    icon = "рџ”»" if side == "sell" else "рџџ©"
+    icon = "🔻" if side == "sell" else "🟩"
     lines = [
-        f"*{coin}* {icon}Г—{actual_lev} `${actual_margin:.2f}`",
-        f"в–¶ Entry: `{result['entry_price']:.6g}`",
+        f"*{coin}* {icon}×{actual_lev} `${actual_margin:.2f}`",
+        f"▶ Entry: `{result['entry_price']:.6g}`",
     ]
     if actual_margin > margin + 0.001:
-        lines.append(f"вљ пёЏ РњР°СЂР¶Р° РїРѕРґРЅСЏС‚Р° `${margin:.2f}` в†’ `${actual_margin:.2f}` (РјРёРЅ Р±РёСЂР¶Рё)")
+        lines.append(f"⚠️ Маржа поднята `${margin:.2f}` → `${actual_margin:.2f}` (мин биржи)")
     if result.get("liquidation_price"):
-        lines.append(f"рџ’Ђ Liq: `{result['liquidation_price']:.6g}`")
+        lines.append(f"💀 Liq: `{result['liquidation_price']:.6g}`")
     if result.get("tp_price"):
-        lines.append(f"вњ… TP: `{result['tp_price']:.6g}`")
+        lines.append(f"✅ TP: `{result['tp_price']:.6g}`")
     if result.get("sl_price"):
-        lines.append(f"рџ›‘ SL: `{result['sl_price']:.6g}`")
+        lines.append(f"🛑 SL: `{result['sl_price']:.6g}`")
     await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles open_{side}_{symbol} вЂ” budget-check then open."""
+    """Handles open_{side}_{symbol} — budget-check then open."""
     q = update.callback_query
     await q.answer()
 
@@ -367,7 +367,7 @@ async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not budget["can_open"]:
         await q.message.reply_text(
-            f"вќЊ РќРµРґРѕСЃС‚Р°С‚РѕС‡РЅРѕ Р±Р°Р»Р°РЅСЃР°: `${free:.2f}` < РјР°СЂР¶Р° `${margin:.2f}`",
+            f"❌ Недостаточно баланса: `${free:.2f}` < маржа `${margin:.2f}`",
             parse_mode="Markdown",
         )
         return
@@ -378,15 +378,15 @@ async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         margin_milli = int(margin * 1000)
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(
-                f"вљ пёЏ РћС‚РєСЂС‹С‚СЊ ({budget['positions_possible']} РїРѕР»РЅС‹С… РїРѕР· РґРѕСЃС‚СѓРїРЅРѕ)",
+                f"⚠️ Открыть ({budget['positions_possible']} полных поз доступно)",
                 callback_data=f"open_confirm_{side}_{margin_milli}_{symbol}",
             )
         ]])
         await q.message.reply_text(
-            f"вљ пёЏ *{coin}* {side_ru}: РЅРµРґРѕСЃС‚Р°С‚РѕС‡РЅС‹Р№ Р±СЋРґР¶РµС‚\n"
-            f"РЎРІРѕР±РѕРґРЅРѕ `${free:.2f}` В· РЅСѓР¶РЅРѕ `${budget['full_budget']:.2f}` РЅР° 1 РїРѕР·\n"
-            f"_(РјР°СЂР¶Р°+РґРѕРєСѓРїРєРё `${budget['base_budget']:.2f}` Г— SL {budget['sl_pct']:.0f}%)_\n"
-            f"РҐРІР°С‚РёС‚ РЅР° `{budget['positions_possible']}` РїРѕР»РЅС‹С… РїРѕР·РёС†РёР№. РћС‚РєСЂС‹С‚СЊ РІСЃС‘ СЂР°РІРЅРѕ?",
+            f"⚠️ *{coin}* {side_ru}: недостаточный бюджет\n"
+            f"Свободно `${free:.2f}` · нужно `${budget['full_budget']:.2f}` на 1 поз\n"
+            f"_(маржа+докупки `${budget['base_budget']:.2f}` × SL {budget['sl_pct']:.0f}%)_\n"
+            f"Хватит на `{budget['positions_possible']}` полных позиций. Открыть всё равно?",
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -402,11 +402,11 @@ async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await _do_execute_open(q, client, context.application, symbol, side, margin, leverage)
     except Exception as e:
-        await q.message.reply_text(f"вќЊ РћС€РёР±РєР°: {e}")
+        await q.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def open_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles open_confirm_{side}_{margin_milli}_{symbol} вЂ” opens ignoring budget warning."""
+    """Handles open_confirm_{side}_{margin_milli}_{symbol} — opens ignoring budget warning."""
     q = update.callback_query
     await q.answer()
 
@@ -429,11 +429,11 @@ async def open_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         await _do_execute_open(q, client, context.application, symbol, side, margin, leverage)
     except Exception as e:
-        await q.message.reply_text(f"вќЊ РћС€РёР±РєР°: {e}")
+        await q.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def open_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles open_anyway_{side}_{symbol} вЂ” opens even if averaging minimum > configured amount."""
+    """Handles open_anyway_{side}_{symbol} — opens even if averaging minimum > configured amount."""
     q = update.callback_query
     await q.answer()
 
@@ -471,7 +471,7 @@ async def open_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     coin = symbol.split("/")[0]
     side_ru = "SHORT" if side == "sell" else "LONG"
     await q.message.reply_text(
-        f"рџљЂ РћС‚РєСЂС‹РІР°СЋ {side_ru} `{coin}`...",
+        f"🚀 Открываю {side_ru} `{coin}`...",
         parse_mode="Markdown",
     )
 
@@ -480,27 +480,27 @@ async def open_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         result = await execute_open(client, context.application, symbol, side, margin, leverage)
         actual_margin = result.get("margin", margin)
         actual_lev = result["leverage"]
-        icon = "рџ”»" if side == "sell" else "рџџ©"
+        icon = "🔻" if side == "sell" else "🟩"
         lines = [
-            f"*{coin}* {icon}Г—{actual_lev} `${actual_margin:.2f}`",
-            f"в–¶ Entry: `{result['entry_price']:.6g}`",
+            f"*{coin}* {icon}×{actual_lev} `${actual_margin:.2f}`",
+            f"▶ Entry: `{result['entry_price']:.6g}`",
         ]
         if actual_margin > margin + 0.001:
-            lines.append(f"вљ пёЏ РњР°СЂР¶Р° РїРѕРґРЅСЏС‚Р° `${margin:.2f}` в†’ `${actual_margin:.2f}` (РјРёРЅ Р±РёСЂР¶Рё)")
+            lines.append(f"⚠️ Маржа поднята `${margin:.2f}` → `${actual_margin:.2f}` (мин биржи)")
         if result.get("liquidation_price"):
-            lines.append(f"рџ’Ђ Liq: `{result['liquidation_price']:.6g}`")
+            lines.append(f"💀 Liq: `{result['liquidation_price']:.6g}`")
         if result.get("tp_price"):
-            lines.append(f"вњ… TP: `{result['tp_price']:.6g}`")
+            lines.append(f"✅ TP: `{result['tp_price']:.6g}`")
         if result.get("sl_price"):
-            lines.append(f"рџ›‘ SL: `{result['sl_price']:.6g}`")
-        lines.append(f"рџ“Љ РђРІС‚РѕРґРѕРєСѓРїРєР°: `${min_avg:.2f}`/С€Р°Рі")
+            lines.append(f"🛑 SL: `{result['sl_price']:.6g}`")
+        lines.append(f"📊 Автодокупка: `${min_avg:.2f}`/шаг")
         await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
-        await q.message.reply_text(f"вќЊ РћС€РёР±РєР°: {e}")
+        await q.message.reply_text(f"❌ Ошибка: {e}")
 
 
 async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles scan_avg_{symbol} вЂ” immediately places one averaging step for an existing position."""
+    """Handles scan_avg_{symbol} — immediately places one averaging step for an existing position."""
     q = update.callback_query
     await q.answer()
 
@@ -514,11 +514,11 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pos = await client.get_position(symbol)
     except Exception as e:
-        await q.message.reply_text(f"вќЊ РќРµ РјРѕРіСѓ РїРѕР»СѓС‡РёС‚СЊ РїРѕР·РёС†РёСЋ {coin}: {e}")
+        await q.message.reply_text(f"❌ Не могу получить позицию {coin}: {e}")
         return
 
     if not pos:
-        await q.message.reply_text(f"вќЊ РџРѕР·РёС†РёСЏ {coin} РЅРµ РЅР°Р№РґРµРЅР°")
+        await q.message.reply_text(f"❌ Позиция {coin} не найдена")
         return
 
     lev = int(pos.get("leverage") or 1)
@@ -538,17 +538,17 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     if free < step:
         await q.message.reply_text(
-            f"вќЊ РќРµРґРѕСЃС‚Р°С‚РѕС‡РЅРѕ Р±Р°Р»Р°РЅСЃР°: `${free:.2f}` < `${step:.2f}`",
+            f"❌ Недостаточно баланса: `${free:.2f}` < `${step:.2f}`",
             parse_mode="Markdown",
         )
         return
 
-    await q.message.reply_text(f"вЏі Р”РѕРєСѓРїР°СЋ `{coin}` +`${step:.2f}`...", parse_mode="Markdown")
+    await q.message.reply_text(f"⏳ Докупаю `{coin}` +`${step:.2f}`...", parse_mode="Markdown")
 
     try:
         await client.place_futures_order(symbol, avg_side, step, lev, margin_mode=margin_mode)
     except Exception as e:
-        await q.message.reply_text(f"вќЊ РћС€РёР±РєР° РґРѕРєСѓРїРєРё {coin}: {e}")
+        await q.message.reply_text(f"❌ Ошибка докупки {coin}: {e}")
         return
 
     # Update DB
@@ -573,7 +573,7 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_entry = float((pos_after or pos).get("entry_price", 0))
 
     await q.message.reply_text(
-        f"вњ… *{coin}* РґРѕРєСѓРїР»РµРЅРѕ +`${step:.2f}`\n"
+        f"✅ *{coin}* докуплено +`${step:.2f}`\n"
         f"PnL: `{pnl_pct:+.1f}%` / `${pnl_usd:+.3f}`\n"
         f"Avg entry: `{new_entry:.6g}`",
         parse_mode="Markdown",
@@ -581,7 +581,7 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles avg_force_{symbol} вЂ” force-average at exchange minimum after auto-avg failed."""
+    """Handles avg_force_{symbol} — force-average at exchange minimum after auto-avg failed."""
     q = update.callback_query
     await q.answer()
 
@@ -593,11 +593,11 @@ async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         pos = await client.get_position(symbol)
     except Exception as e:
-        await q.message.reply_text(f"вќЊ РќРµ РјРѕРіСѓ РїРѕР»СѓС‡РёС‚СЊ РїРѕР·РёС†РёСЋ {coin}: {e}")
+        await q.message.reply_text(f"❌ Не могу получить позицию {coin}: {e}")
         return
 
     if not pos:
-        await q.message.reply_text(f"вќЊ РџРѕР·РёС†РёСЏ {coin} РЅРµ РЅР°Р№РґРµРЅР°")
+        await q.message.reply_text(f"❌ Позиция {coin} не найдена")
         return
 
     lev = int(pos.get("leverage") or 1)
@@ -608,14 +608,14 @@ async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     min_avg = _get_min_avg_margin(symbol, lev, context.bot_data)
 
     await q.message.reply_text(
-        f"вЏі РџСЂРёРЅСѓРґРёС‚РµР»СЊРЅР°СЏ РґРѕРєСѓРїРєР° `{coin}` +`${min_avg:.2f}` (РјРёРЅ Р±РёСЂР¶Рё)...",
+        f"⏳ Принудительная докупка `{coin}` +`${min_avg:.2f}` (мин биржи)...",
         parse_mode="Markdown",
     )
 
     try:
         await client.place_futures_order(symbol, avg_side, min_avg, lev, margin_mode=margin_mode)
     except Exception as e:
-        await q.message.reply_text(f"вќЊ РћС€РёР±РєР° РґРѕРєСѓРїРєРё {coin}: {e}")
+        await q.message.reply_text(f"❌ Ошибка докупки {coin}: {e}")
         return
 
     from bot import db as db_mod
@@ -638,9 +638,8 @@ async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     new_entry = float((pos_after or pos).get("entry_price", 0))
 
     await q.message.reply_text(
-        f"вњ… *{coin}* РґРѕРєСѓРїР»РµРЅРѕ +`${min_avg:.2f}`\n"
+        f"✅ *{coin}* докуплено +`${min_avg:.2f}`\n"
         f"PnL: `{pnl_pct:+.1f}%` / `${pnl_usd:+.3f}`\n"
         f"Avg entry: `{new_entry:.6g}`",
         parse_mode="Markdown",
     )
-

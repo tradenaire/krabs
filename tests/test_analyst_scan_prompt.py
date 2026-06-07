@@ -161,6 +161,18 @@ Extra explanation that should be dropped.
         self.assertIn("ТОП-5 ЛОНГОВ", prompt)
         self.assertIn("OUTPUT FORMAT", template)
         self.assertIn("OUTPUT FORMAT", prompt)
+        self.assertIn("BOT OUTPUT CONTRACT", prompt)
+        self.assertIn("Никаких markdown-таблиц", prompt)
+        self.assertIn("COIN: TICKER", prompt)
+        self.assertIn("Ровно 5 блоков SIDE: LONG и ровно 5 блоков SIDE: SHORT.", prompt)
+
+    def test_scan_prompt_file_is_readable_not_mojibake(self):
+        template = Path("SCAN-PROMPT.md").read_text(encoding="utf-8")
+
+        self.assertIn("Ты — старший аналитик", template)
+        self.assertIn("ТОП-5 монет", template)
+        for marker in ("РўС‹", "Рџ", "вЂ", "Ð", "Ñ"):
+            self.assertNotIn(marker, template)
 
     def test_user_message_prioritizes_online_research_before_exchange_verification(self):
         msg = _build_user_msg([], n=6, mode="both")
