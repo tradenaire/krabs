@@ -21,7 +21,7 @@ OPENROUTER_PRICES = {
 }
 
 DEFAULT_MODEL = "openai/gpt-5.5:online"
-FALLBACK_MODEL = "google/gemini-3.1-pro-preview-customtools:online"
+FALLBACK_MODEL = DEFAULT_MODEL
 _LEGACY_SCAN_MODELS = {
     "x-ai/grok-4-fast:online",
     "google/gemini-3.1-pro-preview-customtools:online",
