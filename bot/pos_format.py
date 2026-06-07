@@ -1,23 +1,8 @@
 """Shared position block formatter used by balance and positions handlers."""
 from bot.fmt import fmt_pct, fmt_usd
-
-
-def _calc_tp_price(entry: float, lev: int, tp_pct: float, side: str) -> float:
-    move = entry * tp_pct / 100 / lev
-    return entry - move if side == "short" else entry + move
-
-
-def _calc_sl_price(entry: float, lev: int, sl_pct: float, side: str) -> float:
-    move = entry * sl_pct / 100 / lev
-    return entry + move if side == "short" else entry - move
-
-
-def _pnl_pct_at_price(entry: float, lev: int, price: float, side: str) -> float:
-    if entry <= 0:
-        return 0.0
-    if side == "short":
-        return (entry - price) / entry * lev * 100
-    return (price - entry) / entry * lev * 100
+from bot.services.tpsl import calc_tp_price as _calc_tp_price
+from bot.services.tpsl import calc_sl_price as _calc_sl_price
+from bot.services.tpsl import pnl_pct_at_price as _pnl_pct_at_price
 
 
 def _fmt_funding(rate: float, lev: int, margin: float, next_ts: str | None = None) -> str:

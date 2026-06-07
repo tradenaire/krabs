@@ -831,3 +831,7 @@ class ExchangeClient:
         except Exception as e:
             logger.debug("get_funding_rate %s: %s", symbol, e)
             return {"rate": 0.0, "next_funding_time": None, "symbol": symbol}
+
+
+# Explicit provider name; the factory may select this or BinanceClient.
+MexcClient = ExchangeClient

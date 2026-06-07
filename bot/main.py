@@ -78,11 +78,18 @@ def main():
         logger.error("No telegram_token. Run: python start.py --setup")
         sys.exit(1)
 
-    client = ExchangeClient(config.mexc_api_key, config.mexc_secret)
+    from bot.exchange.factory import create_exchange_client
+    client = create_exchange_client(config)
 
     async def post_init(application: Application):
         application.bot_data["config"] = config
         application.bot_data["exchange"] = client
+        # Infra layer: typed shared state + event bus (additive; legacy bot_data
+        # keys remain in place until fully migrated).
+        from bot.infra.state import get_state
+        from bot.infra.event_bus import get_bus
+        get_state(application)
+        get_bus(application)
         patch_bot_logging(application.bot)
         # Pre-populate tp_sl_pcts from config so tpsl_enforce_job uses correct values after restart
         tp_pct = float(getattr(config, "tp_pct", 500))
@@ -95,7 +102,7 @@ def main():
         application.bot_data["tp_sl_pcts"] = tp_sl_pcts
         from bot.jobs.main import _load_exhausted
         application.bot_data["_avg_notified_exhausted"] = _load_exhausted()
-        setup_scheduler(application)
+        await setup_scheduler(application)
 
         # Deduplicate + sync DB with exchange on startup
         dupes = db_mod.dedupe_open_positions()
@@ -156,10 +163,23 @@ def main():
         ])
         logger.info("Bot started.")
 
+    async def post_shutdown(application: Application):
+        mgr = application.bot_data.get("engine_manager")
+        if mgr is not None:
+            await mgr.stop_all()
+        worker = application.bot_data.get("scanner_worker")
+        if worker is not None:
+            await worker.stop()
+        try:
+            await client.close()
+        except Exception:
+            pass
+
     app = (
         Application.builder()
         .token(config.telegram_token)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 

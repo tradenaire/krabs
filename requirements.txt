@@ -1,7 +1,9 @@
 python-telegram-bot==22.7
 ccxt>=4.5.46
 apscheduler>=3.10
-pandas>=2.0
-pandas-ta>=0.3.14b
+numpy<2
+pandas>=2.0,<2.3
+# original pandas-ta was removed from PyPI/GitHub; freqtrade fork is a drop-in (imports as pandas_ta)
+ft-pandas-ta @ git+https://github.com/freqtrade/pandas-ta.git
 openai>=1.30          # for OpenRouter calls
 anthropic>=0.39       # optional: Claude backend

@@ -40,215 +40,12 @@ def _funding_warning(rate: float, margin: float) -> str:
     )
 
 
-def _calc_tp_price(entry: float, leverage: int, tp_pct: float, side: str) -> float:
-    """entry + leverage move that gives tp_pct PnL on margin."""
-    move = entry * tp_pct / 100 / leverage
-    return entry - move if side == "short" else entry + move
-
-
-def _calc_sl_price(entry: float, leverage: int, sl_pct: float, side: str) -> float:
-    """entry + leverage move that gives -sl_pct PnL on margin."""
-    move = entry * sl_pct / 100 / leverage
-    return entry + move if side == "short" else entry - move
-
-
-def _max_leverage_by_vol(vol_24h_usdt: float) -> int:
-    """Cap leverage based on 24h quote volume as liquidity/volatility proxy."""
-    if vol_24h_usdt >= 500_000_000:
-        return 20
-    if vol_24h_usdt >= 50_000_000:
-        return 10
-    return 5
-
-
-class MinOrderUpgradeNeeded(Exception):
-    def __init__(self, min_margin: float, leverage: int):
-        self.min_margin = min_margin
-        self.leverage = leverage
-        super().__init__(f"min_margin={min_margin:.4f} lev={leverage}")
-
-
-async def execute_open(client, app, symbol: str, side: str,
-                       margin: float, leverage: int | None = None,
-                       tp_pct: float = 500, sl_pct: float = 500,
-                       interactive: bool = False) -> dict:
-    """Open a futures position with TP/SL and register re-entry.
-
-    interactive=True: raises MinOrderUpgradeNeeded instead of silently upgrading margin.
-    """
-    config = app.bot_data.get("config")
-    log_event(
-        "decisions", "execute_open_start", symbol=symbol, side=side,
-        requested_margin=margin, requested_leverage=leverage,
-        tp_pct=tp_pct, sl_pct=sl_pct, interactive=interactive,
-    )
-    await snapshot_exchange_state(
-        client, "before_open", symbol=symbol, requested_side=side,
-        requested_margin=margin, requested_leverage=leverage,
-    )
-
-    user_set = leverage is not None and leverage > 0
-
-    # Resolve max leverage if not given
-    if not user_set:
-        try:
-            leverage = await client.get_max_leverage(symbol)
-        except Exception:
-            leverage = 25
-
-    # Cap leverage by 24h volume only when leverage was NOT explicitly set by user
-    if not user_set:
-        try:
-            ticker = await client.get_ticker(symbol)
-            vol_24h = float(ticker.get("quoteVolume") or ticker.get("baseVolume") or 0)
-            vol_cap = _max_leverage_by_vol(vol_24h)
-            if leverage > vol_cap:
-                logger.info("Leverage capped %s: %d→%d (vol_24h=$%.0f)", symbol, leverage, vol_cap, vol_24h)
-                leverage = vol_cap
-        except Exception:
-            pass
-
-    # BTC trend warning for manual shorts (non-blocking)
-    if side in ("sell", "short"):
-        try:
-            from bot.jobs.main import _get_btc_rsi_4h
-            btc_rsi = await _get_btc_rsi_4h(client)
-            btc_threshold = float(getattr(config, "btc_rsi_filter", 65.0)) if config else 65.0
-            if btc_rsi is not None and btc_rsi > btc_threshold:
-                from bot.jobs.main import _notify_all
-                await _notify_all(app,
-                    f"⚠️ BTC RSI 4h = `{btc_rsi:.0f}` > `{btc_threshold:.0f}` — бычий рынок\n"
-                    f"Шорт открывается, но осторожно")
-        except Exception:
-            pass
-
-    # Enforce minimum order notional AFTER leverage caps (MEXC error 7008).
-    # MEXC enforces $5 minimum notional; many symbols lack limits.cost.min in market data,
-    # so get_min_order_usdt falls back to 1-contract (too small). Floor at $5.
-    _MEXC_MIN_NOTIONAL = 5.0
-    _min_cache: dict = app.bot_data.setdefault("_min_order_cache", {})
-    _cached_notional = _min_cache.get(symbol, 0)
-    if _cached_notional > 0:
-        effective_notional = max(_cached_notional, _MEXC_MIN_NOTIONAL)
-        _min_margin = effective_notional / max(leverage, 1) * 1.05
-    else:
-        try:
-            _min_margin_api = await client.get_min_order_usdt(symbol, leverage)
-            raw_notional = _min_margin_api * leverage if _min_margin_api > 0 else 0.0
-        except Exception:
-            raw_notional = 0.0
-        effective_notional = max(raw_notional, _MEXC_MIN_NOTIONAL)
-        _min_cache[symbol] = effective_notional
-        _min_margin = effective_notional / max(leverage, 1) * 1.05
-
-    if _min_margin > 0 and margin < _min_margin - 0.0001:
-        if interactive:
-            raise MinOrderUpgradeNeeded(_min_margin, leverage)
-        logger.info("execute_open %s: margin upgraded $%.4f→$%.4f (×%d)", symbol, margin, _min_margin, leverage)
-        margin = _min_margin
-
-    order = await client.place_futures_order(symbol, side, margin, leverage)
-    actual_lev = order.get("leverage", leverage) or leverage
-    log_event("decisions", "execute_open_order_result", symbol=symbol, order=order)
-
-    # Wait for MEXC to settle the position
-    await asyncio.sleep(2)
-    pos = await client.get_position(symbol)
-    await snapshot_exchange_state(client, "after_open_order", symbol=symbol, order=order)
-
-    tp_price = sl_price = None
-    entry = order.get("price", 0)
-    liq = 0
-
-    if pos:
-        entry = pos["entry_price"]
-        liq = pos.get("liquidation_price", 0)
-        pos_side = pos["side"]
-        tp_price = _calc_tp_price(entry, actual_lev, tp_pct, pos_side)
-        sl_price = _calc_sl_price(entry, actual_lev, sl_pct, pos_side)
-        try:
-            await snapshot_exchange_state(
-                client, "before_tpsl_set", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price,
-            )
-            await client.cancel_tp_sl_orders(symbol)
-            await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price)
-            await snapshot_exchange_state(
-                client, "after_tpsl_set", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price,
-            )
-        except Exception as e:
-            log_event(
-                "errors", "execute_open_tpsl_failed", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price, error=str(e),
-            )
-            logger.warning("TP/SL set failed for %s: %s", symbol, e)
-
-    # Persist in DB
-    from bot import db as db_mod
-    fsym = client.futures_symbol(symbol)
-    max_avg_count = int(getattr(config, "max_averaging_count", 100)) if config else 100
-    avg_amount = float(getattr(config, "averaging_amount", 0.5)) if config else 0.5
-    budget = max_avg_count * avg_amount
-    db_mod.upsert_position(
-        symbol=fsym, side=side if side in ("long", "short") else ("short" if side == "sell" else "long"),
-        entry_price=entry, leverage=actual_lev, margin=margin,
-        tp_pct=tp_pct, sl_pct=sl_pct, budget=budget,
-    )
-
-    # Log to stats
-    db_mod.log_trade(fsym, "open", amount=margin, note=f"lev={actual_lev}")
-
-    # Full position history
-    hist_side = "short" if side == "sell" else "long"
-    db_mod.open_position_history(
-        fsym, hist_side, actual_lev, entry, margin,
-        tp_pct=tp_pct, sl_pct=sl_pct,
-        avg_threshold=float(getattr(config, "averaging_threshold", -100)) if config else -100,
-        avg_amount=float(getattr(config, "averaging_amount", 0)) if config else 0,
-        avg_budget=budget,
-        avg_max_count=max_avg_count,
-        avg_interval=int(getattr(config, "averaging_interval", 0)) if config else 0,
-    )
-
-    # Register re-entry (skip if disabled)
-    max_cycles = int(getattr(config, "max_reentry_cycles", 3)) if config else 3
-    if max_cycles == 0:
-        db_mod.delete_reentry(fsym)
-    else:
-        db_mod.upsert_reentry(
-            symbol=fsym,
-            side=side,
-            margin=margin,
-            leverage=actual_lev,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            max_cycles=max_cycles,
-            cycle_count=0,
-        )
-
-    # Store tp_sl_pcts for averaging recalc
-    tp_sl_pcts = app.bot_data.setdefault("tp_sl_pcts", {})
-    tp_sl_pcts[fsym] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
-    log_event(
-        "decisions", "execute_open_persisted", symbol=fsym,
-        entry_price=entry, leverage=actual_lev, margin=margin,
-        tp_price=tp_price, sl_price=sl_price, tp_pct=tp_pct, sl_pct=sl_pct,
-    )
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "margin": margin,
-        "leverage": actual_lev,
-        "entry_price": entry,
-        "tp_price": tp_price,
-        "sl_price": sl_price,
-        "liquidation_price": liq,
-        "order_id": order.get("id"),
-        "tp_pct": tp_pct,
-        "sl_pct": sl_pct,
-    }
+from bot.services.tpsl import calc_tp_price as _calc_tp_price
+from bot.services.tpsl import calc_sl_price as _calc_sl_price
+from bot.services.sizing import max_leverage_by_vol as _max_leverage_by_vol
+# Canonical trading operations now live in the service layer; re-exported here
+# so existing import sites (jobs, scan) keep working unchanged.
+from bot.services.trading import execute_open, MinOrderUpgradeNeeded, close_position as _svc_close
 
 
 async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -310,21 +107,9 @@ async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             client, context.application, sym, "sell", margin,
             leverage=leverage, tp_pct=tp_pct, sl_pct=sl_pct,
         )
-        actual_margin = result.get("margin", margin)
-        lines = [
-            f"*{coin}* 🔻×{result['leverage']} `${actual_margin:.2f}`",
-            f"▶ Entry: `{result['entry_price']:.6g}`",
-        ]
-        if actual_margin > margin + 0.001:
-            lines.append(f"⚠️ Маржа поднята до мин MEXC: `${margin:.2f}` → `${actual_margin:.2f}`")
-        if result.get("liquidation_price"):
-            lines.append(f"💀 Liq: `{result['liquidation_price']:.6g}`")
-        if result.get("tp_price"):
-            lines.append(f"✅ TP: `{result['tp_price']:.6g}` (+{tp_pct:.0f}%)")
-        if result.get("sl_price"):
-            lines.append(f"🛑 SL: `-{sl_pct:.0f}%` (`{result['sl_price']:.6g}`)")
-        lines.append(_funding_line(rate, result["leverage"]))
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        from bot.services.trading import format_open_result
+        msg = format_open_result(result, margin, _funding_line(rate, result["leverage"]))
+        await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -356,49 +141,9 @@ async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _do_close(client, context, symbol: str, keep_reentry: bool):
-    """Shared close logic. Returns (coin, pnl, cycles_left_or_none)."""
-    from bot import db as db_mod
-    pos = await client.get_position(symbol)
-    pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
-    margin = float(pos.get("margin", 0)) if pos else 0.0
-    exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
-
-    if keep_reentry:
-        # Ensure reentry record exists before closing DB position
-        re_rec = db_mod.get_reentry(symbol)
-        if not re_rec:
-            db_rec = db_mod.get_open_position(symbol)
-            config = context.bot_data.get("config")
-            max_cycles = int(getattr(config, "max_reentry_cycles", 3)) if config else 3
-            if db_rec and max_cycles > 0:
-                db_mod.upsert_reentry(
-                    symbol=symbol,
-                    side="sell" if db_rec.get("side") == "short" else "buy",
-                    margin=margin or float(db_rec.get("margin", 0.2)),
-                    leverage=int(db_rec.get("leverage", 1)),
-                    tp_pct=float(db_rec.get("tp_pct", 500)),
-                    sl_pct=float(db_rec.get("sl_pct", 500)),
-                    max_cycles=max_cycles,
-                )
-
-    await client.cancel_tp_sl_orders(symbol)
-    await client.close_futures_position(symbol)
-    db_mod.close_position(symbol)
-    note = "manual_reentry" if keep_reentry else "manual"
-    db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note=note)
-    db_mod.close_position_history(symbol, exit_price, pnl, note)
-
-    if not keep_reentry:
-        db_mod.delete_reentry(symbol)
-        return pnl, None
-
-    re_rec = db_mod.get_reentry(symbol)
-    cycles_left = 0
-    if re_rec:
-        mc = re_rec.get("max_cycles") or 0
-        cc = re_rec.get("cycle_count") or 0
-        cycles_left = max(0, int(mc) - int(cc))
-    return pnl, cycles_left
+    """Thin wrapper over services.trading.close_position. Returns (pnl, cycles_left)."""
+    res = await _svc_close(client, context.bot_data, symbol, keep_reentry=keep_reentry)
+    return res["pnl"], res["cycles_left"]
 
 
 async def close_reentry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1084,6 +829,18 @@ async def setkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             setattr(config, key, value)
     except Exception:
         setattr(config, key, value)
+
+    # Exchange provider / credentials changed → rebuild the client so changes
+    # take effect without a restart (legacy code never re-instantiated it).
+    if key in ("mexc_api_key", "mexc_secret", "binance_api_key", "binance_secret",
+               "exchange_provider", "binance_testnet"):
+        try:
+            from bot.infra.exchange import rebuild_client
+            await rebuild_client(context.application, config)
+            await update.message.reply_text("🔑 Биржевой клиент пересоздан с новыми настройками.")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Ключ сохранён, но клиент не пересоздан: {e}")
+
     await update.message.reply_text(f"✅ Сохранено: `{key}` = `{value}`", parse_mode="Markdown")
 
 

@@ -38,17 +38,28 @@ def setup():
     user_ids = input("Allowed Telegram user IDs (comma-separated): ").strip()
     db_mod.set_config("allowed_user_ids", user_ids)
 
-    mexc_key = input("MEXC API key: ").strip()
-    db_mod.set_config("mexc_api_key", mexc_key)
+    provider = input("Exchange provider [mexc / binance_testnet] (default mexc): ").strip().lower()
+    if provider not in ("mexc", "binance_testnet", "binance"):
+        provider = "mexc"
+    db_mod.set_config("exchange_provider", provider)
 
-    mexc_secret = input("MEXC API secret: ").strip()
-    db_mod.set_config("mexc_secret", mexc_secret)
+    if provider in ("binance_testnet", "binance"):
+        db_mod.set_config("binance_testnet", "true" if provider == "binance_testnet" else "false")
+        binance_key = input("Binance API key (testnet): ").strip()
+        db_mod.set_config("binance_api_key", binance_key)
+        binance_secret = input("Binance API secret (testnet): ").strip()
+        db_mod.set_config("binance_secret", binance_secret)
+    else:
+        mexc_key = input("MEXC API key: ").strip()
+        db_mod.set_config("mexc_api_key", mexc_key)
+        mexc_secret = input("MEXC API secret: ").strip()
+        db_mod.set_config("mexc_secret", mexc_secret)
 
     or_key = input("OpenRouter API key (or leave blank): ").strip()
     if or_key:
         db_mod.set_config("openrouter_api_key", or_key)
 
-    print("\nSetup complete. Run: python start.py")
+    print(f"\nSetup complete (provider={provider}). Run: python start.py")
 
 
 def run():

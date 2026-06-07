@@ -9,20 +9,21 @@ from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks, extract_s
 
 logger = logging.getLogger(__name__)
 
+from bot.services import sizing as _sizing
+
 # MEXC enforces minimum 5 USDT notional by default (code 7008).
 # Cached per-symbol minimums override this (populated from actual errors).
-_MEXC_DEFAULT_MIN_NOTIONAL = 5.0
+_MEXC_DEFAULT_MIN_NOTIONAL = _sizing.MEXC_DEFAULT_MIN_NOTIONAL
 
 
 def _get_min_notional(symbol: str, bot_data: dict) -> float:
     """Minimum USDT notional (position value) for an order on this symbol."""
-    cache = bot_data.get("_min_order_cache", {})
-    return cache.get(symbol, _MEXC_DEFAULT_MIN_NOTIONAL)
+    return _sizing.get_min_notional(symbol, bot_data.get("_min_order_cache", {}))
 
 
 def _get_min_avg_margin(symbol: str, leverage: int, bot_data: dict) -> float:
     """Actual margin to use for averaging (with 5% buffer for contract rounding)."""
-    return _get_min_notional(symbol, bot_data) / max(leverage, 1) * 1.05
+    return _sizing.get_min_avg_margin(symbol, leverage, bot_data.get("_min_order_cache", {}))
 
 
 async def _get_live_min_avg_margin(client, symbol: str, leverage: int, bot_data: dict) -> float:
@@ -40,44 +41,15 @@ async def _get_live_min_avg_margin(client, symbol: str, leverage: int, bot_data:
 
 def _can_avg_at_configured(symbol: str, leverage: int, averaging_amount: float, bot_data: dict) -> bool:
     """True if averaging_amount * leverage covers the MEXC minimum notional."""
-    return averaging_amount * max(leverage, 1) >= _get_min_notional(symbol, bot_data)
+    return _sizing.can_avg_at_configured(
+        symbol, leverage, averaging_amount, bot_data.get("_min_order_cache", {})
+    )
 
 
 def _check_budget(free_balance: float, margin: float, config,
                   eff_avg_amount: float | None = None) -> dict:
-    """
-    Check whether free_balance covers the full position risk budget.
-    Formula (same as auto_scan_job):
-        base_budget = margin + averaging_budget
-        full_budget = base_budget * (sl_pct / 100)   -- unless profit_lock is set
-    This is the worst-case capital at risk per position.
-    """
-    avg_amount = eff_avg_amount or float(getattr(config, "averaging_amount", 0.10))
-    avg_budget = float(getattr(config, "averaging_budget", 5.00))
-    sl_pct = float(getattr(config, "sl_pct", 500))
-    profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
-
-    base_budget = margin + avg_budget
-    if profit_lock_trigger > 0:
-        # Profit-lock moves SL to breakeven — max loss is just the margin invested
-        full_budget = base_budget
-    else:
-        full_budget = base_budget * (sl_pct / 100.0)
-
-    max_steps = int(avg_budget / avg_amount) if avg_amount > 0 else 0
-    # How many full positions the current balance can support
-    positions_possible = int(free_balance / full_budget) if full_budget > 0 else 0
-
-    return {
-        "can_open": free_balance >= margin,
-        "can_full_budget": free_balance >= full_budget,
-        "full_budget": full_budget,
-        "base_budget": base_budget,
-        "positions_possible": positions_possible,
-        "max_steps": max_steps,
-        "sl_pct": sl_pct,
-        "free": free_balance,
-    }
+    """Worst-case capital-at-risk budget check (delegates to services.sizing)."""
+    return _sizing.check_budget(free_balance, margin, config, eff_avg_amount)
 
 
 async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

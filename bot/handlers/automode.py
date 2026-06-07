@@ -5,7 +5,7 @@ from telegram.ext import ContextTypes
 
 from bot import db as db_mod
 from bot.config import Config
-from bot.jobs.main import reschedule_auto_scan, SCHEDULER
+from bot.jobs.main import reschedule_auto_scan, _get_manager
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +31,10 @@ def _status_text(config: Config) -> str:
         f"Интервал: каждые *{interval} мин*",
         f"Макс. позиций: *{maxpos}* | Макс. риск: *{maxrisk}/10*",
     ]
-    job = SCHEDULER.get_job("auto_scan")
-    if job and job.next_run_time:
-        local_next = job.next_run_time.astimezone(_dt.timezone.utc).astimezone()
+    mgr = _get_manager()
+    eng = mgr.get("auto_scan") if mgr else None
+    if eng and eng.last_run_ts:
+        local_next = _dt.datetime.fromtimestamp(eng.next_run_ts())
         lines.append(f"Следующий скан: *{local_next.strftime('%H:%M')}*")
     lines.append("\n" + _HELP)
     return "\n".join(lines)

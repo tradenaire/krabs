@@ -6,8 +6,15 @@ class Config:
     telegram_token: str = ""
     allowed_user_ids: list[int] = field(default_factory=list)
 
+    # Exchange selection: "mexc" (live) or "binance_testnet" (real testnet via ccxt sandbox)
+    exchange_provider: str = "mexc"
+
     mexc_api_key: str = ""
     mexc_secret: str = ""
+
+    binance_api_key: str = ""
+    binance_secret: str = ""
+    binance_testnet: bool = True
 
     openrouter_api_key: str = ""
     openrouter_model: str = "x-ai/grok-4-fast:online"
@@ -43,6 +50,9 @@ class Config:
 
     # Paper trading
     paper_enabled: bool = True
+
+    # Run the heavy technical scan in a separate worker process (hybrid model)
+    scanner_worker_enabled: bool = True
 
     @classmethod
     def from_dict(cls, d: dict) -> "Config":

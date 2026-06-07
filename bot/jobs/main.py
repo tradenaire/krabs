@@ -33,248 +33,31 @@ _position_lock: asyncio.Lock | None = None
 
 
 def _lock() -> asyncio.Lock:
+    # Legacy global lock kept for backward-compat; engines/services use the
+    # per-symbol LockManager in AppState instead (see _symbol_lock).
     global _position_lock
     if _position_lock is None:
         _position_lock = asyncio.Lock()
     return _position_lock
 
 
-def _calc_tp_price(entry: float, leverage: int, tp_pct: float, side: str) -> float:
-    move = entry * tp_pct / 100 / leverage
-    return entry - move if side == "short" else entry + move
+def _symbol_lock(app, symbol: str):
+    """Per-symbol order lock: parallel across symbols, serial per symbol."""
+    from bot.infra.state import get_state
+    return get_state(app).locks.symbol(symbol)
 
 
-def _calc_sl_price(entry: float, leverage: int, sl_pct: float, side: str) -> float:
-    move = entry * sl_pct / 100 / leverage
-    return entry + move if side == "short" else entry - move
+from bot.services.tpsl import calc_tp_price as _calc_tp_price
+from bot.services.tpsl import calc_sl_price as _calc_sl_price
+from bot.services.tpsl import trigger_price_matches as _trigger_price_matches
+from bot.services.tpsl import verify_active_sl as _verify_active_sl
+from bot.services.tpsl import set_tp_sl_verified as _set_tp_sl_verified
 
 
-def _trigger_price_matches(want: float, got: float, rel_tol: float = 0.003) -> bool:
-    if want <= 0 or got <= 0:
-        return False
-    return abs(got - want) / want <= rel_tol
-
-
-async def _verify_active_sl(client, symbol: str, side: str, sl_price: float) -> None:
-    sl_type = 2 if side == "long" else 1
-    orders = await client.get_tp_sl_orders(symbol)
-    for order in orders:
-        if int(order.get("trigger_type", 0) or 0) != sl_type:
-            continue
-        if _trigger_price_matches(sl_price, float(order.get("trigger_price", 0) or 0)):
-            return
-    raise RuntimeError(f"active SL not found at {sl_price:.6g}")
-
-
-async def _set_tp_sl_verified(client, symbol: str, side: str,
-                              tp_price: float | None, sl_price: float,
-                              pos_data: dict, **kwargs) -> None:
-    results = await client.set_tp_sl(
-        symbol, tp_price=tp_price, sl_price=sl_price, pos_data=pos_data, **kwargs
-    )
-    for result in results or []:
-        if result.get("error"):
-            raise RuntimeError(result["error"])
-        body = result.get("result")
-        if isinstance(body, dict) and body.get("success") is False:
-            raise RuntimeError(str(body.get("message", body)))
-    await _verify_active_sl(client, symbol, side, sl_price)
-
-
-# ── Live positions monitor (pinned message, 3s) ───────────────────
-
-def _format_live_text(bal: dict, positions: list[dict],
-                      tp_sl_pcts: dict | None = None,
-                      lev_cache: dict | None = None) -> str:
-    from datetime import datetime
-    from bot.fmt import fmt_pct, fmt_usd
-    free = float(bal.get("free", {}).get("USDT", 0) or 0)
-    total = float(bal.get("total", {}).get("USDT", 0) or 0)
-    ts = datetime.now().strftime("%H:%M:%S")
-
-    lines = [f"📊 *Монитор* `{ts}`",
-             f"Баланс: `${total:.4f}` | Свободно: `${free:.4f}`"]
-
-    if not positions:
-        lines.append("_Нет открытых позиций_")
-        return "\n".join(lines)
-
-    total_pnl = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
-    lines.append(f"PnL итого: `{fmt_usd(total_pnl)}`")
-    lines.append("")
-
-    from bot import db as db_mod
-    for i, pos in enumerate(positions, 1):
-        symbol = pos["symbol"]
-        coin = symbol.split("/")[0]
-        side = pos.get("side", "")
-        lev = int(pos.get("leverage", 1))
-        pct = float(pos.get("percentage", 0))
-        pnl = float(pos.get("unrealized_pnl", 0))
-        entry = float(pos.get("entry_price", 0))
-        mark = float(pos.get("mark_price", 0))
-        liq = float(pos.get("liquidation_price", 0))
-        margin = float(pos.get("margin", 0))
-
-        side_e = "🔻" if side == "short" else "🟩"
-        pct_s = fmt_pct(pct)
-        pnl_s = fmt_usd(pnl)
-
-        health = ""
-        if liq > 0 and mark > 0:
-            dist = abs(mark - liq) / mark * 100
-            if dist < 3:
-                health = " 💀"
-            elif dist < 10:
-                health = " ⚠️"
-        if pct >= 200:
-            health = " 🔥"
-
-        pos_line = (
-            f"{i}. {side_e}`{coin}`×{lev}{health}\n"
-            f"   PnL: `{pct_s}` ({pnl_s}) | Entry: `{entry:.6g}` → `{mark:.6g}`\n"
-            f"   Маржа: `${margin:.3f}`"
-        )
-        if liq > 0:
-            pos_line += f" | Liq: `{liq:.6g}`"
-
-        # TP/SL %
-        stored = (tp_sl_pcts or {}).get(symbol, {})
-        db_rec = db_mod.get_open_position(symbol)
-        tp_pct = stored.get("tp_pct") or (db_rec.get("tp_pct") if db_rec else None)
-        sl_pct = stored.get("sl_pct") or (db_rec.get("sl_pct") if db_rec else None)
-        if tp_pct or sl_pct:
-            tp_s = f"+{tp_pct:.0f}%" if tp_pct else "—"
-            sl_s = f"-{sl_pct:.0f}%" if sl_pct else "—"
-            pos_line += f"\n   TP `{tp_s}` SL `{sl_s}`"
-
-        # Avg and re-entry progress
-        if db_rec:
-            avg_count = db_rec.get("averaging_count", 0)
-            total_invested = db_rec.get("total_invested", 0)
-            pos_line += f"\n   Докупок: `{avg_count}/{max_count}` | вложено `${total_invested:.2f}`"
-        re_rec = db_mod.get_reentry(symbol)
-        if re_rec:
-            pos_line += f"\n   Перезаходов: `{re_rec.get('cycle_count', 0)}/{re_rec.get('max_cycles', 3)}`"
-
-        # Max leverage and position limit (from cache)
-        cached_lev = (lev_cache or {}).get(symbol, {})
-        if cached_lev:
-            max_lev = cached_lev.get("max_lev")
-            max_usdt = cached_lev.get("max_usdt")
-            lev_line = f"Макс ×{max_lev}" if max_lev else ""
-            if max_usdt:
-                lev_line += f" | Лимит ~${max_usdt:,.0f}"
-            if lev_line:
-                pos_line += f"\n   {lev_line}"
-
-        lines.append(pos_line)
-
-    return "\n".join(lines)
-
-
-def _monitor_keyboard(positions: list[dict]) -> InlineKeyboardMarkup:
-    from bot.fmt import fmt_pct, fmt_usd
-    rows = []
-    for pos in positions:
-        coin = pos["symbol"].split("/")[0]
-        pnl = float(pos.get("unrealized_pnl", 0))
-        pct = float(pos.get("percentage", 0))
-        icon = "✅" if pnl >= 0 else "🔻"
-        label = f"❌ {icon} {coin}  {fmt_pct(pct)}  {fmt_usd(pnl)}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"mon_close_{pos['symbol']}")])
-    rows.append([InlineKeyboardButton("💰 Баланс", callback_data="balance_futures")])
-    rows.append([InlineKeyboardButton("📈 Статистика", callback_data="mon_stats")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def positions_monitor_job(app):
-    """Обновляет запиненное сообщение с позициями каждые 3 секунды."""
-    client = app.bot_data.get("exchange")
-    config = app.bot_data.get("config")
-    if not client or not config:
-        return
-
-    live_msgs: dict = app.bot_data.setdefault("_live_msgs", {})
-    live_texts: dict = app.bot_data.setdefault("_live_texts", {})
-
-    try:
-        bal = await client.get_futures_balance()
-        positions = await client.get_positions()
-    except Exception as e:
-        logger.debug("monitor: fetch failed: %s", e)
-        return
-
-    # Cache max_lev and position limit per symbol (refresh every 5 min)
-    lev_cache: dict = app.bot_data.setdefault("_lev_cache", {})
-    for pos in positions:
-        sym = pos["symbol"]
-        cached = lev_cache.get(sym)
-        if not cached or time.time() - cached.get("ts", 0) > 300:
-            try:
-                lev = int(pos.get("leverage", 1))
-                max_lev = await client.get_max_leverage(sym)
-                max_usdt = await client.get_position_limit_usdt(sym, lev)
-                lev_cache[sym] = {"max_lev": max_lev, "max_usdt": max_usdt, "ts": time.time()}
-            except Exception:
-                pass
-
-    tp_sl_pcts: dict = app.bot_data.get("tp_sl_pcts", {})
-    text = _format_live_text(bal, positions, tp_sl_pcts, lev_cache)
-    has_positions = bool(positions)
-    kb = _monitor_keyboard(positions) if has_positions else None
-
-    for uid in (config.allowed_user_ids or []):
-        last_text = live_texts.get(uid, "")
-        if text == last_text:
-            continue
-
-        live_texts[uid] = text
-        msg_id = live_msgs.get(uid)
-
-        if msg_id:
-            try:
-                await app.bot.edit_message_text(
-                    chat_id=uid, message_id=msg_id, text=text,
-                    parse_mode="Markdown", reply_markup=kb
-                )
-            except Exception as e:
-                err = str(e)
-                if "message to edit not found" in err or "MESSAGE_ID_INVALID" in err:
-                    live_msgs.pop(uid, None)
-                    msg_id = None
-                elif "Message is not modified" in err:
-                    pass
-                else:
-                    logger.debug("monitor edit %s: %s", uid, err)
-
-        if not msg_id:
-            if not has_positions:
-                continue
-            try:
-                sent = await app.bot.send_message(
-                    chat_id=uid, text=text, parse_mode="Markdown", reply_markup=kb
-                )
-                live_msgs[uid] = sent.message_id
-                try:
-                    await app.bot.pin_chat_message(
-                        chat_id=uid, message_id=sent.message_id,
-                        disable_notification=True
-                    )
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.debug("monitor send %s: %s", uid, e)
-
-        # Unpin + delete when no positions
-        if not has_positions and msg_id:
-            try:
-                await app.bot.unpin_chat_message(chat_id=uid, message_id=msg_id)
-                await app.bot.delete_message(chat_id=uid, message_id=msg_id)
-            except Exception:
-                pass
-            live_msgs.pop(uid, None)
-            live_texts.pop(uid, None)
+# NOTE: the old live-monitor (positions_monitor_job + _format_live_text +
+# _monitor_keyboard) was dead code — never registered in the scheduler — and
+# _format_live_text referenced an undefined ``max_count``. Removed during the
+# engine refactor. The pinned balance message is handled by PinEngine instead.
 
 
 # ── Positions cache job ───────────────────────────────────────────
@@ -326,7 +109,7 @@ async def averaging_job(app):
     except Exception:
         pass
     profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
-    profit_lock_sl_pct = float(getattr(config, "averaging_profit_lock_sl_pct", 0))
+    # (averaging_profit_lock_sl_pct is applied elsewhere; not needed here)
 
     # Skip averaging during emergency cooldown
     if time.time() < app.bot_data.get("_avg_disabled_until", 0):
@@ -357,46 +140,8 @@ async def averaging_job(app):
     except Exception:
         free_balance = app.bot_data.get("_bal_cache", 0.0)
 
-    # ── Margin emergency check (раз в 10 сек) ────────────────────────
-    _emerg_pct = float(getattr(config, "margin_emergency_threshold_pct", 0))
-    if _emerg_pct > 0 and time.time() - app.bot_data.get("_emerg_last_check", 0) >= 10:
-        app.bot_data["_emerg_last_check"] = time.time()
-        try:
-            _full_bal = await client.get_futures_balance()
-            _raw_bal = _full_bal.get("_raw", {})
-            _free = float(_full_bal.get("free", {}).get("USDT", 0) or 0)
-            _avail = float(_raw_bal.get("availableOpen", _raw_bal.get("availableBalance", _free)) or _free)
-            if _free > 0 and _avail < (_emerg_pct / 100.0) * _free:
-                # Откусить 5% контрактов от каждой позиции равномерно
-                _TRIM_PCT = 0.05
-                import math as _math
-                logger.warning("Margin emergency: avail=$%.2f < %.0f%% of free=$%.2f, trimming %.0f%% of all positions",
-                               _avail, _emerg_pct, _free, _TRIM_PCT * 100)
-                _trimmed = []
-                for _ep in positions:
-                    _sym = _ep["symbol"]
-                    _coin = _sym.split("/")[0]
-                    _total_c = int(round(float(_ep.get("contracts", 0))))
-                    _close_c = max(1, _math.floor(_total_c * _TRIM_PCT))
-                    try:
-                        await client.partial_close_futures_position(_sym, _close_c)
-                        _pnl_ep = float(_ep.get("unrealized_pnl", 0))
-                        _margin_ep = float(_ep.get("margin", 0))
-                        _freed_est = _margin_ep * _TRIM_PCT
-                        _trimmed.append(f"`{_coin}` -{_close_c}к (~`${_freed_est:.2f}`)")
-                        logger.info("margin_emergency: trimmed %s by %d contracts", _sym, _close_c)
-                    except Exception as _ce:
-                        logger.error("margin_emergency trim %s: %s", _sym, _ce)
-                if _trimmed:
-                    await _notify_all(app,
-                        f"✂️ *Сократил позиции* (avail `${_avail:.2f}` < `{_emerg_pct:.0f}%` от `${_free:.2f}`)\n"
-                        + "\n".join(_trimmed))
-                app.bot_data["_avg_disabled_until"] = time.time() + 300
-                await _notify_all(app, "⏸ *Докупки приостановлены на 5 минут* (аварийное закрытие)")
-                return
-        except Exception as _be:
-            logger.warning("margin_emergency balance check: %s", _be)
-    # ─────────────────────────────────────────────────────────────────
+    # Margin emergency now runs in its own EmergencyEngine (bot/engines/emergency.py).
+    # It sets _avg_disabled_until, which is honored by the early-exit check above.
 
     db_positions = {p["symbol"]: p for p in db_mod.get_open_positions()}
     synth_store = app.bot_data.setdefault("_avg_synth", {})
@@ -583,6 +328,7 @@ async def averaging_job(app):
         if avg_count >= max_count:
             if symbol not in notified_exhausted:
                 notified_exhausted.add(symbol)
+                _save_exhausted(notified_exhausted)
                 coin = symbol.split("/")[0]
                 await _notify_all(app,
                     f"🚫 *Докупки закончились* `{coin}`\n"
@@ -629,7 +375,7 @@ async def averaging_job(app):
         _avg_ts[symbol] = time.time()
 
         order_result: dict | None = None
-        async with _lock():
+        async with _symbol_lock(app, symbol):
             try:
                 order_result = await client.place_futures_order(symbol, avg_side, actual_amount, avg_lev,
                                                                 margin_mode=avg_mm)
@@ -646,6 +392,7 @@ async def averaging_job(app):
                     logger.error("Averaging order FAILED for %s: %s", symbol, e)
                     if symbol not in notified_exhausted:
                         notified_exhausted.add(symbol)
+                        _save_exhausted(notified_exhausted)
                         coin = symbol.split("/")[0]
                         await _notify_all(app,
                             f"🚫 *Докупки закончились* `{coin}`\n"
@@ -1273,11 +1020,22 @@ async def auto_scan_job(app):
     from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks,
                                 DEFAULT_MODEL, FALLBACK_MODEL)
 
-    try:
-        local_results, _ = await scan_overbought(client, 65.0, 10.0)
-    except Exception as e:
-        logger.warning("AutoScan: local scan failed: %s", e)
-        local_results = []
+    # Heavy technical scan: prefer the separate worker process; fall back to
+    # in-process if the worker is unavailable.
+    worker = app.bot_data.get("scanner_worker")
+    local_results = []
+    if worker is not None and worker.alive:
+        try:
+            local_results, _ = await worker.scan(65.0, 10.0)
+        except Exception as e:
+            logger.warning("AutoScan: worker scan failed (%s); falling back in-process", e)
+            worker = None
+    if not local_results and (worker is None or not getattr(worker, "alive", False)):
+        try:
+            local_results, _ = await scan_overbought(client, 65.0, 10.0)
+        except Exception as e:
+            logger.warning("AutoScan: local scan failed: %s", e)
+            local_results = []
 
     model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
     ai_result = await deep_short_analysis(local_results, api_key, model=model, n=ask_n)
@@ -1463,123 +1221,85 @@ async def daily_report_job(app):
 
 # ── Scheduler setup ───────────────────────────────────────────────
 
+# Engine manager singleton (set in setup_scheduler). Engines replace the old
+# APScheduler interval jobs with independent async loops.
+_MANAGER = None
+
+
+def _get_manager(app=None):
+    global _MANAGER
+    if app is not None:
+        mgr = app.bot_data.get("engine_manager")
+        if mgr is not None:
+            return mgr
+    return _MANAGER
+
+
 def reschedule_averaging(app, interval: int):
-    """Hot-update averaging job interval without restarting the bot."""
-    from apscheduler.triggers.interval import IntervalTrigger
-    SCHEDULER.reschedule_job(
-        "averaging",
-        trigger=IntervalTrigger(seconds=interval),
-    )
-    logger.info("averaging_job rescheduled to every %ds", interval)
+    """Hot-update averaging engine interval without restarting the bot."""
+    mgr = _get_manager(app)
+    if mgr and mgr.set_interval("averaging", interval):
+        logger.info("averaging engine rescheduled to every %ds", interval)
 
 
 def reschedule_auto_scan(interval_min: int):
-    """Hot-update auto_scan_job interval without restarting the bot."""
-    from apscheduler.triggers.interval import IntervalTrigger
-    SCHEDULER.reschedule_job(
-        "auto_scan",
-        trigger=IntervalTrigger(minutes=interval_min),
-    )
-    logger.info("auto_scan_job rescheduled to every %dm", interval_min)
+    """Hot-update auto_scan (scout) engine interval without restarting the bot."""
+    mgr = _get_manager()
+    if mgr and mgr.set_interval("auto_scan", interval_min * 60):
+        logger.info("auto_scan engine rescheduled to every %dm", interval_min)
 
 
-def setup_scheduler(app):
-    from apscheduler.triggers.interval import IntervalTrigger
+async def setup_scheduler(app):
+    """Build and start the EngineManager (replaces APScheduler)."""
+    global _MANAGER
+    from bot.engines.base import EngineManager
+    from bot.engines.monitor import MonitorEngine, BalanceAlertEngine
+    from bot.engines.averaging import AveragingEngine
+    from bot.engines.emergency import EmergencyEngine
+    from bot.engines.reentry import ReentryEngine
+    from bot.engines.tpsl import TpSlEngine
+    from bot.engines.scout import ScoutEngine
+    from bot.engines.reporting import ReportingEngine
+    from bot.engines.paper import PaperScanEngine, PaperSignalEngine, PaperUpdateEngine
 
     config = app.bot_data.get("config")
     avg_interval = int(getattr(config, "averaging_interval", 3)) if config else 3
-
-    SCHEDULER.add_job(
-        positions_cache_job,
-        trigger=IntervalTrigger(seconds=3),
-        args=[app],
-        id="positions_cache",
-        max_instances=1,
-        replace_existing=True,
-    )
-    SCHEDULER.add_job(
-        averaging_job,
-        trigger=IntervalTrigger(seconds=avg_interval),
-        args=[app],
-        id="averaging",
-        max_instances=1,
-        replace_existing=True,
-    )
-    SCHEDULER.add_job(
-        reentry_job,
-        trigger=IntervalTrigger(seconds=30),
-        args=[app],
-        id="reentry",
-        max_instances=1,
-        replace_existing=True,
-    )
-    SCHEDULER.add_job(
-        tpsl_enforce_job,
-        trigger=IntervalTrigger(seconds=60),
-        args=[app],
-        id="tpsl_enforce",
-        max_instances=1,
-        replace_existing=True,
-    )
-
-    SCHEDULER.add_job(
-        balance_alert_job,
-        trigger=IntervalTrigger(minutes=3),
-        args=[app],
-        id="balance_alert",
-        max_instances=1,
-        replace_existing=True,
-    )
-
     auto_scan_interval = int(getattr(config, "auto_scan_interval_min", 30)) if config else 30
-    SCHEDULER.add_job(
-        auto_scan_job,
-        trigger=IntervalTrigger(minutes=auto_scan_interval),
-        args=[app],
-        id="auto_scan",
-        max_instances=1,
-        replace_existing=True,
-    )
 
-    from apscheduler.triggers.cron import CronTrigger
-    SCHEDULER.add_job(
-        daily_report_job,
-        trigger=CronTrigger(hour=23, minute=0),
-        args=[app],
-        id="daily_report",
-        max_instances=1,
-        replace_existing=True,
-    )
+    mgr = EngineManager(app)
+    mgr.add(MonitorEngine(app))
+    mgr.add(EmergencyEngine(app))
+    mgr.add(AveragingEngine(app, interval=avg_interval))
+    mgr.add(ReentryEngine(app))
+    mgr.add(TpSlEngine(app))
+    mgr.add(BalanceAlertEngine(app))
+    mgr.add(ScoutEngine(app, interval=auto_scan_interval * 60))
+    mgr.add(ReportingEngine(app))
+    mgr.add(PaperScanEngine(app))
+    mgr.add(PaperSignalEngine(app))
+    mgr.add(PaperUpdateEngine(app))
 
-    from bot.paper_trading import paper_scan_job, paper_update_job, paper_signal_job
-    SCHEDULER.add_job(
-        paper_scan_job,
-        trigger=IntervalTrigger(minutes=30),
-        args=[app],
-        id="paper_scan",
-        max_instances=1,
-        replace_existing=True,
-    )
-    SCHEDULER.add_job(
-        paper_signal_job,
-        trigger=IntervalTrigger(minutes=5),
-        args=[app],
-        id="paper_signal",
-        max_instances=1,
-        replace_existing=True,
-    )
-    SCHEDULER.add_job(
-        paper_update_job,
-        trigger=IntervalTrigger(seconds=20),
-        args=[app],
-        id="paper_update",
-        max_instances=1,
-        replace_existing=True,
-    )
+    # Pin auto-update: schedule the previously-unscheduled pin_update_job.
+    from bot.engines.pin import PinEngine
+    mgr.add(PinEngine(app))
 
+    # Hybrid parallelism: spawn the scanner worker process (heavy pandas scan).
+    if getattr(config, "scanner_worker_enabled", True):
+        try:
+            from bot.workers.scanner_worker import ScannerWorkerClient
+            from bot.exchange.factory import provider_credentials
+            api_key, secret, testnet = provider_credentials(config)
+            provider = getattr(config, "exchange_provider", "mexc")
+            worker = ScannerWorkerClient()
+            if worker.start(provider, api_key, secret, testnet):
+                app.bot_data["scanner_worker"] = worker
+        except Exception:
+            logger.exception("scanner worker unavailable; scanning runs in-process")
 
-    SCHEDULER.start()
-    logger.info("Scheduler started (cache=3s, avg=%ds, reentry=30s, tpsl=60s, auto_scan=%dm, paper_scan=30m, paper_signal=5m)",
+    app.bot_data["engine_manager"] = mgr
+    _MANAGER = mgr
+    await mgr.start_all()
+    logger.info("Engines started (cache=3s, avg=%ds, reentry=30s, tpsl=60s, auto_scan=%dm)",
                 avg_interval, auto_scan_interval)
 
 

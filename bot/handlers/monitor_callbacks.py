@@ -33,17 +33,8 @@ async def monitor_close_confirm_callback(update: Update, context: ContextTypes.D
 
     try:
         await q.edit_message_text(f"⏳ Закрываю `{coin}`...", parse_mode="Markdown")
-        pos = await client.get_position(symbol)
-        pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
-        margin = float(pos.get("margin", 0)) if pos else 0.0
-        exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
-        await client.cancel_tp_sl_orders(symbol)
-        await client.close_futures_position(symbol)
-        from bot import db as db_mod
-        db_mod.close_position(symbol)
-        db_mod.delete_reentry(symbol)
-        db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note="manual")
-        db_mod.close_position_history(symbol, exit_price, pnl, "manual")
+        from bot.services.trading import close_position
+        await close_position(client, context.bot_data, symbol, keep_reentry=False)
         await q.edit_message_text(f"✅ *{coin}* закрыт.", parse_mode="Markdown")
     except Exception as e:
         await q.edit_message_text(f"❌ Ошибка закрытия {coin}: {e}")

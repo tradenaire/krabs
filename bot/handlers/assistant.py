@@ -504,7 +504,7 @@ async def nlp_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.edit_message_text("❌ Биржа недоступна.")
         return
 
-    from bot import db as db_mod
+    from bot.services.trading import close_position
 
     if q.data == "nlp_close_ALL":
         await q.edit_message_text("⏳ Закрываю все позиции...")
@@ -518,15 +518,7 @@ async def nlp_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             symbol = pos["symbol"]
             coin = symbol.split("/")[0]
             try:
-                pnl = float(pos.get("unrealized_pnl", 0))
-                margin = float(pos.get("margin", 0))
-                exit_price = float(pos.get("mark_price", 0))
-                await client.cancel_tp_sl_orders(symbol)
-                await client.close_futures_position(symbol)
-                db_mod.close_position(symbol)
-                db_mod.delete_reentry(symbol)
-                db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note="manual")
-                db_mod.close_position_history(symbol, exit_price, pnl, "manual")
+                await close_position(client, context.bot_data, symbol, keep_reentry=False)
                 results.append(f"✅ `{coin}`")
             except Exception as e:
                 results.append(f"❌ `{coin}`: {e}")
@@ -550,15 +542,8 @@ async def nlp_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     symbol = targets[0]["symbol"]
     coin = symbol.split("/")[0]
     try:
-        pnl = float(targets[0].get("unrealized_pnl", 0))
-        margin = float(targets[0].get("margin", 0))
-        exit_price = float(targets[0].get("mark_price", 0))
-        await client.cancel_tp_sl_orders(symbol)
-        await client.close_futures_position(symbol)
-        db_mod.close_position(symbol)
-        db_mod.delete_reentry(symbol)
-        db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note="manual")
-        db_mod.close_position_history(symbol, exit_price, pnl, "manual")
+        res = await close_position(client, context.bot_data, symbol, keep_reentry=False)
+        pnl = res["pnl"]
         sign = "+" if pnl >= 0 else ""
         await q.edit_message_text(
             f"✅ `{coin}` закрыт ({sign}${pnl:.2f})", parse_mode="Markdown"
