@@ -18,10 +18,12 @@ class SignalHandlerFormatTests(unittest.TestCase):
             Confidence 96%
             """,
             user_data,
+            warning="model is unsure about TP3",
         )
 
         self.assertIsNotNone(get_signal(user_data, signal_id))
         self.assertIn("Проверь распознанный сигнал:", text)
+        self.assertIn("⚠️ Warning: model is unsure about TP3", text)
         button_texts = [button.text for row in keyboard.inline_keyboard for button in row]
         self.assertIn("Открыть $1", button_texts)
         self.assertIn("Открыть $2", button_texts)

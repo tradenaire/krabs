@@ -10,6 +10,8 @@ class StartKeySourcesTest(unittest.TestCase):
         self.assertIn("https://www.binance.com/en/my/settings/api-management", source)
         self.assertIn("/setkey exchange_provider binance_testnet", source)
         self.assertIn("/setkey exchange_provider binance", source)
+        self.assertIn("/setkey openrouter_api_key YOUR_KEY", source)
+        self.assertIn("/setkey signal_vision_model openai/gpt-5.5", source)
 
 
 if __name__ == "__main__":

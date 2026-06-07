@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bot.signals.model import ParsedSignal
+from bot.signals.symbols import resolve_signal_symbol
 
 
 async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> dict:
@@ -8,9 +9,11 @@ async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> di
     if not leverage and app is not None:
         config = app.bot_data.get("config")
         leverage = int(getattr(config, "default_leverage", 0) or 0) or None
+    symbol = await resolve_signal_symbol(client, signal.symbol)
+
     if not leverage:
         try:
-            leverage = await client.get_max_leverage(signal.symbol)
+            leverage = await client.get_max_leverage(symbol)
         except Exception:
             leverage = 25
 
@@ -23,7 +26,7 @@ async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> di
         open_result = await execute_open(
             client,
             app,
-            signal.symbol,
+            symbol,
             signal.order_side,
             margin,
             leverage=leverage,
@@ -31,20 +34,20 @@ async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> di
             sl_pct=500,
         )
     else:
-        open_result = await client.place_futures_order(signal.symbol, signal.order_side, margin, leverage)
+        open_result = await client.place_futures_order(symbol, signal.order_side, margin, leverage)
 
-    pos = await client.get_position(signal.symbol)
+    pos = await client.get_position(symbol)
     if not pos:
-        raise RuntimeError(f"No opened position found for {signal.symbol}.")
+        raise RuntimeError(f"No opened position found for {symbol}.")
 
     orders = await client.set_multi_tp_sl(
-        signal.symbol,
+        symbol,
         signal.tps,
         signal.stop,
         pos_data=pos,
     )
     return {
-        "symbol": client.futures_symbol(signal.symbol),
+        "symbol": symbol,
         "side": signal.side,
         "margin": margin,
         "leverage": leverage,

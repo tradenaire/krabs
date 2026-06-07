@@ -324,8 +324,10 @@ then, every deploy agent must preserve or reapply them after switching branches.
 
 ### 3. Signal Image/Text Recognition And Execution
 
-The bot can accept a trading signal as text, image caption, or screenshot. This
-is a deterministic parser/OCR flow, not ChatGPT and not deep market analysis.
+The bot can accept a trading signal as text, image caption, or screenshot.
+Text/captions are parsed locally. Screenshots are sent to the configured
+vision model, which must return strict JSON variables. The model decodes the
+signal; it must not do market analysis and must not open trades by itself.
 
 Expected input shape:
 
@@ -343,11 +345,16 @@ Expected bot behavior:
 
 ```text
 1. Parse symbol, LONG/SHORT, entry range, SL, TP1/TP2/TP3, leverage, confidence.
-2. Show a confirmation card.
-3. Wait for an inline button amount: $1, $2, $5, or $10.
-4. Open the futures position only after confirmation.
-5. Place 3 Binance reduce-only TAKE_PROFIT_MARKET orders.
-6. Place 1 close-position STOP_MARKET SL order.
+2. Build algorithm variables for position/order execution:
+   symbol, side, order_side, close_side, entry_min, entry_max, leverage,
+   take_profit_orders[], stop_loss_order.
+3. Resolve the raw symbol against the currently selected exchange client.
+   Do not hardcode Binance or MEXC; use the active client's markets/contracts.
+4. Show a confirmation card.
+5. Wait for an inline button amount: $1, $2, $5, or $10.
+6. Open the futures position only after confirmation.
+7. Place 3 Binance reduce-only TAKE_PROFIT_MARKET orders.
+8. Place 1 close-position STOP_MARKET SL order.
 ```
 
 Default TP split when the signal does not specify shares:
@@ -366,20 +373,37 @@ bot/signals/parser.py
 bot/signals/preview.py
 bot/signals/store.py
 bot/signals/execution.py
+bot/signals/symbols.py
+bot/signals/vision.py
 bot/handlers/signals.py
 bot/handlers/assistant.py
 bot/exchange/binance_client.py
 requirements.txt
 ```
 
-OCR dependency:
+Vision model config:
 
 ```text
-rapidocr-onnxruntime
+/setkey openrouter_api_key YOUR_KEY
+/setkey signal_vision_model openai/gpt-5.5
 ```
 
-If OCR is not installed, image messages will not be analyzed by GPT. The bot
-will ask the user to send the signal as text or as an image caption.
+If `openai/gpt-5.5` is not available in the configured provider, change only
+`signal_vision_model`; do not rewrite the signal execution algorithm.
+
+Screenshot UX requirements:
+
+```text
+1. Set a Telegram reaction on the incoming signal when possible.
+2. Send Telegram "typing..." action while decoding.
+3. If the vision model/API protection/validation is unsure, reply with a
+   warning emoji and explanation.
+4. Do not silently swallow a signal message.
+5. Do not block text/caption signals when screenshot decoding fails.
+```
+
+Do not use OCR for screenshots unless the user explicitly asks to replace the
+vision model. The current requirement is vision-model decoding.
 
 ## Deploy To Toronto
 
@@ -559,13 +583,15 @@ cd /root/krabs
   tests.test_signal_parser \
   tests.test_signal_store \
   tests.test_signal_handler_format \
-  tests.test_signal_execution
+  tests.test_signal_execution \
+  tests.test_signal_vision_decode \
+  tests.test_signal_symbol_resolution
 ```
 
 Expected:
 
 ```text
-Ran 8 tests
+Ran 13 tests
 OK
 ```
 
@@ -770,8 +796,9 @@ systemctl restart krabs.service
 10. Do not switch to `exchange_provider=binance` unless the user explicitly wants
     live-money Binance trading.
 
-11. Do not route signal screenshots/text through ChatGPT for execution.
-    - Use deterministic OCR/regex parsing.
+11. Do not route signal screenshots through OCR by default.
+    - Use the configured vision model to return strict JSON variables.
+    - Use local validation before any order action.
     - Always show the confirmation card before opening a position.
 
 12. Do not place one close-all TP for parsed 3TP signals.

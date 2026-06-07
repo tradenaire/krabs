@@ -7,4 +7,3 @@ pandas>=2.0,<2.3
 ft-pandas-ta @ git+https://github.com/freqtrade/pandas-ta.git
 openai>=1.30          # for OpenRouter calls
 anthropic>=0.39       # optional: Claude backend
-rapidocr-onnxruntime>=1.4.4  # deterministic OCR for signal screenshots, no GPT

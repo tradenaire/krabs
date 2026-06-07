@@ -1,24 +1,49 @@
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
 
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from bot.signals.execution import execute_signal
 from bot.signals.parser import SignalParseError, parse_signal
 from bot.signals.preview import build_signal_confirmation_text, build_signal_keyboard
 from bot.signals.store import clear_signal, get_signal, save_signal
+from bot.signals.vision import decode_signal_image
 
 
-def prepare_signal_confirmation(raw_text: str, user_data: dict):
+def prepare_signal_confirmation(raw_text: str, user_data: dict, warning: str = ""):
     signal = parse_signal(raw_text)
     signal_id = save_signal(user_data, signal)
-    text = build_signal_confirmation_text(signal)
+    text = build_signal_confirmation_text(signal, warning=warning)
     keyboard = build_signal_keyboard(signal_id)
     return signal_id, text, keyboard
+
+
+def prepare_signal_confirmation_from_signal(signal, user_data: dict, warning: str = ""):
+    signal_id = save_signal(user_data, signal)
+    text = build_signal_confirmation_text(signal, warning=warning)
+    keyboard = build_signal_keyboard(signal_id)
+    return signal_id, text, keyboard
+
+
+async def _mark_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, reaction: str = "👀") -> None:
+    if not update.effective_chat or not update.effective_message:
+        return
+    try:
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    except Exception:
+        pass
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=update.effective_chat.id,
+            message_id=update.effective_message.message_id,
+            reaction=reaction,
+        )
+    except Exception:
+        pass
 
 
 async def maybe_handle_signal_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -28,34 +53,15 @@ async def maybe_handle_signal_text(update: Update, context: ContextTypes.DEFAULT
         _signal_id, text, keyboard = prepare_signal_confirmation(update.message.text, context.user_data)
     except SignalParseError:
         return False
+    await _mark_processing(update, context, "👀")
     await update.message.reply_text(text, reply_markup=keyboard)
     return True
-
-
-def _ocr_image(path: Path) -> str:
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-
-        engine = RapidOCR()
-        result, _ = engine(str(path))
-        if not result:
-            return ""
-        return "\n".join(str(row[1]) for row in result if len(row) > 1)
-    except ImportError:
-        pass
-
-    try:
-        from PIL import Image
-        import pytesseract
-
-        return pytesseract.image_to_string(Image.open(path), lang="eng+rus")
-    except ImportError as e:
-        raise RuntimeError("OCR engine is not installed. Send the signal as text or caption.") from e
 
 
 async def signal_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    await _mark_processing(update, context, "👀")
 
     if update.message.caption:
         try:
@@ -68,25 +74,45 @@ async def signal_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not update.message.photo:
         return
 
-    fd, raw_path = tempfile.mkstemp(prefix="krabs-signal-", suffix=".jpg")
-    os.close(fd)
-    path = Path(raw_path)
+    with tempfile.NamedTemporaryFile(prefix="krabs-signal-", suffix=".jpg", delete=False) as fh:
+        path = Path(fh.name)
     try:
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
         await tg_file.download_to_drive(custom_path=str(path))
-        try:
-            text = _ocr_image(path)
-        except RuntimeError as e:
-            await update.message.reply_text(f"Не смог прочитать картинку: {e}")
+
+        config = context.bot_data.get("config")
+        api_key = getattr(config, "openrouter_api_key", "") if config else ""
+        model = getattr(config, "signal_vision_model", "openai/gpt-5.5") if config else "openai/gpt-5.5"
+        if not api_key:
+            await _mark_processing(update, context, "⚠️")
+            await update.message.reply_text(
+                "⚠️ Не настроен `openrouter_api_key`, поэтому картинку не могу расшифровать нейросетью.\n"
+                "Не блокирую сигнал: пришли этот же сигнал текстом или caption, и я покажу подтверждение.",
+                parse_mode="Markdown",
+            )
             return
-        if not text.strip():
-            await update.message.reply_text("Не смог прочитать сигнал с картинки. Пришли текстом или caption.")
-            return
+
         try:
-            _signal_id, preview, keyboard = prepare_signal_confirmation(text, context.user_data)
+            result = await decode_signal_image(path, api_key=api_key, model=model)
+        except Exception as e:
+            await _mark_processing(update, context, "⚠️")
+            await update.message.reply_text(
+                f"⚠️ Не смог расшифровать картинку через `{model}`: {e}\n"
+                "Не блокирую сигнал: пришли его текстом, и я соберу переменные для ордеров.",
+                parse_mode="Markdown",
+            )
+            return
+
+        try:
+            _signal_id, preview, keyboard = prepare_signal_confirmation_from_signal(
+                result.signal,
+                context.user_data,
+                warning=result.warning,
+            )
         except SignalParseError as e:
-            await update.message.reply_text(f"Картинку прочитал, но сигнал неполный: {e}\n\nПришли сигнал текстом.")
+            await _mark_processing(update, context, "⚠️")
+            await update.message.reply_text(f"⚠️ Сигнал распознан неполно: {e}\n\nПришли исправленный текст.")
             return
         await update.message.reply_text(preview, reply_markup=keyboard)
     finally:

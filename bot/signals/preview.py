@@ -16,7 +16,8 @@ def _pct(value: float) -> str:
     return f"{value:g}%"
 
 
-def build_signal_confirmation_text(signal: ParsedSignal, margin: float | None = None) -> str:
+def build_signal_confirmation_text(signal: ParsedSignal, margin: float | None = None,
+                                   warning: str = "") -> str:
     entry = _price(signal.entry_min)
     if signal.entry_max != signal.entry_min:
         entry = f"{entry} / {_price(signal.entry_max)}"
@@ -29,6 +30,8 @@ def build_signal_confirmation_text(signal: ParsedSignal, margin: float | None = 
     ]
     for idx, tp in enumerate(signal.tps, 1):
         lines.append(f"TP{idx}: {_price(tp.price)} — {_pct(tp.share_pct)}")
+    if warning:
+        lines.extend(["", f"⚠️ Warning: {warning}"])
 
     lines.extend([
         "",

@@ -95,8 +95,8 @@ class SignalExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         result = await execute_signal(client, app=None, signal=self._signal(), margin=2)
 
-        self.assertEqual(client.open_args, ("EPIC", "sell", 2, 3, None))
-        self.assertEqual(client.multi_tpsl_args[0], "EPIC")
+        self.assertEqual(client.open_args, ("EPIC/USDT:USDT", "sell", 2, 3, None))
+        self.assertEqual(client.multi_tpsl_args[0], "EPIC/USDT:USDT")
         self.assertEqual(client.multi_tpsl_args[2], 0.2167)
         self.assertEqual(result["symbol"], "EPIC/USDT:USDT")
         self.assertEqual(result["orders"], 4)
