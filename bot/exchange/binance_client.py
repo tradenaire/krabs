@@ -451,6 +451,38 @@ class BinanceClient:
         log_event("decisions", "set_tp_sl_result", symbol=sym, results=results)
         return results
 
+    async def place_reduce_tp(self, symbol: str, pos_side: str, qty: float,
+                              trigger_price: float) -> dict:
+        """Partial take-profit: reduce-only TAKE_PROFIT_MARKET for `qty` contracts."""
+        sym = self.futures_symbol(symbol)
+        await self._exchange.load_markets()
+        close_side = "sell" if pos_side == "long" else "buy"
+        q = float(self._exchange.amount_to_precision(sym, qty))
+        stop = float(self._exchange.price_to_precision(sym, trigger_price))
+        order = await self._exchange.create_order(
+            sym, "TAKE_PROFIT_MARKET", close_side, q, None,
+            {"stopPrice": stop, "reduceOnly": True, "workingType": "MARK_PRICE"},
+        )
+        return {"id": order.get("id"), "symbol": sym, "qty": q,
+                "trigger_price": stop, "info": order.get("info", {})}
+
+    async def place_reduce_sl(self, symbol: str, pos_side: str, trigger_price: float,
+                              qty: float | None = None) -> dict:
+        """Stop-loss: STOP_MARKET. closePosition when qty is None, else reduce-only qty."""
+        sym = self.futures_symbol(symbol)
+        await self._exchange.load_markets()
+        close_side = "sell" if pos_side == "long" else "buy"
+        stop = float(self._exchange.price_to_precision(sym, trigger_price))
+        if qty is None:
+            params = {"stopPrice": stop, "closePosition": True, "workingType": "MARK_PRICE"}
+            order = await self._exchange.create_order(sym, "STOP_MARKET", close_side, None, None, params)
+        else:
+            q = float(self._exchange.amount_to_precision(sym, qty))
+            params = {"stopPrice": stop, "reduceOnly": True, "workingType": "MARK_PRICE"}
+            order = await self._exchange.create_order(sym, "STOP_MARKET", close_side, q, None, params)
+        return {"id": order.get("id"), "symbol": sym, "trigger_price": stop,
+                "info": order.get("info", {})}
+
     @staticmethod
     def _order_kind(o: dict) -> str | None:
         t = str(o.get("type") or (o.get("info") or {}).get("type") or "").lower()

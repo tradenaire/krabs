@@ -18,41 +18,50 @@ DEFAULT_MODEL = "x-ai/grok-4-fast:online"
 FALLBACK_MODEL = "google/gemini-3.1-pro-preview-customtools:online"
 
 SYSTEM_PROMPT = """# ROLE
-Ты — старший аналитик отдела количественного анализа в крупном хедж-фонде. Специализация — поиск активов с высоким потенциалом падения (Short opportunities).
+Ты — старший аналитик отдела количественного анализа в крупном хедж-фонде. Твоя задача — находить НАИМЕНЕЕ РИСКОВЫЕ сделки по всему рынку крипто-фьючерсов, в ОБЕ стороны: и в шорт (Short), и в лонг (Long).
 
 # TASK
-Проведи комплексное исследование текущего состояния рынка на {today} и выдели РОВНО {n} монет для шорта.
+Проведи комплексное исследование текущего состояния рынка на {today} и выдели РОВНО {n} САМЫХ НАДЁЖНЫХ сделок (минимальный риск), отсортированных от наименее рискованной к более рискованной. Для каждой определи направление (long или short).
 
 # ANALYSIS ALGORITHM
 Для каждой монеты проанализируй:
-1. Технический перегрев: RSI 4H и 1D >70, отклонение от EMA20/50
-2. Фундаментальный негатив: взломы, SEC, token unlocks в ближайшие 7 дней
-3. Биржевые данные: Funding Rate, Exchange Inflow, Open Interest
+1. Тех. картина: RSI 4H/1D, EMA20/50, дивергенции, перекупленность/перепроданность.
+   - Шорт: перегрев (RSI>70), отбой от сопротивления, медвежья дивергенция.
+   - Лонг: перепроданность (RSI<30), отбой от поддержки, бычья дивергенция.
+2. Фундаментал: новости, взломы, SEC, token unlocks в ближайшие 7 дней.
+3. Биржевые данные: Funding Rate, Open Interest, объёмы.
 
 # FUNDING RATE И РИСК
-Funding Rate напрямую влияет на качество шорта:
-- Funding > +0.03% → лонги перегреты, шортить выгодно (снижай RISK на 1-2 пункта)
-- Funding 0..+0.03% → нейтрально
-- Funding < 0% → шорт платит funding, невыгодно (повышай RISK на 1-2 пункта)
-- Funding < -0.05% → шорт очень дорогой, только при сильном техническом сигнале (RISK не ниже 7/10)
+- Шорт: Funding > +0.03% → шортить выгодно (RISK ниже); Funding < 0% → шорт платит, RISK выше.
+- Лонг: Funding < 0% → лонг получает выплаты (RISK ниже); Funding сильно положительный → лонг платит, RISK выше.
+
+# RISK
+RISK N/10 — оценка риска сделки (1 = самая надёжная, 10 = очень рискованная). Приоритет — низкий RISK.
+
+# TAKE PROFITS
+Для каждой сделки рассчитай ТРИ цели тейк-профита (TP1<TP2<TP3 для лонга по удалению от entry; для шорта цены ниже entry, TP1 ближе всех). TP1 — консервативная близкая цель, TP3 — амбициозная. SL — за ближайшим инвалидирующим уровнем.
 
 # OUTPUT FORMAT
-КРИТИЧНО: никаких markdown-таблиц. Вместо этого {n} блоков COIN:
+КРИТИЧНО: никаких markdown-таблиц. Вместо этого {n} блоков COIN (отсортированы по возрастанию RISK):
 
 COIN: TICKER
+SIDE: long|short
 PRICE: $X.XX
 TECH: RSI 4H XX, описание
-FUND: фундаментальный негатив
-FUNDING: +X.XXX% (оценка: выгодно/нейтрально/дорогой шорт)
+FUND: фундаментал
+FUNDING: +X.XXX% (оценка)
 ENTRY: $X.XX–X.XX
+TP1: $X.XX
+TP2: $X.XX
+TP3: $X.XX
 SL: $X.XX
 RISK: N/10
 
 После блоков:
-SENTIMENT: 2-3 предложения об общем настроении.
+SENTIMENT: 2-3 предложения об общем настроении рынка.
 
 Правила:
-- Только {n} блоков. Тикер без /USDT. Каждое поле — одна строка."""
+- Ровно {n} блоков. Тикер без /USDT. Каждое поле — одна строка. SIDE строго long или short."""
 
 
 @dataclass
@@ -90,19 +99,26 @@ def parse_analyst_blocks(text: str, n: int = 20) -> list[dict]:
     for b in blocks:
         fields: dict[str, str] = {}
         for line in b:
-            m = re.match(r"\s*(COIN|PRICE|TECH|FUND|FUNDING|ENTRY|SL|RISK)\s*:\s*(.+)", line, re.IGNORECASE)
+            m = re.match(r"\s*(COIN|SIDE|PRICE|TECH|FUND|FUNDING|ENTRY|TP1|TP2|TP3|SL|RISK)\s*:\s*(.+)",
+                         line, re.IGNORECASE)
             if m:
                 fields[m.group(1).upper()] = m.group(2).strip()
         ticker = fields.get("COIN", "").strip().upper()
         if not ticker:
             continue
+        side_raw = fields.get("SIDE", "").strip().lower()
+        side = "long" if side_raw.startswith("long") else ("short" if side_raw.startswith("short") else "")
         parsed.append({
             "ticker":   ticker,
+            "side":     side,
             "price":    fields.get("PRICE", ""),
             "tech":     fields.get("TECH", ""),
             "fund":     fields.get("FUND", ""),
             "funding":  fields.get("FUNDING", ""),
             "entry":    fields.get("ENTRY", ""),
+            "tp1":      fields.get("TP1", ""),
+            "tp2":      fields.get("TP2", ""),
+            "tp3":      fields.get("TP3", ""),
             "sl":       fields.get("SL", ""),
             "risk":     fields.get("RISK", ""),
         })
@@ -139,10 +155,11 @@ def _build_user_msg(candidates: list[dict], n: int = 5) -> str:
             rows.append(
                 f"- {ticker}: RSI={c.get('rsi', 0)}, 24h={c.get('daily_change_pct', 0):+.1f}%{funding_str}"
             )
-        ctx = "Наш локальный сканер MEXC отметил эти монеты:\n" + "\n".join(rows)
+        ctx = "Наш локальный сканер отметил эти монеты (могут быть кандидаты и в лонг, и в шорт):\n" + "\n".join(rows)
     else:
         ctx = "(локальный сканер не нашёл кандидатов — иди от полного рынка)"
-    return f"Сегодня {today}. Выдай ТОП-{n} монет для шорта.\n\n{ctx}"
+    return (f"Сегодня {today}. Выдай ТОП-{n} НАИМЕНЕЕ РИСКОВЫХ сделок по всему рынку, "
+            f"в обе стороны (long/short), отсортированных по возрастанию RISK.\n\n{ctx}")
 
 
 async def deep_short_analysis(candidates: list[dict], api_key: str,

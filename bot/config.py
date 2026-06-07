@@ -26,6 +26,12 @@ class Config:
     tp_pct: float = 500.0
     sl_pct: float = 500.0
 
+    # Exit model: "single" (one TP + one SL) or "ladder" (3 partial TPs + breakeven SL)
+    exit_mode: str = "single"
+    tp_ladder_pcts: str = "50,120,250"    # fallback TP levels (PnL% on margin) if AI gives none
+    tp_partial_pct: float = 50.0          # close this % of remaining at each TP
+    breakeven_on_first_tp: bool = True    # move SL to entry after the first TP fills
+
     # Averaging
     averaging_enabled: bool = True               # master on/off toggle
     averaging_threshold: float = -100.0          # trigger at PnL ≤ this %

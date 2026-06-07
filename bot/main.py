@@ -145,16 +145,9 @@ def main():
 
         from telegram import BotCommand
         await application.bot.set_my_commands([
-            BotCommand("start", "Помощь"),
             BotCommand("balance", "Баланс и позиции"),
-            BotCommand("positions", "Открытые позиции"),
             BotCommand("scan", "AI шорт-пикер"),
-            BotCommand("short", "Открыть шорт"),
-            BotCommand("close", "Закрыть позицию"),
             BotCommand("avg", "Все настройки"),
-            BotCommand("setbet", "Изменить ставку"),
-            BotCommand("setstops", "Изменить стоплосс"),
-            BotCommand("settakes", "Изменить тейкпрофит"),
             BotCommand("stats", "Статистика за день"),
             BotCommand("paper", "Бумажный портфель $500"),
             BotCommand("automode", "Авто-скан и открытие позиций"),
