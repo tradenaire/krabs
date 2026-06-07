@@ -183,6 +183,8 @@ async def averaging_job(app):
             del _profit_lock_step[sym]
 
     seen_this_run: set[str] = set()
+    # Positions managed by the ladder exit are off-limits to averaging.
+    ladder_syms = db_mod.get_ladder_symbols()
 
     for pos in positions:
         symbol = pos["symbol"]
@@ -193,6 +195,9 @@ async def averaging_job(app):
             logger.warning("Averaging: duplicate symbol %s in positions list, skipping", symbol)
             continue
         seen_this_run.add(symbol)
+
+        if symbol in ladder_syms:
+            continue  # ladder exit manages this position; no averaging
 
         # ── Contracts sanity check ──────────────────────────────────
         exchange_contracts = int(round(float(pos.get("contracts", 0))))
@@ -1054,10 +1059,8 @@ async def auto_scan_job(app):
         m = _re.match(r"(\d+)", pick.get("risk", "10"))
         return int(m.group(1)) if m else 10
 
-    good_picks = [
-        p for p in picks
-        if p.get("side", "short") == "short" and _risk_int(p) <= max_risk
-    ]
+    # Least-risky first (ascending RISK)
+    good_picks = sorted([p for p in picks if _risk_int(p) <= max_risk], key=_risk_int)
     filtered_out = len(picks) - len(good_picks)
 
     if not good_picks:
@@ -1121,6 +1124,10 @@ async def auto_scan_job(app):
             skipped.append(f"{ticker}(нет OHLCV)")
             continue
 
+        # Direction: prefer AI's SIDE, fall back to local technical direction.
+        side = pick.get("side") or tech.get("direction") or "short"
+        order_side = "buy" if side == "long" else "sell"
+
         try:
             sym_max = await client.get_max_leverage(fut_sym)
         except Exception:
@@ -1138,8 +1145,8 @@ async def auto_scan_job(app):
             continue
 
         try:
-            result = await execute_open(client, app, fut_sym, "sell", margin, leverage,
-                                        tp_pct=tp_pct, sl_pct=sl_pct)
+            result = await execute_open(client, app, fut_sym, order_side, margin, leverage,
+                                        tp_pct=tp_pct, sl_pct=sl_pct, pick=pick)
             free_balance -= margin  # update local estimate after open
         except Exception as e:
             logger.error("AutoScan: open %s failed: %s", fut_sym, e)
@@ -1148,8 +1155,10 @@ async def auto_scan_job(app):
 
         coin = fut_sym.split("/")[0]
         risk_val = _risk_int(pick)
+        side_label = "LONG" if side == "long" else "SHORT"
+        side_emoji = "🔺" if side == "long" else "🔻"
         lines = [
-            f"🤖 *AutoScan* → SHORT `{coin}` риск {risk_val}/10",
+            f"🤖 *AutoScan* → {side_emoji} {side_label} `{coin}` риск {risk_val}/10",
             f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']} | `${margin:.2f}`",
         ]
         if result.get("tp_price"):
@@ -1261,6 +1270,7 @@ async def setup_scheduler(app):
     from bot.engines.emergency import EmergencyEngine
     from bot.engines.reentry import ReentryEngine
     from bot.engines.tpsl import TpSlEngine
+    from bot.engines.ladder import LadderExitEngine
     from bot.engines.scout import ScoutEngine
     from bot.engines.reporting import ReportingEngine
     from bot.engines.paper import PaperScanEngine, PaperSignalEngine, PaperUpdateEngine
@@ -1275,6 +1285,7 @@ async def setup_scheduler(app):
     mgr.add(AveragingEngine(app, interval=avg_interval))
     mgr.add(ReentryEngine(app))
     mgr.add(TpSlEngine(app))
+    mgr.add(LadderExitEngine(app))
     mgr.add(BalanceAlertEngine(app))
     mgr.add(ScoutEngine(app, interval=auto_scan_interval * 60))
     mgr.add(ReportingEngine(app))

@@ -55,6 +55,9 @@ _EXPORTED = [
     "update_paper_profit_lock", "update_paper_liq_price",
     "reset_paper_account", "get_paper_stats", "get_min_order_cache",
     "set_min_order_notional",
+    "upsert_tp_ladder", "get_tp_ladder", "get_active_tp_ladders",
+    "get_ladder_symbols", "mark_tp_filled", "mark_ladder_breakeven",
+    "close_tp_ladder",
 ]
 
 for _name in _EXPORTED:

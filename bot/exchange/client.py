@@ -593,6 +593,41 @@ class ExchangeClient:
         log_event("decisions", "set_tp_sl_result", symbol=sym, results=results)
         return results
 
+    async def _place_reduce_plan(self, symbol: str, pos_side: str, trigger_type: int,
+                                 trigger_price: float, qty: float | None) -> dict:
+        """Place a single reduce plan-order (TP or SL) for ladder exit.
+        qty None -> close whole position; else close `qty` contracts."""
+        sym = self.futures_symbol(symbol)
+        await self._exchange.load_markets()
+        market = self._exchange.market(sym)
+        mexc_sym = self._mexc_contract_symbol(market, sym)
+        close_side = 4 if pos_side == "long" else 2
+        if qty is None:
+            pos = await self.get_position(symbol)
+            vol = int(round(pos["contracts"])) if pos else 1
+        else:
+            vol = max(1, int(round(qty)))
+        params = {
+            "symbol": mexc_sym, "price": 0, "vol": vol,
+            "side": close_side, "orderType": 5, "openType": 2,
+            "triggerPrice": str(trigger_price), "triggerType": trigger_type,
+            "trend": 1, "executeCycle": 2,
+        }
+        r = await self._exchange.contractPrivatePostPlanorderPlace(params)
+        log_event("exchange", "mexc_raw_response", operation="place_reduce_plan", params=params, raw=r)
+        return {"id": (r or {}).get("data"), "symbol": sym, "trigger_price": trigger_price,
+                "qty": vol, "info": r}
+
+    async def place_reduce_tp(self, symbol: str, pos_side: str, qty: float,
+                              trigger_price: float) -> dict:
+        tt = 1 if pos_side == "long" else 2
+        return await self._place_reduce_plan(symbol, pos_side, tt, trigger_price, qty)
+
+    async def place_reduce_sl(self, symbol: str, pos_side: str, trigger_price: float,
+                              qty: float | None = None) -> dict:
+        tt = 2 if pos_side == "long" else 1
+        return await self._place_reduce_plan(symbol, pos_side, tt, trigger_price, qty)
+
     async def get_limit_close_orders(self, symbol: str) -> list[dict]:
         """Return open limit close orders (TP limit orders) for a symbol."""
         sym = self.futures_symbol(symbol)

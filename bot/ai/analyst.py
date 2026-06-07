@@ -60,11 +60,14 @@ TECH: RSI 4H XX, описание
 FUND: фундаментальный тезис/катализатор
 FUNDING: +X.XXX% (оценка для выбранной стороны)
 ENTRY: $X.XX–X.XX
+TP1: $X.XX
+TP2: $X.XX
+TP3: $X.XX
 SL: $X.XX
 RISK: N/10
 
 После блоков:
-SENTIMENT: 2-3 предложения об общем настроении.
+SENTIMENT: 2-3 предложения об общем настроении рынка.
 
 Правила:
 - {count_rule}
@@ -179,7 +182,8 @@ def _parse_legacy_analyst_blocks(text: str, n: int = 20) -> list[dict]:
     for b in blocks:
         fields: dict[str, str] = {}
         for line in b:
-            m = re.match(r"\s*(COIN|SIDE|PRICE|TECH|FUND|FUNDING|ENTRY|SL|RISK)\s*:\s*(.+)", line, re.IGNORECASE)
+            m = re.match(r"\s*(COIN|SIDE|PRICE|TECH|FUND|FUNDING|ENTRY|TP1|TP2|TP3|SL|RISK)\s*:\s*(.+)",
+                         line, re.IGNORECASE)
             if m:
                 fields[m.group(1).upper()] = m.group(2).strip()
         ticker = fields.get("COIN", "").strip().upper()
@@ -195,6 +199,9 @@ def _parse_legacy_analyst_blocks(text: str, n: int = 20) -> list[dict]:
             "fund":     fields.get("FUND", ""),
             "funding":  fields.get("FUNDING", ""),
             "entry":    fields.get("ENTRY", ""),
+            "tp1":      fields.get("TP1", ""),
+            "tp2":      fields.get("TP2", ""),
+            "tp3":      fields.get("TP3", ""),
             "sl":       fields.get("SL", ""),
             "risk":     fields.get("RISK", ""),
         })

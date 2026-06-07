@@ -82,6 +82,22 @@ def init_db():
                 status TEXT DEFAULT 'open',
                 created_at TEXT DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS tp_ladder (
+                symbol TEXT PRIMARY KEY,
+                side TEXT NOT NULL,
+                entry_price REAL DEFAULT 0,
+                leverage INTEGER DEFAULT 1,
+                tp1 REAL DEFAULT 0,
+                tp2 REAL DEFAULT 0,
+                tp3 REAL DEFAULT 0,
+                sl REAL DEFAULT 0,
+                filled1 INTEGER DEFAULT 0,
+                filled2 INTEGER DEFAULT 0,
+                filled3 INTEGER DEFAULT 0,
+                sl_at_breakeven INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at TEXT DEFAULT (datetime('now'))
+            );
             CREATE TABLE IF NOT EXISTS reentry (
                 symbol TEXT PRIMARY KEY,
                 side TEXT NOT NULL,
@@ -230,6 +246,59 @@ def close_position(symbol: str):
             "UPDATE positions SET status='closed' WHERE symbol=? AND status='open'",
             (symbol,)
         )
+
+
+# ── tp ladder (3-TP partial exit) ─────────────────────────────────
+
+def upsert_tp_ladder(symbol: str, side: str, entry_price: float, leverage: int,
+                     tp1: float, tp2: float, tp3: float, sl: float):
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO tp_ladder
+                (symbol, side, entry_price, leverage, tp1, tp2, tp3, sl,
+                 filled1, filled2, filled3, sl_at_breakeven, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'active')
+            ON CONFLICT(symbol) DO UPDATE SET
+                side=excluded.side, entry_price=excluded.entry_price,
+                leverage=excluded.leverage, tp1=excluded.tp1, tp2=excluded.tp2,
+                tp3=excluded.tp3, sl=excluded.sl, filled1=0, filled2=0, filled3=0,
+                sl_at_breakeven=0, status='active'
+        """, (symbol, side, entry_price, leverage, tp1, tp2, tp3, sl))
+
+
+def get_tp_ladder(symbol: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM tp_ladder WHERE symbol=? AND status='active'", (symbol,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_active_tp_ladders() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM tp_ladder WHERE status='active'").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_ladder_symbols() -> set[str]:
+    return {r["symbol"] for r in get_active_tp_ladders()}
+
+
+def mark_tp_filled(symbol: str, idx: int):
+    if idx not in (1, 2, 3):
+        return
+    with _connect() as conn:
+        conn.execute(f"UPDATE tp_ladder SET filled{idx}=1 WHERE symbol=?", (symbol,))
+
+
+def mark_ladder_breakeven(symbol: str):
+    with _connect() as conn:
+        conn.execute("UPDATE tp_ladder SET sl_at_breakeven=1 WHERE symbol=?", (symbol,))
+
+
+def close_tp_ladder(symbol: str):
+    with _connect() as conn:
+        conn.execute("UPDATE tp_ladder SET status='closed' WHERE symbol=?", (symbol,))
 
 
 # ── re-entry ──────────────────────────────────────────────────────

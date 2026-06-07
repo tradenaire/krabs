@@ -36,10 +36,11 @@ class MinOrderUpgradeNeeded(Exception):
 async def execute_open(client, app, symbol: str, side: str,
                        margin: float, leverage: int | None = None,
                        tp_pct: float = 500, sl_pct: float = 500,
-                       interactive: bool = False) -> dict:
+                       interactive: bool = False, pick: dict | None = None) -> dict:
     """Open a futures position with TP/SL and register re-entry.
 
     interactive=True: raises MinOrderUpgradeNeeded instead of silently upgrading margin.
+    pick: optional analyst pick (with tp1/tp2/tp3/sl) used by ladder exit mode.
     """
     config = app.bot_data.get("config")
     log_event(
@@ -122,29 +123,47 @@ async def execute_open(client, app, symbol: str, side: str,
     entry = order.get("price", 0)
     liq = 0
 
+    exit_mode = str(getattr(config, "exit_mode", "single")).lower() if config else "single"
+
     if pos:
         entry = pos["entry_price"]
         liq = pos.get("liquidation_price", 0)
         pos_side = pos["side"]
-        tp_price = calc_tp_price(entry, actual_lev, tp_pct, pos_side)
-        sl_price = calc_sl_price(entry, actual_lev, sl_pct, pos_side)
-        try:
-            await snapshot_exchange_state(
-                client, "before_tpsl_set", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price,
-            )
-            await client.cancel_tp_sl_orders(symbol)
-            await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price)
-            await snapshot_exchange_state(
-                client, "after_tpsl_set", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price,
-            )
-        except Exception as e:
-            log_event(
-                "errors", "execute_open_tpsl_failed", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price, error=str(e),
-            )
-            logger.warning("TP/SL set failed for %s: %s", symbol, e)
+
+        if exit_mode == "ladder":
+            # 3-TP partial exit with breakeven SL — managed by LadderExitEngine.
+            try:
+                from bot.services import ladder as ladder_svc
+                await client.cancel_tp_sl_orders(symbol)
+                await ladder_svc.setup_on_open(
+                    client, app, symbol, pos_side, entry, actual_lev,
+                    float(pos.get("contracts", 0)), pick,
+                )
+                lad = ladder_svc.compute_levels(entry, actual_lev, pos_side, pick, config)
+                tp_price, sl_price = lad[0][0], lad[1]  # TP1 / SL for the return summary
+            except Exception as e:
+                log_event("errors", "execute_open_ladder_failed", symbol=symbol, error=str(e))
+                logger.warning("ladder setup failed for %s: %s", symbol, e)
+        else:
+            tp_price = calc_tp_price(entry, actual_lev, tp_pct, pos_side)
+            sl_price = calc_sl_price(entry, actual_lev, sl_pct, pos_side)
+            try:
+                await snapshot_exchange_state(
+                    client, "before_tpsl_set", symbol=symbol,
+                    tp_price=tp_price, sl_price=sl_price,
+                )
+                await client.cancel_tp_sl_orders(symbol)
+                await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price)
+                await snapshot_exchange_state(
+                    client, "after_tpsl_set", symbol=symbol,
+                    tp_price=tp_price, sl_price=sl_price,
+                )
+            except Exception as e:
+                log_event(
+                    "errors", "execute_open_tpsl_failed", symbol=symbol,
+                    tp_price=tp_price, sl_price=sl_price, error=str(e),
+                )
+                logger.warning("TP/SL set failed for %s: %s", symbol, e)
 
     fsym = client.futures_symbol(symbol)
     max_avg_count = int(getattr(config, "max_averaging_count", 100)) if config else 100
