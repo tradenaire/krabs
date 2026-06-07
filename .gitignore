@@ -7,3 +7,6 @@ data/
 .venv/
 venv/
 *.bak.*
+# Never commit deploy secrets / key bundles
+*WITH-SECRETS*
+*-deploy-lite-*

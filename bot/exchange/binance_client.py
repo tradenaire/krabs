@@ -19,11 +19,37 @@ import asyncio
 import functools
 import logging
 
+import aiohttp
 import ccxt.async_support as ccxt
 
 from bot.event_logger import log_event
 
 logger = logging.getLogger(__name__)
+
+
+class _BinanceThreadedDNS(ccxt.binanceusdm):
+    """Binance USDM with aiohttp ThreadedResolver to avoid aiodns getaddrinfo
+    failures on Windows (same workaround as the MEXC client). Session is created
+    lazily inside the running loop.
+    """
+    def __init__(self, config=None):
+        self._session = None
+        super().__init__(config or {})
+
+    @property
+    def session(self):
+        if self._session is None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return None
+            connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver(), ssl=True)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
+
+    @session.setter
+    def session(self, value):
+        self._session = value
 
 _TP_TYPES = ("take_profit_market", "take_profit")
 _SL_TYPES = ("stop_market", "stop")
@@ -64,14 +90,21 @@ def _f(v) -> float:
 class BinanceClient:
     def __init__(self, api_key: str, secret: str, testnet: bool = True):
         self.testnet = testnet
-        self._exchange = ccxt.binanceusdm({
+        self._exchange = _BinanceThreadedDNS({
             "apiKey": api_key,
             "secret": secret,
             "enableRateLimit": True,
             "options": {"defaultType": "future"},
         })
         if testnet:
-            self._exchange.set_sandbox_mode(True)
+            # Binance "Demo Trading" is a distinct environment from the legacy
+            # testnet. Demo Trading keys require enable_demo_trading(True);
+            # set_sandbox_mode(True) points at the old testnet and would reject
+            # these keys. Prefer demo trading, fall back to sandbox if absent.
+            if hasattr(self._exchange, "enable_demo_trading"):
+                self._exchange.enable_demo_trading(True)
+            else:
+                self._exchange.set_sandbox_mode(True)
         # Binance keeps spot/futures wallets separate, but for the bot's purposes
         # the futures wallet is what matters; spot reuses the same instance.
         self._spot = self._exchange
