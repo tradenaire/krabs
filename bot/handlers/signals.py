@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import logging
 from pathlib import Path
 
 from telegram import Update
@@ -12,6 +13,8 @@ from bot.signals.parser import SignalParseError, parse_signal
 from bot.signals.preview import build_signal_confirmation_text, build_signal_keyboard
 from bot.signals.store import clear_signal, get_signal, save_signal
 from bot.signals.vision import decode_signal_image
+
+logger = logging.getLogger(__name__)
 
 
 def prepare_signal_confirmation(raw_text: str, user_data: dict, warning: str = ""):
@@ -27,6 +30,32 @@ def prepare_signal_confirmation_from_signal(signal, user_data: dict, warning: st
     text = build_signal_confirmation_text(signal, warning=warning)
     keyboard = build_signal_keyboard(signal_id)
     return signal_id, text, keyboard
+
+
+def format_vision_decode_warning(error: Exception, model: str) -> str:
+    raw = str(error)
+    low = raw.lower()
+    if "short sl must be above entry" in low:
+        reason = "для SHORT стоп-лосс должен быть выше entry, а TP должны быть ниже entry."
+    elif "long sl must be below entry" in low:
+        reason = "для LONG стоп-лосс должен быть ниже entry, а TP должны быть выше entry."
+    elif "tps must be" in low or "tp targets" in low:
+        reason = "тейк-профиты выглядят противоречиво относительно entry."
+    elif "missing entry" in low or "missing sl" in low or "missing tp" in low or "missing" in low:
+        reason = "на картинке не удалось уверенно найти все обязательные поля: entry, SL и TP."
+    elif "valid json" in low or "json" in low:
+        reason = "модель не вернула структурированные переменные сигнала."
+    else:
+        reason = (
+            "модель не смогла надежно разобрать скрин. Это может быть защита API, лимит, "
+            "неподдерживаемая модель или неясная картинка."
+        )
+    return (
+        f"⚠️ Не открываю сделку по скрину через `{model}`.\n"
+        f"Причина: {reason}\n\n"
+        "Кнопки открытия не показываю, чтобы не поставить опасную или неверную позицию. "
+        "Пришли сигнал текстом или caption: SYMBOL, LONG/SHORT, Entry, SL, TP1/TP2/TP3."
+    )
 
 
 async def _mark_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, reaction: str = "👀") -> None:
@@ -88,7 +117,7 @@ async def signal_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await _mark_processing(update, context, "⚠️")
             await update.message.reply_text(
                 "⚠️ Не настроен `openrouter_api_key`, поэтому картинку не могу расшифровать нейросетью.\n"
-                "Не блокирую сигнал: пришли этот же сигнал текстом или caption, и я покажу подтверждение.",
+                "Кнопки открытия по скрину не показываю. Пришли этот же сигнал текстом или caption, и я покажу подтверждение.",
                 parse_mode="Markdown",
             )
             return
@@ -96,10 +125,10 @@ async def signal_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             result = await decode_signal_image(path, api_key=api_key, model=model)
         except Exception as e:
+            logger.warning("signal vision decode failed with %s: %s", model, e)
             await _mark_processing(update, context, "⚠️")
             await update.message.reply_text(
-                f"⚠️ Не смог расшифровать картинку через `{model}`: {e}\n"
-                "Не блокирую сигнал: пришли его текстом, и я соберу переменные для ордеров.",
+                format_vision_decode_warning(e, model),
                 parse_mode="Markdown",
             )
             return
@@ -111,8 +140,12 @@ async def signal_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 warning=result.warning,
             )
         except SignalParseError as e:
+            logger.warning("signal vision validation failed with %s: %s", model, e)
             await _mark_processing(update, context, "⚠️")
-            await update.message.reply_text(f"⚠️ Сигнал распознан неполно: {e}\n\nПришли исправленный текст.")
+            await update.message.reply_text(
+                format_vision_decode_warning(e, model),
+                parse_mode="Markdown",
+            )
             return
         await update.message.reply_text(preview, reply_markup=keyboard)
     finally:

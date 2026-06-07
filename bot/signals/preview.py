@@ -31,7 +31,7 @@ def build_signal_confirmation_text(signal: ParsedSignal, margin: float | None = 
     for idx, tp in enumerate(signal.tps, 1):
         lines.append(f"TP{idx}: {_price(tp.price)} — {_pct(tp.share_pct)}")
     if warning:
-        lines.extend(["", f"⚠️ Warning: {warning}"])
+        lines.extend(["", f"⚠️ Предупреждение: {warning}"])
 
     lines.extend([
         "",

@@ -1,6 +1,6 @@
 import unittest
 
-from bot.handlers.signals import prepare_signal_confirmation
+from bot.handlers.signals import format_vision_decode_warning, prepare_signal_confirmation
 from bot.signals.store import get_signal
 
 
@@ -23,7 +23,7 @@ class SignalHandlerFormatTests(unittest.TestCase):
 
         self.assertIsNotNone(get_signal(user_data, signal_id))
         self.assertIn("Проверь распознанный сигнал:", text)
-        self.assertIn("⚠️ Warning: model is unsure about TP3", text)
+        self.assertIn("⚠️ Предупреждение: model is unsure about TP3", text)
         button_texts = [button.text for row in keyboard.inline_keyboard for button in row]
         self.assertIn("Открыть $1", button_texts)
         self.assertIn("Открыть $2", button_texts)
@@ -31,6 +31,17 @@ class SignalHandlerFormatTests(unittest.TestCase):
         self.assertIn("Открыть $10", button_texts)
         self.assertIn("Проверить/исправить", button_texts)
         self.assertIn("Отмена", button_texts)
+
+    def test_formats_vision_errors_in_plain_russian_without_raw_exception(self):
+        text = format_vision_decode_warning(
+            ValueError("invalid literal for int() with base 10: '3x'"),
+            "openai/gpt-5.5",
+        )
+
+        self.assertIn("⚠️", text)
+        self.assertIn("Не открываю сделку по скрину", text)
+        self.assertIn("Пришли сигнал текстом", text)
+        self.assertNotIn("invalid literal", text)
 
 
 if __name__ == "__main__":

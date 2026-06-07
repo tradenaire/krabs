@@ -14,7 +14,7 @@ from bot.signals.parser import SignalParseError
 VISION_SYSTEM_PROMPT = """You extract trading signal variables from a screenshot.
 Return JSON only. Do not do market analysis. Do not recommend trades.
 If a field is uncertain, still return the best visible value and put the concern
-in warning. Required variables: symbol, side, entry_min/entry_max or entry,
+in warning in short Russian. Required variables: symbol, side, entry_min/entry_max or entry,
 sl/stop, tps, leverage, confidence, warning."""
 
 
