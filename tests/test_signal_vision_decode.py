@@ -53,6 +53,18 @@ class SignalVisionDecodeTests(unittest.TestCase):
         self.assertEqual(variables["take_profit_orders"][0], {"price": 0.1978, "share_pct": 50.0})
         self.assertEqual(variables["stop_loss_order"], {"price": 0.2167, "close_position": True})
 
+    def test_accepts_model_leverage_and_confidence_strings(self):
+        result = parse_vision_signal_json(
+            """
+            {"symbol":"EPIC","side":"SHORT","entry":[0.2098,0.2104],
+             "stop":0.2167,"tps":[0.1978,0.1942,0.1903],
+             "leverage":"3x","confidence":"96%"}
+            """
+        )
+
+        self.assertEqual(result.signal.leverage, 3)
+        self.assertEqual(result.signal.confidence, 96)
+
 
 if __name__ == "__main__":
     unittest.main()

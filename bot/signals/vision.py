@@ -52,6 +52,13 @@ def _num(data: dict, *keys: str) -> float | None:
     return None
 
 
+def _intish(value) -> int | None:
+    if value in (None, ""):
+        return None
+    match = re.search(r"\d+", str(value))
+    return int(match.group(0)) if match else None
+
+
 def _entry_range(data: dict) -> tuple[float, float]:
     entry = data.get("entry")
     if isinstance(entry, list) and entry:
@@ -116,8 +123,8 @@ def parse_vision_signal_json(raw: str) -> VisionSignalResult:
         entry_max=entry_max,
         stop=stop,
         tps=_tp_targets(data),
-        leverage=int(data["leverage"]) if data.get("leverage") not in (None, "") else None,
-        confidence=int(data["confidence"]) if data.get("confidence") not in (None, "") else None,
+        leverage=_intish(data.get("leverage")),
+        confidence=_intish(data.get("confidence")),
         source_text=json.dumps(data, ensure_ascii=False),
     )
     return VisionSignalResult(
