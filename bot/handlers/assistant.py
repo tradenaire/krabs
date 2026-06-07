@@ -47,6 +47,10 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if f"@{bot_username}" not in update.message.text:
             return
 
+    from bot.handlers.signals import maybe_handle_signal_text
+    if await maybe_handle_signal_text(update, context):
+        return
+
     msg = update.message.text.strip()
     lo = msg.lower()
 

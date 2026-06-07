@@ -84,7 +84,8 @@ def log_event(stream: str, event: str, **fields: Any) -> None:
             **sanitize(fields),
         }
         line = json.dumps(record, ensure_ascii=False, default=_json_default)
-        (_LOG_DIR / f"{stream}-{day}.jsonl").open("a", encoding="utf-8").write(line + "\n")
+        with (_LOG_DIR / f"{stream}-{day}.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
     except Exception as e:
         logger.debug("structured log skipped: %s", e)
 

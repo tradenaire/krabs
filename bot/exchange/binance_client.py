@@ -418,6 +418,76 @@ class BinanceClient:
         log_event("decisions", "set_tp_sl_result", symbol=sym, results=results)
         return results
 
+    async def set_multi_tp_sl(self, symbol: str, tp_targets,
+                              sl_price: float | None = None,
+                              pos_data: dict | None = None) -> list[dict]:
+        sym = self.futures_symbol(symbol)
+        await self._exchange.load_markets()
+        if pos_data:
+            pos = pos_data
+        else:
+            pos = await self.get_position(symbol)
+            if not pos:
+                raise ValueError(f"No position for {sym}")
+
+        side = pos["side"]
+        contracts = _f(pos.get("contracts"))
+        if contracts <= 0:
+            raise ValueError(f"No contracts for {sym}")
+        close_side = "sell" if side == "long" else "buy"
+
+        await self.cancel_tp_sl_orders(symbol)
+
+        results = []
+        def _target_value(target, key: str) -> float:
+            if hasattr(target, key):
+                return float(getattr(target, key))
+            return float(target[key])
+
+        for idx, target in enumerate(tp_targets, 1):
+            price = _target_value(target, "price")
+            share_pct = _target_value(target, "share_pct")
+            qty = float(self._exchange.amount_to_precision(sym, contracts * share_pct / 100.0))
+            if qty <= 0:
+                continue
+            stop = float(self._exchange.price_to_precision(sym, price))
+            params = {"stopPrice": stop, "reduceOnly": True,
+                      "workingType": "MARK_PRICE"}
+            try:
+                order = await self._exchange.create_order(
+                    sym, "TAKE_PROFIT_MARKET", close_side, qty, None, params,
+                )
+                log_event("exchange", "binance_raw_response",
+                          operation=f"set_multi_tp_{idx}", raw=order.get("info"))
+                results.append({"type": "TP", "price": price, "share_pct": share_pct,
+                                "amount": qty, "result": {"success": True}})
+            except Exception as e:
+                results.append({"type": "TP", "price": price, "share_pct": share_pct,
+                                "result": {"success": False, "message": str(e)}, "error": str(e)})
+                raise RuntimeError(f"TP{idx} place failed for {sym}: {e}")
+
+        if sl_price:
+            stop = float(self._exchange.price_to_precision(sym, sl_price))
+            params = {"stopPrice": stop, "closePosition": True,
+                      "workingType": "MARK_PRICE"}
+            try:
+                order = await self._exchange.create_order(
+                    sym, "STOP_MARKET", close_side, None, None, params,
+                )
+                log_event("exchange", "binance_raw_response",
+                          operation="set_multi_sl", raw=order.get("info"))
+                results.append({"type": "SL", "price": sl_price,
+                                "result": {"success": True}})
+            except Exception as e:
+                results.append({"type": "SL", "price": sl_price,
+                                "result": {"success": False, "message": str(e)}, "error": str(e)})
+                raise RuntimeError(f"SL place failed for {sym}: {e}")
+
+        if not results:
+            results.append({"type": "skip", "result": {"success": True}})
+        log_event("decisions", "set_multi_tp_sl_result", symbol=sym, results=results)
+        return results
+
     @staticmethod
     def _order_kind(o: dict) -> str | None:
         t = str(o.get("type") or (o.get("info") or {}).get("type") or "").lower()

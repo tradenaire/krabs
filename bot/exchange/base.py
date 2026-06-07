@@ -19,6 +19,8 @@ Return-shape contract (the important ones):
     {id, symbol, trigger_price(float), side(int close-side), trigger_type(int),
      state} where trigger_type for long: TP=1/SL=2, for short: TP=2/SL=1.
 - set_tp_sl(...) -> list[dict] of {type:"TP"|"SL"|"skip", price?, result:{success,...}}
+- set_multi_tp_sl(...) is an optional Binance signal-execution extension for
+  partial TP orders; callers must check availability before using it.
 - was_closed_by_tp(symbol, pos_side, opened_at_ms=None) -> (bool|None, float|None)
 - get_funding_rate(symbol) -> {rate, next_funding_time, symbol}
 """
@@ -57,6 +59,9 @@ class IExchangeClient(Protocol):
     async def set_tp_sl(self, symbol: str, tp_price: float | None = None,
                         sl_price: float | None = None, pos_data: dict | None = None,
                         sl_limit_price: float | None = None) -> list[dict]: ...
+    async def set_multi_tp_sl(self, symbol: str, tp_targets,
+                              sl_price: float | None = None,
+                              pos_data: dict | None = None) -> list[dict]: ...
     async def get_tp_sl_orders(self, symbol: str | None = None) -> list[dict]: ...
     async def cancel_tp_sl_orders(self, symbol: str) -> int: ...
     async def cancel_plan_orders(self, symbol: str) -> None: ...

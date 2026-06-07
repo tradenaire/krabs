@@ -6,6 +6,31 @@ and which mistakes must not be repeated.
 
 Do not paste secrets into chat, Markdown, shell logs, or screenshots.
 
+## Mandatory Binance References
+
+Before planning, coding, debugging, or reviewing any Binance-related change,
+read and use these primary references:
+
+```text
+https://developers.binance.com/docs/derivatives/
+https://demo-fapi.binance.com/
+https://developers.binance.com/docs/binance-spot-api-docs/demo-mode/general-info
+```
+
+Use them as the source of truth for:
+
+```text
+USD-M futures endpoints
+Demo Trading behavior
+Demo base URLs
+Auth requirements
+API key environment differences
+Permission/IP whitelist checks
+```
+
+Do not rely on old Binance Futures Testnet assumptions without checking these
+references first.
+
 ## Current Toronto State
 
 Server:
@@ -71,10 +96,15 @@ Important: the server currently has local hotfix edits on top of
 ```text
 bot/main.py
 bot/exchange/binance_client.py
+bot/handlers/assistant.py
+bot/handlers/signals.py
+bot/signals/
+requirements.txt
+tests/test_signal_*.py
 ```
 
 Do not overwrite these by blindly running `git reset --hard` or re-copying the
-raw remote branch unless you reapply the hotfixes below.
+raw remote branch unless you reapply the hotfixes and signal changes below.
 
 ## What This Deploy Is
 
@@ -292,6 +322,65 @@ Reason: Binance deprecated the old futures sandbox/testnet flow. CCXT now expect
 These hotfixes should eventually be committed/pushed to `BinanceTest`. Until
 then, every deploy agent must preserve or reapply them after switching branches.
 
+### 3. Signal Image/Text Recognition And Execution
+
+The bot can accept a trading signal as text, image caption, or screenshot. This
+is a deterministic parser/OCR flow, not ChatGPT and not deep market analysis.
+
+Expected input shape:
+
+```text
+EPIC USDT
+SHORT
+Entry 0.2098 / 0.2104
+SL 0.2167
+TP1 0.1978 TP2 0.1942 TP3 0.1903
+3x
+Confidence 96%
+```
+
+Expected bot behavior:
+
+```text
+1. Parse symbol, LONG/SHORT, entry range, SL, TP1/TP2/TP3, leverage, confidence.
+2. Show a confirmation card.
+3. Wait for an inline button amount: $1, $2, $5, or $10.
+4. Open the futures position only after confirmation.
+5. Place 3 Binance reduce-only TAKE_PROFIT_MARKET orders.
+6. Place 1 close-position STOP_MARKET SL order.
+```
+
+Default TP split when the signal does not specify shares:
+
+```text
+TP1 50%
+TP2 25%
+TP3 25%
+```
+
+Relevant files:
+
+```text
+bot/signals/model.py
+bot/signals/parser.py
+bot/signals/preview.py
+bot/signals/store.py
+bot/signals/execution.py
+bot/handlers/signals.py
+bot/handlers/assistant.py
+bot/exchange/binance_client.py
+requirements.txt
+```
+
+OCR dependency:
+
+```text
+rapidocr-onnxruntime
+```
+
+If OCR is not installed, image messages will not be analyzed by GPT. The bot
+will ask the user to send the signal as text or as an image caption.
+
 ## Deploy To Toronto
 
 Connect to the server. If SSH key auth works:
@@ -329,6 +418,11 @@ Then upload/copy the local hotfixed files to the server:
 ```text
 K:\krabs-final\bot\main.py
 K:\krabs-final\bot\exchange\binance_client.py
+K:\krabs-final\bot\handlers\assistant.py
+K:\krabs-final\bot\handlers\signals.py
+K:\krabs-final\bot\signals\
+K:\krabs-final\requirements.txt
+K:\krabs-final\tests\test_signal_*.py
 ```
 
 Remote destinations:
@@ -336,6 +430,11 @@ Remote destinations:
 ```text
 /root/krabs/bot/main.py
 /root/krabs/bot/exchange/binance_client.py
+/root/krabs/bot/handlers/assistant.py
+/root/krabs/bot/handlers/signals.py
+/root/krabs/bot/signals/
+/root/krabs/requirements.txt
+/root/krabs/tests/
 ```
 
 Install/update dependencies:
@@ -424,9 +523,19 @@ git branch --show-current
 git rev-parse --short HEAD
 grep -n "Krabs3" bot/main.py
 grep -n "enable_demo_trading\|set_sandbox_mode" bot/exchange/binance_client.py
+grep -n "set_multi_tp_sl" bot/exchange/binance_client.py
 systemctl is-active krabs.service
 systemctl is-active krabs4.service || true
 ps -eo pid,ppid,lstart,cmd | grep -E "/root/krabs|/opt/krabs|start.py" | grep -v grep || true
+```
+
+Before changing Binance code or deployment settings, verify the plan/code
+against these references:
+
+```text
+https://developers.binance.com/docs/derivatives/
+https://demo-fapi.binance.com/
+https://developers.binance.com/docs/binance-spot-api-docs/demo-mode/general-info
 ```
 
 Expected:
@@ -437,8 +546,27 @@ krabs.service active
 krabs4.service inactive
 bot/main.py contains "Krabs3 — Binance Futures Bot"
 bot/exchange/binance_client.py contains enable_demo_trading(True)
+bot/exchange/binance_client.py contains set_multi_tp_sl
 no set_sandbox_mode(True)
 only one /root/krabs/start.py bot process
+```
+
+Verify signal parser and Binance multi-TP tests:
+
+```bash
+cd /root/krabs
+.venv/bin/python -B -m unittest \
+  tests.test_signal_parser \
+  tests.test_signal_store \
+  tests.test_signal_handler_format \
+  tests.test_signal_execution
+```
+
+Expected:
+
+```text
+Ran 8 tests
+OK
 ```
 
 Also verify the provider stored in SQLite:
@@ -641,6 +769,14 @@ systemctl restart krabs.service
 
 10. Do not switch to `exchange_provider=binance` unless the user explicitly wants
     live-money Binance trading.
+
+11. Do not route signal screenshots/text through ChatGPT for execution.
+    - Use deterministic OCR/regex parsing.
+    - Always show the confirmation card before opening a position.
+
+12. Do not place one close-all TP for parsed 3TP signals.
+    - Use partial reduce-only TP orders for TP1/TP2/TP3.
+    - Keep one SL close-position order for the whole remaining position.
 
 ## Safety Notes
 

@@ -21,6 +21,7 @@ from bot.handlers.trading import (short_handler, close_handler, avg_handler, set
                                    min_open_callback, avgunlock_callback,
                                    close_reentry_callback, close_final_callback, close_cancel_callback)
 from bot.handlers.assistant import assistant_handler, nlp_close_callback
+from bot.handlers.signals import signal_callback, signal_photo_handler
 from bot.handlers.stats import stats_handler
 from bot.jobs.main import setup_scheduler
 from bot.handlers.monitor_callbacks import (monitor_close_callback, monitor_close_confirm_callback,
@@ -63,6 +64,9 @@ async def start_handler(update: Update, context):
         "`/setkey exchange_provider binance`\n"
         "`/setkey binance_api_key YOUR_REAL_API_KEY`\n"
         "`/setkey binance_secret YOUR_REAL_SECRET`\n\n"
+        "*Signal screenshots/text:*\n"
+        "Send a signal image or text with SYMBOL, LONG/SHORT, Entry, SL, TP1/TP2/TP3.\n"
+        "The bot will show a confirmation card first; no GPT analysis is used for execution.\n\n"
         "💬 *Текстовые команды (без /)* — пиши как хочешь:\n"
         "• `открой CHIP` — шорт со стандартными настройками\n"
         "• `закрой BTC` — закрыть (с подтверждением)\n"
@@ -215,6 +219,7 @@ def main():
     app.add_handler(CommandHandler("pin", pin_handler))
     app.add_handler(CommandHandler("ask", ask_handler))
 
+    app.add_handler(CallbackQueryHandler(signal_callback, pattern=r"^sig_"))
     app.add_handler(CallbackQueryHandler(min_open_callback, pattern=r"^min_open_"))
     app.add_handler(CallbackQueryHandler(open_confirm_callback, pattern=r"^open_confirm_"))
     app.add_handler(CallbackQueryHandler(open_anyway_callback, pattern=r"^open_anyway_"))
@@ -244,6 +249,7 @@ def main():
     app.add_handler(CallbackQueryHandler(avgunlock_callback, pattern=r"^avgunlock_"))
 
     # NLP free-form text (lowest priority — after all commands and callbacks)
+    app.add_handler(MessageHandler(filters.PHOTO, signal_photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, assistant_handler))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
