@@ -17,7 +17,7 @@ class Config:
     binance_testnet: bool = True
 
     openrouter_api_key: str = ""
-    openrouter_model: str = "x-ai/grok-4-fast:online"
+    openrouter_model: str = "openai/gpt-5.5:online"
     signal_vision_model: str = "openai/gpt-5.5"
     anthropic_api_key: str = ""
 

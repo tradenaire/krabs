@@ -1054,7 +1054,10 @@ async def auto_scan_job(app):
         m = _re.match(r"(\d+)", pick.get("risk", "10"))
         return int(m.group(1)) if m else 10
 
-    good_picks = [p for p in picks if _risk_int(p) <= max_risk]
+    good_picks = [
+        p for p in picks
+        if p.get("side", "short") == "short" and _risk_int(p) <= max_risk
+    ]
     filtered_out = len(picks) - len(good_picks)
 
     if not good_picks:
