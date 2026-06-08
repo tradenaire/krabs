@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from bot.exchange.binance_client import BinanceClient
 from bot.signals.execution import execute_signal
@@ -40,8 +42,12 @@ class FakeClient:
     def __init__(self):
         self.open_args = None
         self.multi_tpsl_args = None
+        self.multi_tpsl_calls = []
+        self.position = {"symbol": "EPIC/USDT:USDT", "side": "short", "contracts": 10.0, "entry_price": 0.2101}
 
     def futures_symbol(self, symbol):
+        if "/" in symbol:
+            return symbol
         return f"{symbol}/USDT:USDT"
 
     async def place_futures_order(self, symbol, side, amount_usdt, leverage, margin_mode=None):
@@ -49,10 +55,11 @@ class FakeClient:
         return {"id": "open-1", "price": 0.2101, "leverage": leverage}
 
     async def get_position(self, symbol):
-        return {"symbol": self.futures_symbol(symbol), "side": "short", "contracts": 10.0, "entry_price": 0.2101}
+        return dict(self.position, symbol=self.futures_symbol(symbol))
 
     async def set_multi_tp_sl(self, symbol, tp_targets, sl_price, pos_data=None):
         self.multi_tpsl_args = (symbol, tp_targets, sl_price, pos_data)
+        self.multi_tpsl_calls.append(self.multi_tpsl_args)
         return [{"type": "TP"}, {"type": "TP"}, {"type": "TP"}, {"type": "SL"}]
 
 
@@ -100,6 +107,46 @@ class SignalExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.multi_tpsl_args[2], 0.2167)
         self.assertEqual(result["symbol"], "EPIC/USDT:USDT")
         self.assertEqual(result["orders"], 4)
+
+    async def test_execute_signal_disables_default_exits_when_opening_through_service(self):
+        client = FakeClient()
+        app = SimpleNamespace(bot_data={"config": SimpleNamespace(default_leverage=5)})
+        calls = []
+
+        async def fake_execute_open(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return {"id": "open-1", "entry_price": 0.2101, "leverage": 3}
+
+        with patch("bot.services.trading.execute_open", fake_execute_open):
+            await execute_signal(client, app=app, signal=self._signal(), margin=2)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["kwargs"].get("setup_exits"), False)
+        self.assertEqual(len(client.multi_tpsl_calls), 1)
+
+    async def test_execute_signal_rejects_immediate_trigger_tp_before_multi_tp_call(self):
+        client = FakeClient()
+        client.position = {
+            "symbol": "HYPE/USDT:USDT",
+            "side": "short",
+            "contracts": 100.0,
+            "entry_price": 10.0,
+            "mark_price": 9.8,
+        }
+        signal = ParsedSignal(
+            symbol="HYPE",
+            side="short",
+            entry_min=9.9,
+            entry_max=10.1,
+            stop=10.5,
+            tps=(TpTarget(10.1, 50), TpTarget(9.4, 25), TpTarget(9.0, 25)),
+            leverage=5,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "TP1.*сработал бы сразу"):
+            await execute_signal(client, app=None, signal=signal, margin=2)
+
+        self.assertEqual(client.multi_tpsl_calls, [])
 
 
 if __name__ == "__main__":

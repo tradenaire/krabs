@@ -402,7 +402,12 @@ async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await _do_execute_open(q, client, context.application, symbol, side, margin, leverage)
     except Exception as e:
-        await q.message.reply_text(f"❌ Ошибка: {e}")
+        from bot.services.exchange_errors import format_open_error
+        side_name = "short" if side == "sell" else "long"
+        await q.message.reply_text(
+            format_open_error(e, symbol=symbol, side=side_name),
+            parse_mode="Markdown",
+        )
 
 
 async def open_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,7 +434,12 @@ async def open_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         await _do_execute_open(q, client, context.application, symbol, side, margin, leverage)
     except Exception as e:
-        await q.message.reply_text(f"❌ Ошибка: {e}")
+        from bot.services.exchange_errors import format_open_error
+        side_name = "short" if side == "sell" else "long"
+        await q.message.reply_text(
+            format_open_error(e, symbol=symbol, side=side_name),
+            parse_mode="Markdown",
+        )
 
 
 async def open_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -496,7 +506,12 @@ async def open_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(f"📊 Автодокупка: `${min_avg:.2f}`/шаг")
         await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
-        await q.message.reply_text(f"❌ Ошибка: {e}")
+        from bot.services.exchange_errors import format_open_error
+        side_name = "short" if side == "sell" else "long"
+        await q.message.reply_text(
+            format_open_error(e, symbol=symbol, side=side_name),
+            parse_mode="Markdown",
+        )
 
 
 async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

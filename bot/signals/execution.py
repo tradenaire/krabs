@@ -4,6 +4,36 @@ from bot.signals.model import ParsedSignal
 from bot.signals.symbols import resolve_signal_symbol
 
 
+def _validate_exits_against_live_position(signal: ParsedSignal, pos: dict) -> None:
+    side = signal.side
+    entry = float(pos.get("entry_price") or 0)
+    mark = float(pos.get("mark_price") or entry or 0)
+    reference = mark or entry
+    if reference <= 0:
+        return
+
+    for idx, tp in enumerate(signal.tps, 1):
+        price = float(tp.price)
+        if side == "short" and price >= reference:
+            raise RuntimeError(
+                f"TP{idx} сработал бы сразу: SHORT TP `{price:.8g}` должен быть ниже текущей цены `{reference:.8g}`."
+            )
+        if side == "long" and price <= reference:
+            raise RuntimeError(
+                f"TP{idx} сработал бы сразу: LONG TP `{price:.8g}` должен быть выше текущей цены `{reference:.8g}`."
+            )
+
+    stop = float(signal.stop)
+    if side == "short" and stop <= reference:
+        raise RuntimeError(
+            f"SL сработал бы сразу: SHORT SL `{stop:.8g}` должен быть выше текущей цены `{reference:.8g}`."
+        )
+    if side == "long" and stop >= reference:
+        raise RuntimeError(
+            f"SL сработал бы сразу: LONG SL `{stop:.8g}` должен быть ниже текущей цены `{reference:.8g}`."
+        )
+
+
 async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> dict:
     leverage = signal.leverage
     if not leverage and app is not None:
@@ -32,6 +62,7 @@ async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> di
             leverage=leverage,
             tp_pct=500,
             sl_pct=500,
+            setup_exits=False,
         )
     else:
         open_result = await client.place_futures_order(symbol, signal.order_side, margin, leverage)
@@ -40,12 +71,20 @@ async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> di
     if not pos:
         raise RuntimeError(f"No opened position found for {symbol}.")
 
-    orders = await client.set_multi_tp_sl(
-        symbol,
-        signal.tps,
-        signal.stop,
-        pos_data=pos,
-    )
+    try:
+        _validate_exits_against_live_position(signal, pos)
+        orders = await client.set_multi_tp_sl(
+            symbol,
+            signal.tps,
+            signal.stop,
+            pos_data=pos,
+        )
+    except Exception:
+        try:
+            await client.close_futures_position(symbol)
+        except Exception:
+            pass
+        raise
     return {
         "symbol": symbol,
         "side": signal.side,

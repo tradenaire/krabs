@@ -36,7 +36,8 @@ class MinOrderUpgradeNeeded(Exception):
 async def execute_open(client, app, symbol: str, side: str,
                        margin: float, leverage: int | None = None,
                        tp_pct: float = 500, sl_pct: float = 500,
-                       interactive: bool = False, pick: dict | None = None) -> dict:
+                       interactive: bool = False, pick: dict | None = None,
+                       setup_exits: bool = True) -> dict:
     """Open a futures position with TP/SL and register re-entry.
 
     interactive=True: raises MinOrderUpgradeNeeded instead of silently upgrading margin.
@@ -47,6 +48,7 @@ async def execute_open(client, app, symbol: str, side: str,
         "decisions", "execute_open_start", symbol=symbol, side=side,
         requested_margin=margin, requested_leverage=leverage,
         tp_pct=tp_pct, sl_pct=sl_pct, interactive=interactive,
+        setup_exits=setup_exits,
     )
     await snapshot_exchange_state(
         client, "before_open", symbol=symbol, requested_side=side,
@@ -130,7 +132,9 @@ async def execute_open(client, app, symbol: str, side: str,
         liq = pos.get("liquidation_price", 0)
         pos_side = pos["side"]
 
-        if exit_mode == "ladder":
+        if not setup_exits:
+            pass
+        elif exit_mode == "ladder":
             # 3-TP partial exit with breakeven SL — managed by LadderExitEngine.
             try:
                 from bot.services import ladder as ladder_svc
@@ -262,9 +266,21 @@ async def close_position(client, bot_data, symbol: str, *,
     db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note=note)
     db_mod.close_position_history(symbol, exit_price, pnl, note)
 
+    result = {
+        "symbol": client.futures_symbol(symbol),
+        "side": pos.get("side") if pos else "",
+        "pnl": pnl,
+        "margin": margin,
+        "exit_price": exit_price,
+        "entry_price": float(pos.get("entry_price", 0)) if pos else 0.0,
+        "leverage": int(pos.get("leverage", 1)) if pos else 1,
+        "close_reason": note,
+    }
+
     if not keep_reentry:
         db_mod.delete_reentry(symbol)
-        return {"pnl": pnl, "margin": margin, "exit_price": exit_price, "cycles_left": None}
+        result["cycles_left"] = None
+        return result
 
     re_rec = db_mod.get_reentry(symbol)
     cycles_left = 0
@@ -272,7 +288,37 @@ async def close_position(client, bot_data, symbol: str, *,
         mc = re_rec.get("max_cycles") or 0
         cc = re_rec.get("cycle_count") or 0
         cycles_left = max(0, int(mc) - int(cc))
-    return {"pnl": pnl, "margin": margin, "exit_price": exit_price, "cycles_left": cycles_left}
+    result["cycles_left"] = cycles_left
+    return result
+
+
+def format_manual_close_result(res: dict, *, keep_reentry: bool) -> str:
+    from bot.services.trade_messages import CloseFacts, ReentryFacts, format_close_message
+
+    cycles_left = res.get("cycles_left")
+    cycle_next = 1 if keep_reentry else None
+    max_cycles = (int(cycles_left) + 1) if keep_reentry and cycles_left is not None else None
+    return format_close_message(
+        CloseFacts(
+            symbol=res.get("symbol") or "",
+            side=res.get("side") or "short",
+            reason_code=res.get("close_reason") or "manual",
+            reason_label="ручное закрытие",
+            entry_price=float(res.get("entry_price") or 0),
+            exit_price=float(res.get("exit_price") or 0),
+            leverage=int(res.get("leverage") or 1),
+            margin=float(res.get("margin") or 0),
+            realized_pnl=float(res.get("pnl") or 0),
+        ),
+        ReentryFacts(
+            enabled=keep_reentry,
+            will_reenter=keep_reentry,
+            why="пользователь выбрал закрытие с перезаходом" if keep_reentry else "пользователь выбрал закрыть насовсем",
+            cycle_next=cycle_next,
+            max_cycles=max_cycles,
+            cooldown_text="примерно 30с" if keep_reentry else "",
+        ),
+    )
 
 
 def format_open_result(result: dict, requested_margin: float,

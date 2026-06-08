@@ -34,8 +34,12 @@ async def monitor_close_confirm_callback(update: Update, context: ContextTypes.D
     try:
         await q.edit_message_text(f"⏳ Закрываю `{coin}`...", parse_mode="Markdown")
         from bot.services.trading import close_position
-        await close_position(client, context.bot_data, symbol, keep_reentry=False)
-        await q.edit_message_text(f"✅ *{coin}* закрыт.", parse_mode="Markdown")
+        from bot.services.trading import format_manual_close_result
+        res = await close_position(client, context.bot_data, symbol, keep_reentry=False)
+        await q.edit_message_text(
+            format_manual_close_result(res, keep_reentry=False),
+            parse_mode="Markdown",
+        )
     except Exception as e:
         await q.edit_message_text(f"❌ Ошибка закрытия {coin}: {e}")
 

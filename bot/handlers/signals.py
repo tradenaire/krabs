@@ -201,7 +201,15 @@ async def signal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await execute_signal(client, context.application, signal, margin)
     except Exception as e:
-        await q.edit_message_text(f"Ошибка открытия сигнала: {e}")
+        from bot.services.exchange_errors import format_open_error
+        await q.edit_message_text(
+            format_open_error(
+                e,
+                symbol=f"{signal.symbol}/USDT:USDT",
+                side=signal.side,
+            ),
+            parse_mode="Markdown",
+        )
         return
 
     clear_signal(context.user_data, signal_id)

@@ -390,7 +390,11 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка открытия: {e}")
+            from bot.services.exchange_errors import format_open_error
+            await update.message.reply_text(
+                format_open_error(e, symbol=symbol, side="short"),
+                parse_mode="Markdown",
+            )
         return
 
     # ── Close all / close symbol (with confirmation) ──────────────
@@ -522,8 +526,9 @@ async def nlp_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             symbol = pos["symbol"]
             coin = symbol.split("/")[0]
             try:
-                await close_position(client, context.bot_data, symbol, keep_reentry=False)
-                results.append(f"✅ `{coin}`")
+                from bot.services.trading import format_manual_close_result
+                res = await close_position(client, context.bot_data, symbol, keep_reentry=False)
+                results.append(format_manual_close_result(res, keep_reentry=False))
             except Exception as e:
                 results.append(f"❌ `{coin}`: {e}")
         await q.edit_message_text("Закрыто:\n" + "\n".join(results), parse_mode="Markdown")
@@ -547,10 +552,10 @@ async def nlp_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     coin = symbol.split("/")[0]
     try:
         res = await close_position(client, context.bot_data, symbol, keep_reentry=False)
-        pnl = res["pnl"]
-        sign = "+" if pnl >= 0 else ""
+        from bot.services.trading import format_manual_close_result
         await q.edit_message_text(
-            f"✅ `{coin}` закрыт ({sign}${pnl:.2f})", parse_mode="Markdown"
+            format_manual_close_result(res, keep_reentry=False),
+            parse_mode="Markdown",
         )
     except Exception as e:
         await q.edit_message_text(f"❌ {e}")

@@ -111,7 +111,11 @@ async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = format_open_result(result, margin, _funding_line(rate, result["leverage"]))
         await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        from bot.services.exchange_errors import format_open_error
+        await update.message.reply_text(
+            format_open_error(e, symbol=sym, side="short"),
+            parse_mode="Markdown",
+        )
 
 
 async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,9 +145,10 @@ async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _do_close(client, context, symbol: str, keep_reentry: bool):
-    """Thin wrapper over services.trading.close_position. Returns (pnl, cycles_left)."""
+    """Thin wrapper over services.trading.close_position. Returns user-facing text."""
+    from bot.services.trading import format_manual_close_result
     res = await _svc_close(client, context.bot_data, symbol, keep_reentry=keep_reentry)
-    return res["pnl"], res["cycles_left"]
+    return format_manual_close_result(res, keep_reentry=keep_reentry)
 
 
 async def close_reentry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,13 +159,8 @@ async def close_reentry_callback(update: Update, context: ContextTypes.DEFAULT_T
     client = context.bot_data["exchange"]
     coin = symbol.split("/")[0]
     try:
-        pnl, cycles_left = await _do_close(client, context, symbol, keep_reentry=True)
-        pnl_s = f"`{pnl:+.2f}$`" if pnl != 0 else ""
-        await q.edit_message_text(
-            f"✅ *{coin}* закрыт{(' ' + pnl_s) if pnl_s else ''}\n"
-            f"🔄 Перезаход через ~30с (осталось: {cycles_left})",
-            parse_mode="Markdown",
-        )
+        text = await _do_close(client, context, symbol, keep_reentry=True)
+        await q.edit_message_text(text, parse_mode="Markdown")
     except Exception as e:
         await q.edit_message_text(f"❌ Ошибка: {e}")
 
@@ -173,9 +173,8 @@ async def close_final_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     client = context.bot_data["exchange"]
     coin = symbol.split("/")[0]
     try:
-        pnl, _ = await _do_close(client, context, symbol, keep_reentry=False)
-        pnl_s = f" `{pnl:+.2f}$`" if pnl != 0 else ""
-        await q.edit_message_text(f"✅ *{coin}* закрыт{pnl_s}.", parse_mode="Markdown")
+        text = await _do_close(client, context, symbol, keep_reentry=False)
+        await q.edit_message_text(text, parse_mode="Markdown")
     except Exception as e:
         await q.edit_message_text(f"❌ Ошибка: {e}")
 
@@ -883,7 +882,12 @@ async def min_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"🛑 SL: `-{pending['sl_pct']:.0f}%` (`{result['sl_price']:.6g}`)")
         await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
-        await query.edit_message_text(f"❌ Ошибка: {e}")
+        from bot.services.exchange_errors import format_open_error
+        side_name = "short" if pending["side"] == "sell" else "long"
+        await query.edit_message_text(
+            format_open_error(e, symbol=pending["symbol"], side=side_name),
+            parse_mode="Markdown",
+        )
 
 
 async def avgunlock_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
