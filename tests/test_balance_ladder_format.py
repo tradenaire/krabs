@@ -79,6 +79,62 @@ class BalanceLadderFormatTests(unittest.TestCase):
         self.assertIn("Averaging: disabled", text)
         self.assertNotIn("PnL <=", text)
 
+    def test_position_block_uses_active_exchange_orders_without_ladder(self):
+        config = SimpleNamespace(
+            max_reentry_cycles=3,
+            averaging_enabled=True,
+            averaging_threshold=-100,
+            averaging_amount=0.5,
+            max_averaging_count=10,
+            tp_ladder_pcts="50,120,250",
+        )
+        orders = [
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 95.0, "trigger_type": 2},
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 90.0, "trigger_type": 2},
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 80.0, "trigger_type": 2},
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 105.0, "trigger_type": 1},
+        ]
+
+        with patch("bot.db.get_tp_ladder", return_value=None):
+            text = format_position_block(
+                self._pos(),
+                db_rec={"tp_pct": 500, "sl_pct": 500, "averaging_count": 0, "total_invested": 10.0},
+                re_rec=None,
+                config=config,
+                tp_sl_pcts={},
+                active_tpsl_orders=orders,
+            )
+
+        self.assertIn("TP1:95", text)
+        self.assertIn("TP2:90", text)
+        self.assertIn("TP3:80", text)
+        self.assertIn("SL:-50%", text)
+        self.assertNotIn("TP:", text)
+
+    def test_position_block_falls_back_to_configured_three_tp_levels(self):
+        config = SimpleNamespace(
+            max_reentry_cycles=3,
+            averaging_enabled=True,
+            averaging_threshold=-100,
+            averaging_amount=0.5,
+            max_averaging_count=10,
+            tp_ladder_pcts="50,120,250",
+        )
+
+        with patch("bot.db.get_tp_ladder", return_value=None):
+            text = format_position_block(
+                self._pos(),
+                db_rec={"tp_pct": 500, "sl_pct": 500, "averaging_count": 0, "total_invested": 10.0},
+                re_rec=None,
+                config=config,
+                tp_sl_pcts={},
+            )
+
+        self.assertIn("TP1", text)
+        self.assertIn("TP2", text)
+        self.assertIn("TP3", text)
+        self.assertNotIn("TP:", text)
+
 
 if __name__ == "__main__":
     unittest.main()

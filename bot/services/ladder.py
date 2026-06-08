@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 
-from bot.services.tpsl import calc_tp_price, calc_sl_price
+from bot.services.tpsl import calc_tp_price, calc_sl_price, validate_exit_prices, verify_exit_orders
 
 logger = logging.getLogger(__name__)
 
@@ -88,22 +88,18 @@ async def setup_on_open(client, app, symbol: str, side: str, entry: float,
     config = app.bot_data.get("config")
     partial_pct = float(getattr(config, "tp_partial_pct", 50.0))
     tps, sl = compute_levels(entry, leverage, side, pick, config)
+    validate_exit_prices(symbol, side, entry, tps, sl)
     qtys = tp_quantities(contracts, partial_pct, n_levels=len(tps))
 
     fsym = client.futures_symbol(symbol)
-    # Initial SL (closePosition) at the computed level.
-    try:
-        await client.place_reduce_sl(symbol, side, sl, qty=None)
-    except Exception as e:
-        logger.warning("ladder %s: initial SL failed: %s", fsym, e)
+    await client.place_reduce_sl(symbol, side, sl, qty=None)
 
     for i, (tp, q) in enumerate(zip(tps, qtys), 1):
         if q <= 0:
             continue
-        try:
-            await client.place_reduce_tp(symbol, side, q, tp)
-        except Exception as e:
-            logger.warning("ladder %s: TP%d failed: %s", fsym, i, e)
+        await client.place_reduce_tp(symbol, side, q, tp)
+
+    await verify_exit_orders(client, symbol, side, tps, sl)
 
     padded = (tps + [0.0, 0.0, 0.0])[:3]
     await adb.upsert_tp_ladder(fsym, side, entry, leverage, padded[0], padded[1], padded[2], sl)
@@ -112,7 +108,7 @@ async def setup_on_open(client, app, symbol: str, side: str, entry: float,
 
 
 async def rebuild(client, app, symbol: str, ladder: dict, contracts: float,
-                  breakeven: bool) -> None:
+                  breakeven: bool, reference: float | None = None) -> None:
     """Cancel all conditional orders and re-place SL + remaining (unfilled) TPs,
     sizing from the current remaining contracts. SL goes to entry if breakeven."""
     config = app.bot_data.get("config")
@@ -133,17 +129,14 @@ async def rebuild(client, app, symbol: str, ladder: dict, contracts: float,
         logger.debug("ladder rebuild cancel %s: %s", symbol, e)
 
     sl_price = entry if breakeven else float(ladder["sl"])
-    try:
-        await client.place_reduce_sl(symbol, side, sl_price, qty=None)
-    except Exception as e:
-        logger.warning("ladder rebuild SL %s: %s", symbol, e)
+    validation_reference = float(reference or entry)
+    validate_exit_prices(symbol, side, validation_reference, remaining_levels, sl_price)
+    await client.place_reduce_sl(symbol, side, sl_price, qty=None)
 
     if remaining_levels:
         qtys = tp_quantities(contracts, partial_pct, n_levels=len(remaining_levels))
         for tp, q in zip(remaining_levels, qtys):
             if q <= 0:
                 continue
-            try:
-                await client.place_reduce_tp(symbol, side, q, tp)
-            except Exception as e:
-                logger.warning("ladder rebuild TP %s @%.6g: %s", symbol, tp, e)
+            await client.place_reduce_tp(symbol, side, q, tp)
+    await verify_exit_orders(client, symbol, side, remaining_levels, sl_price)

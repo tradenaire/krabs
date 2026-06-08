@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from bot.signals.model import ParsedSignal
 from bot.signals.symbols import resolve_signal_symbol
+from bot.services.tpsl import verify_exit_orders
 
 
 def _validate_exits_against_live_position(signal: ParsedSignal, pos: dict) -> None:
@@ -78,6 +79,13 @@ async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> di
             signal.tps,
             signal.stop,
             pos_data=pos,
+        )
+        await verify_exit_orders(
+            client,
+            symbol,
+            signal.side,
+            [float(tp.price) for tp in signal.tps],
+            float(signal.stop),
         )
     except Exception:
         try:

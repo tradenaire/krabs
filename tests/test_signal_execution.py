@@ -43,6 +43,13 @@ class FakeClient:
         self.open_args = None
         self.multi_tpsl_args = None
         self.multi_tpsl_calls = []
+        self.close_calls = []
+        self.tpsl_orders = [
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 0.1978, "trigger_type": 2},
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 0.1942, "trigger_type": 2},
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 0.1903, "trigger_type": 2},
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 0.2167, "trigger_type": 1},
+        ]
         self.position = {"symbol": "EPIC/USDT:USDT", "side": "short", "contracts": 10.0, "entry_price": 0.2101}
 
     def futures_symbol(self, symbol):
@@ -61,6 +68,14 @@ class FakeClient:
         self.multi_tpsl_args = (symbol, tp_targets, sl_price, pos_data)
         self.multi_tpsl_calls.append(self.multi_tpsl_args)
         return [{"type": "TP"}, {"type": "TP"}, {"type": "TP"}, {"type": "SL"}]
+
+    async def get_tp_sl_orders(self, symbol):
+        fsym = self.futures_symbol(symbol)
+        return [order for order in self.tpsl_orders if order.get("symbol") == fsym]
+
+    async def close_futures_position(self, symbol):
+        self.close_calls.append(symbol)
+        return {"status": "closed"}
 
 
 class SignalExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -162,6 +177,15 @@ class SignalExecutionTests(unittest.IsolatedAsyncioTestCase):
             await execute_signal(client, app=None, signal=signal, margin=2)
 
         self.assertEqual(client.multi_tpsl_calls, [])
+
+    async def test_execute_signal_closes_fresh_entry_if_exchange_readback_has_no_tpsl(self):
+        client = FakeClient()
+        client.tpsl_orders = []
+
+        with self.assertRaisesRegex(RuntimeError, "expected 3 TP"):
+            await execute_signal(client, app=None, signal=self._signal(), margin=2)
+
+        self.assertEqual(client.close_calls, ["EPIC/USDT:USDT"])
 
 
 if __name__ == "__main__":

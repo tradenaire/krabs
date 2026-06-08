@@ -102,6 +102,15 @@ class LadderExitEngine(Engine):
             # After the first TP, move SL to breakeven; re-assert remaining TPs.
             breakeven = bool(getattr(self.app.bot_data.get("config"), "breakeven_on_first_tp", True))
             contracts = float(pos.get("contracts", 0))
-            await ladder_svc.rebuild(client, self.app, symbol, lad, contracts, breakeven=breakeven)
+            reference = float(pos.get("mark_price") or pos.get("entry_price") or lad.get("entry_price") or 0)
+            await ladder_svc.rebuild(
+                client,
+                self.app,
+                symbol,
+                lad,
+                contracts,
+                breakeven=breakeven,
+                reference=reference,
+            )
             if breakeven:
                 await adb.mark_ladder_breakeven(symbol)

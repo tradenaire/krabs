@@ -12,7 +12,7 @@ import logging
 
 from bot import db as db_mod
 from bot.event_logger import log_event, snapshot_exchange_state
-from bot.services.tpsl import calc_tp_price, calc_sl_price
+from bot.services.tpsl import calc_tp_price, calc_sl_price, set_tp_sl_verified
 from bot.services.sizing import max_leverage_by_vol
 
 logger = logging.getLogger(__name__)
@@ -139,16 +139,22 @@ async def execute_open(client, app, symbol: str, side: str,
             # 3-TP partial exit with breakeven SL — managed by LadderExitEngine.
             try:
                 from bot.services import ladder as ladder_svc
+                lad = ladder_svc.compute_levels(entry, actual_lev, pos_side, pick, config)
                 await client.cancel_tp_sl_orders(symbol)
                 await ladder_svc.setup_on_open(
                     client, app, symbol, pos_side, entry, actual_lev,
                     float(pos.get("contracts", 0)), pick,
                 )
-                lad = ladder_svc.compute_levels(entry, actual_lev, pos_side, pick, config)
                 tp_price, sl_price = lad[0][0], lad[1]  # TP1 / SL for the return summary
             except Exception as e:
                 log_event("errors", "execute_open_ladder_failed", symbol=symbol, error=str(e))
-                logger.warning("ladder setup failed for %s: %s", symbol, e)
+                logger.warning("ladder setup failed for %s; closing fresh entry: %s", symbol, e)
+                try:
+                    await client.cancel_tp_sl_orders(symbol)
+                    await client.close_futures_position(symbol)
+                except Exception as close_err:
+                    log_event("errors", "execute_open_ladder_cleanup_failed", symbol=symbol, error=str(close_err))
+                raise
         else:
             tp_price = calc_tp_price(entry, actual_lev, tp_pct, pos_side)
             sl_price = calc_sl_price(entry, actual_lev, sl_pct, pos_side)
@@ -158,7 +164,7 @@ async def execute_open(client, app, symbol: str, side: str,
                     tp_price=tp_price, sl_price=sl_price,
                 )
                 await client.cancel_tp_sl_orders(symbol)
-                await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price)
+                await set_tp_sl_verified(client, symbol, pos_side, tp_price, sl_price, pos)
                 await snapshot_exchange_state(
                     client, "after_tpsl_set", symbol=symbol,
                     tp_price=tp_price, sl_price=sl_price,
@@ -168,7 +174,13 @@ async def execute_open(client, app, symbol: str, side: str,
                     "errors", "execute_open_tpsl_failed", symbol=symbol,
                     tp_price=tp_price, sl_price=sl_price, error=str(e),
                 )
-                logger.warning("TP/SL set failed for %s: %s", symbol, e)
+                logger.warning("TP/SL set failed for %s; closing fresh entry: %s", symbol, e)
+                try:
+                    await client.cancel_tp_sl_orders(symbol)
+                    await client.close_futures_position(symbol)
+                except Exception as close_err:
+                    log_event("errors", "execute_open_tpsl_cleanup_failed", symbol=symbol, error=str(close_err))
+                raise
 
     fsym = client.futures_symbol(symbol)
     max_avg_count = int(getattr(config, "max_averaging_count", 100)) if config else 100

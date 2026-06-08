@@ -13,7 +13,8 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
                         tp_sl_pcts: dict, db_map: dict, re_map: dict,
                         config, daily_stats: dict,
                         lev_cache: dict | None = None,
-                        spot_raw: dict | None = None) -> str:
+                        spot_raw: dict | None = None,
+                        active_tpsl_map: dict | None = None) -> str:
     from bot.pos_format import format_position_block
 
     free = float(futures_raw.get("free", {}).get("USDT", 0) or 0)
@@ -31,6 +32,7 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
         lines = ["*Баланс💰*", "_Нет открытых позиций_"]
 
     lev_cache = lev_cache or {}
+    active_tpsl_map = active_tpsl_map or {}
 
     # Per-position blocks
     for pos in positions:
@@ -45,6 +47,7 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
             tp_sl_pcts=tp_sl_pcts,
             max_lev=cached.get("max_lev", 0),
             max_pos_usdt=cached.get("max_pos_usdt", 0),
+            active_tpsl_orders=active_tpsl_map.get(symbol, []),
         )
         lines.append(block)
 
@@ -179,22 +182,51 @@ async def _fetch_lev_cache(client, positions: list[dict]) -> dict:
     return cache
 
 
+def _normalize_order_symbol(symbol: str) -> str:
+    value = str(symbol or "")
+    if "/" in value:
+        return value if ":USDT" in value else f"{value}:USDT"
+    if "_" in value:
+        base, quote = value.split("_", 1)
+        return f"{base}/{quote}:USDT"
+    if value.endswith("USDT") and len(value) > 4:
+        return f"{value[:-4]}/USDT:USDT"
+    return value
+
+
+def _build_active_tpsl_map(positions: list[dict], orders: list[dict]) -> dict:
+    wanted = {pos["symbol"] for pos in positions}
+    by_symbol = {symbol: [] for symbol in wanted}
+    for order in orders or []:
+        symbol = _normalize_order_symbol(order.get("symbol", ""))
+        if symbol in by_symbol:
+            by_symbol[symbol].append(order)
+    return by_symbol
+
+
 async def _fetch_all(client, context):
     from bot import db as db_mod
     from datetime import date
 
-    futures_bal, spot_bal, positions = await asyncio.gather(
+    tpsl_coro = client.get_tp_sl_orders() if hasattr(client, "get_tp_sl_orders") else None
+    fetches = [
         client.get_futures_balance(),
         client.get_spot_balance(),
         client.get_positions(),
-        return_exceptions=True,
-    )
+    ]
+    if tpsl_coro is not None:
+        fetches.append(tpsl_coro)
+    fetched = await asyncio.gather(*fetches, return_exceptions=True)
+    futures_bal, spot_bal, positions = fetched[:3]
+    active_tpsl_orders = fetched[3] if len(fetched) > 3 else []
     if isinstance(futures_bal, Exception):
         raise futures_bal
     if isinstance(positions, Exception):
         raise positions
     if isinstance(spot_bal, Exception):
         spot_bal = None
+    if isinstance(active_tpsl_orders, Exception):
+        active_tpsl_orders = []
 
     db_recs = {r["symbol"]: r for r in db_mod.get_open_positions()}
     re_recs = {r["symbol"]: r for r in db_mod.get_all_reentry()}
@@ -202,20 +234,21 @@ async def _fetch_all(client, context):
     tp_sl_pcts = context.bot_data.get("tp_sl_pcts", {})
     daily_stats = db_mod.get_daily_stats(date.today().isoformat())
     lev_cache = await _fetch_lev_cache(client, positions)
+    active_tpsl_map = _build_active_tpsl_map(positions, active_tpsl_orders)
 
-    return futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal
+    return futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, active_tpsl_map
 
 
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = context.bot_data["exchange"]
     try:
-        futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
+        futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, active_tpsl_map = \
             await _fetch_all(client, context)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
         return
 
-    text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
+    text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, active_tpsl_map)
     kb = _build_close_kb(positions, config)
     # Split if Telegram limit exceeded (4096 chars)
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
@@ -257,12 +290,12 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data in ("balance_refresh", "balance_futures"):
         client = context.bot_data["exchange"]
         try:
-            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
+            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, active_tpsl_map = \
                 await _fetch_all(client, context)
         except Exception as e:
             await q.answer(f"Ошибка: {e}", show_alert=True)
             return
-        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
+        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, active_tpsl_map)
         kb = _build_close_kb(positions, config)
         chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
         try:
@@ -363,12 +396,12 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Refresh balance message with updated buttons
         client = context.bot_data["exchange"]
         try:
-            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
+            futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, active_tpsl_map = \
                 await _fetch_all(client, context)
         except Exception as e:
             await q.answer(f"Ошибка: {e}", show_alert=True)
             return
-        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal)
+        text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal, active_tpsl_map)
         kb = _build_close_kb(positions, config)
         try:
             await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)

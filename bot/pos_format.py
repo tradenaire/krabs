@@ -62,11 +62,60 @@ def _format_ladder_lines(ladder: dict, entry: float, lev: int, side: str) -> lis
     return lines
 
 
+def _format_order_lines(orders: list[dict], entry: float, lev: int, side: str) -> list[str]:
+    if not orders:
+        return []
+    tp_type, sl_type = (1, 2) if side == "long" else (2, 1)
+    tp_prices = [
+        float(order.get("trigger_price") or 0)
+        for order in orders
+        if int(order.get("trigger_type") or 0) == tp_type
+        and float(order.get("trigger_price") or 0) > 0
+    ]
+    sl_prices = [
+        float(order.get("trigger_price") or 0)
+        for order in orders
+        if int(order.get("trigger_type") or 0) == sl_type
+        and float(order.get("trigger_price") or 0) > 0
+    ]
+    tp_prices = sorted(set(tp_prices), reverse=(side == "short"))[:3]
+
+    lines: list[str] = []
+    for idx, price in enumerate(tp_prices, 1):
+        pnl_pct = _pnl_pct_at_price(entry, lev, price, side)
+        lines.append(f"TP{idx}:{price:.6g} (+{pnl_pct:.0f}%)")
+    if sl_prices:
+        sl_price = min(sl_prices, key=lambda price: abs(price - entry))
+        sl_pnl_pct = _pnl_pct_at_price(entry, lev, sl_price, side)
+        lines.append(f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g})")
+    return lines
+
+
+def _format_config_ladder_lines(entry: float, lev: int, side: str, config,
+                                sl_price: float) -> list[str]:
+    raw = str(getattr(config, "tp_ladder_pcts", "50,120,250")) if config else "50,120,250"
+    try:
+        pcts = [float(x) for x in raw.split(",") if x.strip()][:3]
+    except Exception:
+        pcts = [50.0, 120.0, 250.0]
+    while len(pcts) < 3:
+        pcts.append(pcts[-1] * 2 if pcts else 100.0)
+
+    lines: list[str] = []
+    for idx, pct in enumerate(pcts[:3], 1):
+        price = _calc_tp_price(entry, lev, pct, side)
+        lines.append(f"TP{idx}:{price:.6g} (+{pct:.0f}%)")
+    sl_pnl_pct = _pnl_pct_at_price(entry, lev, sl_price, side)
+    lines.append(f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g})")
+    return lines
+
+
 def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
                           config, tp_sl_pcts: dict,
                           max_lev: int = 0, max_pos_usdt: float = 0,
                           funding_rate: float = 0.0,
-                          funding_next_ts=None) -> str:
+                          funding_next_ts=None,
+                          active_tpsl_orders: list[dict] | None = None) -> str:
     symbol = pos["symbol"]
     coin = symbol.split("/")[0]
     side = pos.get("side", "short")
@@ -98,7 +147,6 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     stored = tp_sl_pcts.get(symbol, {})
     tp_pct_val = stored.get("tp_pct") or (db_rec.get("tp_pct") if db_rec else None) or 500.0
     sl_pct_val = stored.get("sl_pct") or (db_rec.get("sl_pct") if db_rec else None) or 500.0
-    tp_price = _calc_tp_price(entry, lev, tp_pct_val, side)
     sl_price = _calc_sl_price(entry, lev, sl_pct_val, side)
     ladder = _active_ladder(symbol)
 
@@ -133,10 +181,14 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
         lines.append(f"☠️ {liq:.6g}{dist_str}")
     if ladder:
         lines.extend(_format_ladder_lines(ladder, entry, lev, side))
+    elif active_tpsl_orders:
+        order_lines = _format_order_lines(active_tpsl_orders, entry, lev, side)
+        if order_lines:
+            lines.extend(order_lines)
+        else:
+            lines.extend(_format_config_ladder_lines(entry, lev, side, config, sl_price))
     else:
-        sl_pnl_pct = _pnl_pct_at_price(entry, lev, sl_price, side)
-        lines.append(f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g})")
-        lines.append(f"TP:{tp_price:.6g} (+{tp_pct_val:.0f}%)")
+        lines.extend(_format_config_ladder_lines(entry, lev, side, config, sl_price))
 
     # Max leverage / position limit (if provided)
     if max_lev > 0 or max_pos_usdt > 0:
