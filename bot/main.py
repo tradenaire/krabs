@@ -119,6 +119,8 @@ def main():
         from bot.jobs.main import _load_exhausted
         application.bot_data["_avg_notified_exhausted"] = _load_exhausted()
         await setup_scheduler(application)
+        from bot.testing_update_endpoint import maybe_start_test_update_endpoint
+        await maybe_start_test_update_endpoint(application, config)
 
         # Deduplicate + sync DB with exchange on startup
         dupes = db_mod.dedupe_open_positions()
@@ -173,6 +175,8 @@ def main():
         logger.info("Bot started.")
 
     async def post_shutdown(application: Application):
+        from bot.testing_update_endpoint import stop_test_update_endpoint
+        await stop_test_update_endpoint(application)
         mgr = application.bot_data.get("engine_manager")
         if mgr is not None:
             await mgr.stop_all()

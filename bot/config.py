@@ -61,6 +61,12 @@ class Config:
     # Run the heavy technical scan in a separate worker process (hybrid model)
     scanner_worker_enabled: bool = True
 
+    # Local-only testing endpoint. Disabled unless token is set via DB config or
+    # KRABS_TEST_UPDATE_TOKEN env var.
+    test_update_endpoint_token: str = ""
+    test_update_endpoint_host: str = "127.0.0.1"
+    test_update_endpoint_port: int = 8787
+
     @classmethod
     def from_dict(cls, d: dict) -> "Config":
         obj = cls()
