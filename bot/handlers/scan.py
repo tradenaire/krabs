@@ -4,13 +4,61 @@ import uuid
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from bot.ai.scanner import scan_overbought, analyze_single_coin, mexc_find_futures_symbol, format_coin_card
-from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks, extract_sentiment,
-                             format_usage_footer, DEFAULT_MODEL,
-                             normalize_openrouter_model)
-from bot.ai.research_snapshot import build_research_snapshot
-
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_MODEL = "openai/gpt-5.5:online"
+
+
+async def scan_overbought(*args, **kwargs):
+    from bot.ai.scanner import scan_overbought as _impl
+    return await _impl(*args, **kwargs)
+
+
+async def analyze_single_coin(*args, **kwargs):
+    from bot.ai.scanner import analyze_single_coin as _impl
+    return await _impl(*args, **kwargs)
+
+
+async def mexc_find_futures_symbol(*args, **kwargs):
+    from bot.ai.scanner import mexc_find_futures_symbol as _impl
+    return await _impl(*args, **kwargs)
+
+
+def format_coin_card(*args, **kwargs):
+    from bot.ai.scanner import format_coin_card as _impl
+    return _impl(*args, **kwargs)
+
+
+async def deep_short_analysis(*args, **kwargs):
+    from bot.ai.analyst import deep_short_analysis as _impl
+    return await _impl(*args, **kwargs)
+
+
+def parse_analyst_blocks(*args, **kwargs):
+    from bot.ai.analyst import parse_analyst_blocks as _impl
+    return _impl(*args, **kwargs)
+
+
+def extract_sentiment(*args, **kwargs):
+    from bot.ai.analyst import extract_sentiment as _impl
+    return _impl(*args, **kwargs)
+
+
+def format_usage_footer(*args, **kwargs):
+    from bot.ai.analyst import format_usage_footer as _impl
+    return _impl(*args, **kwargs)
+
+
+def normalize_openrouter_model(*args, **kwargs):
+    from bot.ai.analyst import normalize_openrouter_model as _impl
+    return _impl(*args, **kwargs)
+
+
+async def build_research_snapshot(*args, **kwargs):
+    from bot.ai.research_snapshot import build_research_snapshot as _impl
+    return await _impl(*args, **kwargs)
+
 
 from bot.services import sizing as _sizing
 from bot.services.ladder import parse_price
