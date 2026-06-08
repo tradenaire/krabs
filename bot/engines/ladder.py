@@ -21,6 +21,31 @@ def _is_tp(order: dict, side: str) -> bool:
     return int(order.get("trigger_type", 0) or 0) == tp_type
 
 
+def _tp_slot_price(ladder: dict, idx: int) -> float:
+    try:
+        return float(ladder.get(f"tp{idx}") or 0)
+    except Exception:
+        return 0.0
+
+
+def _expected_open_tp_count(ladder: dict) -> int:
+    return sum(
+        1
+        for idx in (1, 2, 3)
+        if _tp_slot_price(ladder, idx) > 0 and not ladder.get(f"filled{idx}")
+    )
+
+
+def _next_unfilled_tp_slots(ladder: dict, count: int) -> list[int]:
+    slots: list[int] = []
+    for idx in (1, 2, 3):
+        if len(slots) >= count:
+            break
+        if _tp_slot_price(ladder, idx) > 0 and not ladder.get(f"filled{idx}"):
+            slots.append(idx)
+    return slots
+
+
 class LadderExitEngine(Engine):
     name = "ladder_exit"
     interval = 10.0
@@ -63,22 +88,16 @@ class LadderExitEngine(Engine):
                 continue
             open_tps = sum(1 for o in orders if _is_tp(o, side))
 
-            recorded_filled = int(lad["filled1"]) + int(lad["filled2"]) + int(lad["filled3"])
-            expected_open = 3 - recorded_filled
+            expected_open = _expected_open_tp_count(lad)
             if open_tps >= expected_open:
                 continue  # nothing newly filled
 
             newly = expected_open - open_tps
             # Mark the next `newly` unfilled levels as filled.
-            marked = 0
-            for i in (1, 2, 3):
-                if marked >= newly:
-                    break
-                if not lad.get(f"filled{i}"):
-                    await adb.mark_tp_filled(symbol, i)
-                    lad[f"filled{i}"] = 1
-                    marked += 1
-                    logger.info("ladder %s: TP%d filled", symbol, i)
+            for i in _next_unfilled_tp_slots(lad, newly):
+                await adb.mark_tp_filled(symbol, i)
+                lad[f"filled{i}"] = 1
+                logger.info("ladder %s: TP%d filled", symbol, i)
 
             # After the first TP, move SL to breakeven; re-assert remaining TPs.
             breakeven = bool(getattr(self.app.bot_data.get("config"), "breakeven_on_first_tp", True))

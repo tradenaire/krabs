@@ -108,6 +108,21 @@ class SignalExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["symbol"], "EPIC/USDT:USDT")
         self.assertEqual(result["orders"], 4)
 
+    async def test_execute_signal_records_ladder_for_balance_display(self):
+        client = FakeClient()
+        calls = []
+
+        async def fake_upsert(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        with patch("bot.infra.db.upsert_tp_ladder", fake_upsert):
+            await execute_signal(client, app=None, signal=self._signal(), margin=2)
+
+        self.assertEqual(len(calls), 1)
+        args, _kwargs = calls[0]
+        self.assertEqual(args[:4], ("EPIC/USDT:USDT", "short", 0.2101, 3))
+        self.assertEqual(args[4:8], (0.1978, 0.1942, 0.1903, 0.2167))
+
     async def test_execute_signal_disables_default_exits_when_opening_through_service(self):
         client = FakeClient()
         app = SimpleNamespace(bot_data={"config": SimpleNamespace(default_leverage=5)})

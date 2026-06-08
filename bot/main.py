@@ -13,7 +13,8 @@ from bot.exchange.client import ExchangeClient
 from bot.event_logger import (patch_bot_logging, telegram_error_logger,
                               telegram_update_logger)
 from bot.handlers.scan import (scan_handler, open_callback, open_confirm_callback,
-                               open_anyway_callback, scan_avg_callback, avg_force_callback)
+                               open_anyway_callback, scan_avg_callback, avg_force_callback,
+                               scan_preview_callback, scan_confirm_callback)
 from bot.handlers.balance import balance_handler, balance_callback
 from bot.handlers.positions import positions_handler, positions_callback
 from bot.handlers.trading import (short_handler, close_handler, avg_handler, setkey_handler,
@@ -223,6 +224,8 @@ def main():
     app.add_handler(CallbackQueryHandler(min_open_callback, pattern=r"^min_open_"))
     app.add_handler(CallbackQueryHandler(open_confirm_callback, pattern=r"^open_confirm_"))
     app.add_handler(CallbackQueryHandler(open_anyway_callback, pattern=r"^open_anyway_"))
+    app.add_handler(CallbackQueryHandler(scan_preview_callback, pattern=r"^scan_preview_"))
+    app.add_handler(CallbackQueryHandler(scan_confirm_callback, pattern=r"^scan_confirm_"))
     app.add_handler(CallbackQueryHandler(scan_avg_callback, pattern=r"^scan_avg_"))
     app.add_handler(CallbackQueryHandler(avg_force_callback, pattern=r"^avg_force_"))
     app.add_handler(CallbackQueryHandler(open_callback, pattern=r"^open_"))

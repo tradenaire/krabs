@@ -8,6 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.event_logger import log_event, set_correlation_id, snapshot_exchange_state
+from bot.services.trade_messages import CloseFacts, ReentryFacts, format_close_message
 
 logger = logging.getLogger(__name__)
 SCHEDULER = AsyncIOScheduler()
@@ -575,6 +576,30 @@ def _fmt_close_pnl(entry: float, close_price: float | None,
     return f"`{pct:+.1f}%` / `{usd:+.2f}$`"
 
 
+def _close_reason_parts(closed_by_tp: bool, profitable_sl: bool) -> tuple[str, str]:
+    if closed_by_tp:
+        return "tp", "тейк-профит"
+    if profitable_sl:
+        return "tp", "профит-локк SL"
+    return "sl", "стоп-лосс"
+
+
+def _close_pnl_amount(
+    entry: float,
+    close_price: float | None,
+    side: str,
+    leverage: int,
+    margin: float,
+) -> float:
+    if not close_price or entry <= 0:
+        return 0.0
+    if side == "short":
+        pct = (entry - close_price) / entry * leverage * 100
+    else:
+        pct = (close_price - entry) / entry * leverage * 100
+    return pct / 100 * margin
+
+
 async def reentry_job(app):
     """После TP — переоткрыть позицию (max_cycles раз)."""
     from bot import db as db_mod
@@ -631,21 +656,65 @@ async def reentry_job(app):
             except Exception:
                 pass
 
+        pnl_margin = ph_total_invested or float(re_cfg.get("margin") or 1.0)
+        pnl_lev = ph_leverage or int(re_cfg.get("leverage") or 0) or 1
+
+        def _close_pnl(exit_price: float | None) -> tuple[str, float]:
+            pnl_usdt = _close_pnl_amount(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin)
+            pnl_s = _fmt_close_pnl(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin)
+            return (f" · PnL {pnl_s}" if pnl_s else "", pnl_usdt)
+
+        def _close_message(
+            exit_price: float | None,
+            closed_by_tp_flag: bool,
+            profitable_sl_flag: bool,
+            *,
+            reentry_enabled: bool,
+            will_reenter: bool,
+            why: str,
+            cycle_next: int | None = None,
+            cooldown_text: str = "",
+        ) -> str:
+            reason_code, reason_label = _close_reason_parts(closed_by_tp_flag, profitable_sl_flag)
+            return format_close_message(
+                CloseFacts(
+                    symbol=symbol,
+                    side=pos_side_str,
+                    reason_code=reason_code,
+                    reason_label=reason_label,
+                    entry_price=entry_price,
+                    exit_price=float(exit_price or 0),
+                    leverage=pnl_lev,
+                    margin=pnl_margin,
+                    realized_pnl=_close_pnl_amount(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin),
+                ),
+                ReentryFacts(
+                    enabled=reentry_enabled,
+                    will_reenter=will_reenter,
+                    why=why,
+                    cycle_next=cycle_next,
+                    max_cycles=max_cycles if will_reenter else None,
+                    cooldown_text=cooldown_text,
+                ),
+            )
+
         if max_cycles == 0:
             closed_by_tp, profitable_sl, close_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
             if closed_by_tp is None:
                 continue
-            close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
+            close_note, _ = _close_reason_parts(closed_by_tp, profitable_sl)
             pnl_text, pnl_usdt = _close_pnl(close_price)
             db_mod.close_position(symbol)
             db_mod.log_trade(symbol, "close", note=close_note, pnl=pnl_usdt)
             db_mod.close_position_history(symbol, exit_price=close_price or 0, pnl=pnl_usdt, close_reason=close_note)
             if not closed_by_tp and not profitable_sl:
                 app.bot_data.setdefault("_sl_cooldown", {})[symbol] = time.time()
-            icon = "✅" if (closed_by_tp or profitable_sl) else "🛑"
-            label = "по тейку" if closed_by_tp else ("по профит-локк SL" if profitable_sl else "по стопу")
             await _notify_all(app,
-                f"{icon} *{coin}* {label} (перезаход отключён){pnl_text}")
+                _close_message(
+                    close_price, closed_by_tp, profitable_sl,
+                    reentry_enabled=False, will_reenter=False,
+                    why="перезаход отключён",
+                ))
             db_mod.delete_reentry(symbol)
             continue
 
@@ -654,15 +723,17 @@ async def reentry_job(app):
             closed_by_tp, profitable_sl, close_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
             if closed_by_tp is None:
                 continue
-            close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
+            close_note, _ = _close_reason_parts(closed_by_tp, profitable_sl)
             pnl_text, pnl_usdt = _close_pnl(close_price)
             db_mod.close_position(symbol)
             db_mod.log_trade(symbol, "close", note=close_note, pnl=pnl_usdt)
             db_mod.close_position_history(symbol, exit_price=close_price or 0, pnl=pnl_usdt, close_reason=close_note)
-            icon = "✅" if (closed_by_tp or profitable_sl) else "🛑"
-            label = "по тейку" if closed_by_tp else ("по профит-локк SL" if profitable_sl else "по стопу")
             await _notify_all(app,
-                f"{icon} *{coin}* {label} — циклы исчерпаны ({cycle_count}/{max_cycles}){pnl_text}")
+                _close_message(
+                    close_price, closed_by_tp, profitable_sl,
+                    reentry_enabled=True, will_reenter=False,
+                    why=f"циклы исчерпаны ({cycle_count}/{max_cycles})",
+                ))
             db_mod.delete_reentry(symbol)
             continue
 
@@ -685,20 +756,6 @@ async def reentry_job(app):
 
         logger.info("Re-entry #%d %s %s $%.2f", cycle_count + 1, symbol, side, margin)
 
-        pnl_margin = ph_total_invested or float(re_cfg.get("margin") or 1.0)
-        pnl_lev = ph_leverage or int(re_cfg.get("leverage") or 0) or 1
-
-        def _close_pnl(exit_price: float | None) -> tuple[str, float]:
-            if not exit_price or entry_price <= 0:
-                return "", 0.0
-            pnl_s = _fmt_close_pnl(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin)
-            if side == "short":
-                pct = (entry_price - exit_price) / entry_price * pnl_lev * 100
-            else:
-                pct = (exit_price - entry_price) / entry_price * pnl_lev * 100
-            pnl_usdt = pct / 100 * pnl_margin
-            return (f" · PnL {pnl_s}" if pnl_s else "", pnl_usdt)
-
         # Determine close reason: TP or profitable-SL → re-enter, loss-SL → skip
         closed_by_tp, profitable_sl, close_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
 
@@ -706,7 +763,7 @@ async def reentry_job(app):
             logger.info("Re-entry: %s close reason unknown, retrying next cycle", symbol)
             continue
 
-        close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
+        close_note, _ = _close_reason_parts(closed_by_tp, profitable_sl)
         still_open = db_mod.get_open_position(symbol) is not None
         if still_open:
             db_mod.close_position(symbol)
@@ -729,9 +786,13 @@ async def reentry_job(app):
             if pl_ts == 0:
                 app.bot_data[pl_cd_key] = time.time()
                 await _notify_all(app,
-                    f"🔒 *{coin}* закрыта в прибыль (профит-локк SL)\n"
-                    f"⏳ Пауза 1м, отмена ордеров, перезаход "
-                    f"#{cycle_count + 1}/{max_cycles}")
+                    _close_message(
+                        close_price, closed_by_tp, profitable_sl,
+                        reentry_enabled=True, will_reenter=True,
+                        why="профит-локк SL: пауза перед перезаходом",
+                        cycle_next=cycle_count + 1,
+                        cooldown_text="Пауза 1м",
+                    ))
                 continue
 
             if time.time() - pl_ts < 60:
@@ -749,8 +810,11 @@ async def reentry_job(app):
                 # Classic behaviour: block re-entry after SL
                 app.bot_data.setdefault("_sl_cooldown", {})[symbol] = time.time()
                 await _notify_all(app,
-                    f"🛑 *{coin}* закрыта по стопу — перезаход пропущен\n"
-                    f"⏳ Кулдаун авто-скана на 2ч")
+                    _close_message(
+                        close_price, closed_by_tp, profitable_sl,
+                        reentry_enabled=False, will_reenter=False,
+                        why="reentry_on_sl выключен; кулдаун авто-скана на 2ч",
+                    ))
                 db_mod.delete_reentry(symbol)
                 continue
 
@@ -763,9 +827,13 @@ async def reentry_job(app):
                 app.bot_data[sl_cd_key] = time.time()
                 app.bot_data.setdefault("_sl_cooldown", {})[symbol] = time.time()
                 await _notify_all(app,
-                    f"🛑 *{coin}* закрыта по стопу\n"
-                    f"⏳ Пауза {cooldown_min}м, затем перезаход "
-                    f"#{cycle_count + 1}/{max_cycles}")
+                    _close_message(
+                        close_price, closed_by_tp, profitable_sl,
+                        reentry_enabled=True, will_reenter=True,
+                        why=f"SL разрешён для перезахода; ждём {cooldown_min}м",
+                        cycle_next=cycle_count + 1,
+                        cooldown_text=f"Пауза {cooldown_min}м",
+                    ))
                 continue
 
             if time.time() - sl_ts < cooldown_min * 60:
@@ -792,11 +860,15 @@ async def reentry_job(app):
             notified_exhausted: set = app.bot_data.setdefault("_avg_notified_exhausted", set())
             notified_exhausted.discard(symbol)
             _save_exhausted(notified_exhausted)
-            close_label = "по TP" if closed_by_tp else "в прибыль (профит-локк SL)"
             msg = (
-                f"✅ *{coin}* закрыта {close_label} → перезаход #{new_cycle}/{max_cycles}"
-                f"{pnl_text}\n"
-                f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']}\n"
+                _close_message(
+                    close_price, closed_by_tp, profitable_sl,
+                    reentry_enabled=True, will_reenter=True,
+                    why="TP разрешает перезаход" if closed_by_tp else "профит-локк SL разрешает перезаход",
+                    cycle_next=new_cycle,
+                )
+                + "\n"
+                f"Entry нового входа: `{result['entry_price']:.6g}` | ×{result['leverage']}\n"
                 f"TP: `{result.get('tp_price', 0):.6g}` | SL: `{result.get('sl_price', 0):.6g}`"
             )
             await _notify_all(app, msg)
@@ -931,11 +1003,24 @@ async def tpsl_enforce_job(app):
     for symbol in orphan_syms:
         if symbol in reentry_symbols:
             continue  # reentry_job will handle it (close + re-entry logic)
+        ph = db_mod.get_last_position_history(symbol) or {}
         db_mod.close_position(symbol)
         db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason="liquidated")
         coin = symbol.split("/")[0]
+        side = str(ph.get("side") or "short").lower()
+        side_label = "SHORT" if side in ("short", "sell") else "LONG" if side in ("long", "buy") else side.upper()
+        entry_price = float(ph.get("entry_price") or 0)
+        margin = float(ph.get("total_invested") or ph.get("initial_margin") or ph.get("margin") or 0)
+        leverage = int(ph.get("leverage") or 1)
         logger.info("DB sync: closed stale open position %s (not on exchange)", symbol)
-        await _notify_all(app, f"💀 *{coin}* закрыта принудительно (ликвидация или внешнее закрытие)")
+        await _notify_all(app, "\n".join([
+            f"💀 *{coin}* {side_label} закрыта",
+            "Причина: позиция исчезла с биржи",
+            f"Entry: `{entry_price:.8g}` | Exit: `?` | Плечо: `×{leverage}`",
+            f"Маржа: `${margin:.2f}` | PnL: `неизвестно`",
+            "Перезаход: нет",
+            "Почему: нельзя честно определить цену закрытия и PnL после внешнего закрытия",
+        ]))
 
     # Full plan-order sweep every 5 min (every 5th run)
     run_count = app.bot_data.get("_tpsl_run_count", 0) + 1

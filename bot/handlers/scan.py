@@ -1,5 +1,6 @@
 """/scan — LLM + web-search market picker."""
 import logging
+import uuid
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
@@ -12,6 +13,8 @@ from bot.ai.research_snapshot import build_research_snapshot
 logger = logging.getLogger(__name__)
 
 from bot.services import sizing as _sizing
+from bot.services.ladder import parse_price
+from bot.services.trade_plan import format_three_tp_plan, pick_from_plan, plan_fingerprint, plan_from_pick
 
 # Exchanges enforce per-symbol minimum order notionals.
 # Cached per-symbol minimums override the default (populated from actual errors).
@@ -158,6 +161,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tech["_ai_fund"] = pick.get("fund", "")
         tech["_ai_funding"] = pick.get("funding", "")
         tech["_ai_risk"] = pick.get("risk", "")
+        tech["_ai_pick"] = pick
         validated.append(tech)
         if direction in side_counts:
             side_counts[direction] += 1
@@ -237,13 +241,29 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             card += f"\n   Фандинг (AI): {r['_ai_funding']}"
         if r.get("_ai_risk"):
             card += f"\n   Риск (AI): {r['_ai_risk']}"
+        pick = r.get("_ai_pick", {})
+        if pick:
+            card += (
+                f"\n   TP1 `{pick.get('tp1', '—')}` | TP2 `{pick.get('tp2', '—')}` | "
+                f"TP3 `{pick.get('tp3', '—')}` | SL `{pick.get('sl', '—')}`"
+            )
 
         icon = "🔻" if direction == "short" else "🔺"
+        scan_id = uuid.uuid4().hex[:12]
+        context.user_data.setdefault("scan_picks", {})[scan_id] = {
+            "symbol": sym,
+            "side": side_code,
+            "direction": direction,
+            "margin": default_bet,
+            "leverage": lev_eff,
+            "pick": pick,
+            "min_avg": min_avg,
+        }
 
         if avg_ok:
             btn = InlineKeyboardButton(
                 f"{icon} ${default_bet:g} · {lev_eff}x",
-                callback_data=f"open_{side_code}_{sym}",
+                callback_data=f"scan_preview_{scan_id}",
             )
         else:
             # Averaging minimum exceeds configured amount — show warning
@@ -253,7 +273,7 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             btn = InlineKeyboardButton(
                 f"⚠️ Открыть (докупка ~${min_avg:.2f})",
-                callback_data=f"open_anyway_{side_code}_{sym}",
+                callback_data=f"scan_preview_{scan_id}",
             )
 
         kb = InlineKeyboardMarkup([[btn]])
@@ -315,13 +335,18 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _do_execute_open(q, client, app, symbol: str, side: str,
-                           margin: float, leverage: int):
+                           margin: float, leverage: int,
+                           pick: dict | None = None,
+                           exit_mode_override: str | None = None):
     """Shared open logic used by open_callback and open_confirm_callback."""
     coin = symbol.split("/")[0]
     side_ru = "SHORT" if side == "sell" else "LONG"
     await q.message.reply_text(f"🚀 Открываю {side_ru} `{coin}`...", parse_mode="Markdown")
     from bot.handlers.trading import execute_open
-    result = await execute_open(client, app, symbol, side, margin, leverage)
+    result = await execute_open(
+        client, app, symbol, side, margin, leverage,
+        pick=pick, exit_mode_override=exit_mode_override,
+    )
     actual_margin = result.get("margin", margin)
     actual_lev = result["leverage"]
     icon = "🔻" if side == "sell" else "🟩"
@@ -333,11 +358,142 @@ async def _do_execute_open(q, client, app, symbol: str, side: str,
         lines.append(f"⚠️ Маржа поднята `${margin:.2f}` → `${actual_margin:.2f}` (мин биржи)")
     if result.get("liquidation_price"):
         lines.append(f"💀 Liq: `{result['liquidation_price']:.6g}`")
+    if pick:
+        try:
+            plan = plan_from_pick(
+                symbol=symbol,
+                side=side,
+                entry=float(result["entry_price"]),
+                reference=float(result["entry_price"]),
+                leverage=int(actual_lev),
+                margin=float(actual_margin),
+                pick=pick,
+                config=app.bot_data.get("config") if app is not None else None,
+            )
+            opened = format_three_tp_plan(plan, title="Opened position")
+            extras = []
+            if actual_margin > margin + 0.001:
+                extras.append(f"Margin upgraded `${margin:.2f}` -> `${actual_margin:.2f}`")
+            if result.get("liquidation_price"):
+                extras.append(f"Liq: `{result['liquidation_price']:.6g}`")
+            if extras:
+                opened += "\n" + "\n".join(extras)
+            await q.message.reply_text(opened, parse_mode="Markdown")
+            return
+        except Exception:
+            pass
     if result.get("tp_price"):
         lines.append(f"✅ TP: `{result['tp_price']:.6g}`")
     if result.get("sl_price"):
         lines.append(f"🛑 SL: `{result['sl_price']:.6g}`")
     await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def _live_reference_price(client, symbol: str, fallback: float = 0.0) -> float:
+    try:
+        ticker = await client.get_ticker(symbol)
+        return float(ticker.get("last") or ticker.get("close") or ticker.get("price") or fallback)
+    except Exception:
+        return float(fallback or 0)
+
+
+async def _scan_plan_from_payload(client, config, payload: dict):
+    symbol = payload["symbol"]
+    pick = payload.get("pick") or {}
+    entry = await _live_reference_price(client, symbol, parse_price(pick.get("price") or pick.get("entry") or "0"))
+    if entry <= 0:
+        entry = parse_price(pick.get("entry") or "0")
+    return plan_from_pick(
+        symbol=symbol,
+        side=payload.get("direction") or payload.get("side"),
+        entry=entry,
+        reference=entry,
+        leverage=int(payload.get("leverage") or 1),
+        margin=float(payload.get("margin") or 0),
+        pick=pick,
+        config=config,
+    )
+
+
+async def scan_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    scan_id = (q.data or "").replace("scan_preview_", "", 1)
+    payload = context.user_data.get("scan_picks", {}).get(scan_id)
+    if not payload:
+        await q.message.reply_text("Scan idea expired. Run /scan again.")
+        return
+
+    client = context.bot_data["exchange"]
+    config = context.bot_data.get("config")
+    try:
+        plan = await _scan_plan_from_payload(client, config, payload)
+    except Exception as e:
+        await q.message.reply_text(f"Cannot build 3TP preview: {e}")
+        return
+    payload["pick"] = pick_from_plan(plan)
+    payload["preview_fingerprint"] = plan_fingerprint(plan)
+    text = format_three_tp_plan(plan, title="Open preview")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Confirm open", callback_data=f"scan_confirm_{scan_id}")]])
+    await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def scan_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    scan_id = (q.data or "").replace("scan_confirm_", "", 1)
+    payload = context.user_data.get("scan_picks", {}).get(scan_id)
+    if not payload:
+        await q.message.reply_text("Scan idea expired. Run /scan again.")
+        return
+    client = context.bot_data["exchange"]
+    config = context.bot_data.get("config")
+    try:
+        plan = await _scan_plan_from_payload(client, config, payload)
+    except Exception as e:
+        await q.message.reply_text(f"Cannot open 3TP plan: {e}")
+        return
+    fingerprint = plan_fingerprint(plan)
+    if payload.get("preview_fingerprint") != fingerprint:
+        payload["pick"] = pick_from_plan(plan)
+        payload["preview_fingerprint"] = fingerprint
+        text = format_three_tp_plan(plan, title="Updated open preview")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Confirm open", callback_data=f"scan_confirm_{scan_id}")]])
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        return
+    payload["pick"] = pick_from_plan(plan)
+    try:
+        averaging_amount = float(getattr(config, "averaging_amount", 0.10)) if config else 0.10
+        min_avg = float(payload.get("min_avg") or 0)
+        if min_avg > averaging_amount:
+            min_notional = min_avg * max(int(payload["leverage"]), 1) / 1.05
+            context.bot_data.setdefault("_min_order_cache", {})[payload["symbol"]] = min_notional
+            try:
+                from bot import db as db_mod
+                db_mod.set_min_order_notional(payload["symbol"], min_notional)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        await _do_execute_open(
+            q,
+            client,
+            context.application,
+            payload["symbol"],
+            payload["side"],
+            float(payload["margin"]),
+            int(payload["leverage"]),
+            pick=payload["pick"],
+            exit_mode_override="ladder",
+        )
+    except Exception as e:
+        from bot.services.exchange_errors import format_open_error
+        side_name = "short" if payload["side"] == "sell" else "long"
+        await q.message.reply_text(
+            format_open_error(e, symbol=payload["symbol"], side=side_name),
+            parse_mode="Markdown",
+        )
 
 
 async def open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

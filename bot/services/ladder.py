@@ -30,14 +30,15 @@ def _levels_from_pick(entry: float, side: str, pick: dict) -> tuple[list[float],
     if not pick:
         return None
     tps = [parse_price(pick.get(k, "")) for k in ("tp1", "tp2", "tp3")]
+    tps = [t for t in tps if t > 0]
     sl = parse_price(pick.get("sl", ""))
-    if any(t <= 0 for t in tps) or sl <= 0 or entry <= 0:
+    if not tps or sl <= 0 or entry <= 0:
         return None
     if side == "long":
-        if not (entry < tps[0] < tps[1] < tps[2]) or sl >= entry:
+        if any(t <= entry for t in tps) or tps != sorted(tps) or sl >= entry:
             return None
     else:  # short
-        if not (entry > tps[0] > tps[1] > tps[2]) or sl <= entry:
+        if any(t >= entry for t in tps) or tps != sorted(tps, reverse=True) or sl <= entry:
             return None
     return tps, sl
 
@@ -56,7 +57,7 @@ def _levels_from_config(entry: float, leverage: int, side: str, config) -> tuple
 
 
 def compute_levels(entry: float, leverage: int, side: str, pick: dict | None, config):
-    """Return ([tp1, tp2, tp3], sl). Prefer AI levels, fall back to config ladder."""
+    """Return (TP levels, SL). Prefer AI/filter levels, fall back to config ladder."""
     from_pick = _levels_from_pick(entry, side, pick or {})
     if from_pick:
         return from_pick
@@ -87,7 +88,7 @@ async def setup_on_open(client, app, symbol: str, side: str, entry: float,
     config = app.bot_data.get("config")
     partial_pct = float(getattr(config, "tp_partial_pct", 50.0))
     tps, sl = compute_levels(entry, leverage, side, pick, config)
-    qtys = tp_quantities(contracts, partial_pct)
+    qtys = tp_quantities(contracts, partial_pct, n_levels=len(tps))
 
     fsym = client.futures_symbol(symbol)
     # Initial SL (closePosition) at the computed level.
@@ -104,7 +105,8 @@ async def setup_on_open(client, app, symbol: str, side: str, entry: float,
         except Exception as e:
             logger.warning("ladder %s: TP%d failed: %s", fsym, i, e)
 
-    await adb.upsert_tp_ladder(fsym, side, entry, leverage, tps[0], tps[1], tps[2], sl)
+    padded = (tps + [0.0, 0.0, 0.0])[:3]
+    await adb.upsert_tp_ladder(fsym, side, entry, leverage, padded[0], padded[1], padded[2], sl)
     logger.info("ladder set for %s %s: TP %s SL %.6g", fsym, side,
                 [round(t, 6) for t in tps], sl)
 
@@ -121,7 +123,9 @@ async def rebuild(client, app, symbol: str, ladder: dict, contracts: float,
     remaining_levels = []
     for i in (1, 2, 3):
         if not ladder.get(f"filled{i}"):
-            remaining_levels.append(float(ladder[f"tp{i}"]))
+            price = float(ladder[f"tp{i}"])
+            if price > 0:
+                remaining_levels.append(price)
 
     try:
         await client.cancel_tp_sl_orders(symbol)

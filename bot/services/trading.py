@@ -37,7 +37,8 @@ async def execute_open(client, app, symbol: str, side: str,
                        margin: float, leverage: int | None = None,
                        tp_pct: float = 500, sl_pct: float = 500,
                        interactive: bool = False, pick: dict | None = None,
-                       setup_exits: bool = True) -> dict:
+                       setup_exits: bool = True,
+                       exit_mode_override: str | None = None) -> dict:
     """Open a futures position with TP/SL and register re-entry.
 
     interactive=True: raises MinOrderUpgradeNeeded instead of silently upgrading margin.
@@ -125,7 +126,7 @@ async def execute_open(client, app, symbol: str, side: str,
     entry = order.get("price", 0)
     liq = 0
 
-    exit_mode = str(getattr(config, "exit_mode", "single")).lower() if config else "single"
+    exit_mode = str(exit_mode_override or (getattr(config, "exit_mode", "single") if config else "single")).lower()
 
     if pos:
         entry = pos["entry_price"]

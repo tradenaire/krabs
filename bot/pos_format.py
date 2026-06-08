@@ -32,6 +32,36 @@ def _fmt_funding(rate: float, lev: int, margin: float, next_ts: str | None = Non
     return line
 
 
+def _active_ladder(symbol: str) -> dict | None:
+    try:
+        from bot import db as _db_pf
+        return _db_pf.get_tp_ladder(symbol)
+    except Exception:
+        return None
+
+
+def _format_ladder_lines(ladder: dict, entry: float, lev: int, side: str) -> list[str]:
+    lines: list[str] = []
+    for idx in (1, 2, 3):
+        price = float(ladder.get(f"tp{idx}") or 0)
+        if price <= 0:
+            continue
+        pnl_pct = _pnl_pct_at_price(entry, lev, price, side)
+        state = " filled" if int(ladder.get(f"filled{idx}") or 0) else ""
+        lines.append(f"TP{idx}:{price:.6g} (+{pnl_pct:.0f}%){state}")
+
+    sl_price = float(ladder.get("sl") or 0)
+    if int(ladder.get("sl_at_breakeven") or 0):
+        sl_price = entry
+        sl_note = " breakeven"
+    else:
+        sl_note = ""
+    if sl_price > 0:
+        sl_pnl_pct = _pnl_pct_at_price(entry, lev, sl_price, side)
+        lines.append(f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g}){sl_note}")
+    return lines
+
+
 def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
                           config, tp_sl_pcts: dict,
                           max_lev: int = 0, max_pos_usdt: float = 0,
@@ -64,12 +94,13 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
         dist = abs(mark - liq) / mark * 100
         dist_str = f" ({dist:.1f}% до ликв.)"
 
-    # TP/SL from stored pcts
+    # TP/SL from active ladder or stored pcts
     stored = tp_sl_pcts.get(symbol, {})
     tp_pct_val = stored.get("tp_pct") or (db_rec.get("tp_pct") if db_rec else None) or 500.0
     sl_pct_val = stored.get("sl_pct") or (db_rec.get("sl_pct") if db_rec else None) or 500.0
     tp_price = _calc_tp_price(entry, lev, tp_pct_val, side)
     sl_price = _calc_sl_price(entry, lev, sl_pct_val, side)
+    ladder = _active_ladder(symbol)
 
     # Averaging info
     threshold = float(getattr(config, "averaging_threshold", -100)) if config else -100
@@ -100,9 +131,12 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     ]
     if liq > 0:
         lines.append(f"☠️ {liq:.6g}{dist_str}")
-    sl_pnl_pct = _pnl_pct_at_price(entry, lev, sl_price, side)
-    lines.append(f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g})")
-    lines.append(f"TP:{tp_price:.6g} (+{tp_pct_val:.0f}%)")
+    if ladder:
+        lines.extend(_format_ladder_lines(ladder, entry, lev, side))
+    else:
+        sl_pnl_pct = _pnl_pct_at_price(entry, lev, sl_price, side)
+        lines.append(f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g})")
+        lines.append(f"TP:{tp_price:.6g} (+{tp_pct_val:.0f}%)")
 
     # Max leverage / position limit (if provided)
     if max_lev > 0 or max_pos_usdt > 0:
@@ -116,10 +150,15 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     _thr_str = f"{eff_threshold:.0f}%"
     if eff_threshold != threshold:
         _thr_str += f" _(dyn)_"
-    lines.append(
-        f"🔁 Докупка: при PnL ≤ {_thr_str} · +${avg_amount:.2f}"
-        f" · шагов {avg_count}/{max_avg} · вложено ${invested:.2f}"
-    )
+    if config and not bool(getattr(config, "averaging_enabled", True)):
+        lines.append(
+            f"🔁 Averaging: disabled · шагов {avg_count}/{max_avg} · вложено ${invested:.2f}"
+        )
+    else:
+        lines.append(
+            f"🔁 Докупка: при PnL ≤ {_thr_str} · +${avg_amount:.2f}"
+            f" · шагов {avg_count}/{max_avg} · вложено ${invested:.2f}"
+        )
     lines.append(
         f"🔄 Перезаход: после TP +{tp_pct_val:.0f}%"
         f" → reopen ${reopen_margin:.2f} · циклов {cycle_count}/{max_cycles}"

@@ -85,6 +85,23 @@ async def execute_signal(client, app, signal: ParsedSignal, margin: float) -> di
         except Exception:
             pass
         raise
+    try:
+        from bot.infra import db as adb
+        padded_tps = [float(tp.price) for tp in signal.tps[:3]]
+        while len(padded_tps) < 3:
+            padded_tps.append(0.0)
+        await adb.upsert_tp_ladder(
+            client.futures_symbol(symbol),
+            signal.side,
+            float(pos.get("entry_price") or 0),
+            int(leverage or 1),
+            padded_tps[0],
+            padded_tps[1],
+            padded_tps[2],
+            float(signal.stop),
+        )
+    except Exception:
+        pass
     return {
         "symbol": symbol,
         "side": signal.side,

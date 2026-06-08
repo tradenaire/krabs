@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import tempfile
 import logging
+from dataclasses import replace
 from pathlib import Path
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from bot.signals.execution import execute_signal
+from bot.signals.model import TpTarget
 from bot.signals.parser import SignalParseError, parse_signal
 from bot.signals.preview import build_signal_confirmation_text, build_signal_keyboard
 from bot.signals.store import clear_signal, get_signal, save_signal
@@ -30,6 +32,68 @@ def prepare_signal_confirmation_from_signal(signal, user_data: dict, warning: st
     text = build_signal_confirmation_text(signal, warning=warning)
     keyboard = build_signal_keyboard(signal_id)
     return signal_id, text, keyboard
+
+
+async def _live_signal_reference(client, signal) -> tuple[str, float]:
+    from bot.signals.symbols import resolve_signal_symbol
+
+    try:
+        symbol = await resolve_signal_symbol(client, signal.symbol)
+    except Exception:
+        symbol = f"{signal.symbol}/USDT:USDT"
+    try:
+        ticker = await client.get_ticker(symbol)
+        reference = float(ticker.get("last") or ticker.get("close") or ticker.get("price") or signal.entry_mid)
+    except Exception:
+        reference = float(signal.entry_mid)
+    return symbol, reference
+
+
+async def _show_filtered_signal_if_needed(q, context, signal, signal_id: str, margin: float) -> bool:
+    client = context.bot_data.get("exchange")
+    if not client:
+        return False
+    from bot.services.trade_plan import build_three_tp_plan, format_three_tp_plan
+
+    symbol, reference = await _live_signal_reference(client, signal)
+    try:
+        plan = build_three_tp_plan(
+            symbol=symbol,
+            side=signal.side,
+            entry=float(signal.entry_mid),
+            reference=reference,
+            leverage=int(signal.leverage or getattr(context.bot_data.get("config"), "default_leverage", 1) or 1),
+            margin=margin,
+            tp_prices=[tp.price for tp in signal.tps],
+            tp_shares=[tp.share_pct for tp in signal.tps],
+            sl_price=float(signal.stop),
+            config=context.bot_data.get("config"),
+        )
+    except Exception as e:
+        await q.edit_message_text(f"Не открываю {signal.symbol}: {e}")
+        return True
+
+    current = [(round(tp.price, 12), round(tp.share_pct, 8)) for tp in signal.tps]
+    planned = [(round(level.price, 12), round(level.share_pct, 8)) for level in plan.levels]
+    if current == planned:
+        return False
+
+    adjusted = replace(
+        signal,
+        tps=tuple(TpTarget(level.price, level.share_pct) for level in plan.levels),
+    )
+    context.user_data.setdefault("pending_signals", {})[signal_id] = adjusted
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Confirm filtered open", callback_data=f"sig_filtered_open:{signal_id}:{margin:g}")
+    ], [
+        InlineKeyboardButton("Cancel", callback_data=f"sig_cancel:{signal_id}")
+    ]])
+    await q.edit_message_text(
+        format_three_tp_plan(plan, title="Filtered signal preview"),
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return True
 
 
 def format_vision_decode_warning(error: Exception, model: str) -> str:
@@ -182,7 +246,7 @@ async def signal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if action != "sig_open" or len(parts) < 3:
+    if action not in ("sig_open", "sig_filtered_open") or len(parts) < 3:
         await q.edit_message_text("Неизвестное действие.")
         return
 
@@ -196,6 +260,10 @@ async def signal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not client:
         await q.edit_message_text("Биржевой клиент недоступен.")
         return
+
+    if action in ("sig_open", "sig_filtered_open"):
+        if await _show_filtered_signal_if_needed(q, context, signal, signal_id, margin):
+            return
 
     await q.edit_message_text(f"Открываю {signal.symbol} {signal.side.upper()} на ${margin:g}...")
     try:
@@ -213,13 +281,16 @@ async def signal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     clear_signal(context.user_data, signal_id)
-    await q.edit_message_text(
-        "\n".join([
-            f"Открыто: {result['symbol']} {signal.side.upper()}",
-            f"Margin: ${margin:g}",
-            f"Leverage: x{result['leverage']}",
-            f"Entry: {result['entry_price']:.8g}",
-            f"TP orders: {len(signal.tps)}",
-            f"SL: {signal.stop:.8g}",
-        ])
+    from bot.services.trade_plan import build_three_tp_plan, format_three_tp_plan
+    plan = build_three_tp_plan(
+        symbol=result["symbol"],
+        side=signal.side,
+        entry=float(result["entry_price"]),
+        reference=float(result["entry_price"]),
+        leverage=int(result["leverage"]),
+        margin=float(result.get("margin") or margin),
+        tp_prices=[tp.price for tp in signal.tps],
+        tp_shares=[tp.share_pct for tp in signal.tps],
+        sl_price=float(signal.stop),
     )
+    await q.edit_message_text(format_three_tp_plan(plan, title="Opened signal"), parse_mode="Markdown")

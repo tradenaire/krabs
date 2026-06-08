@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from bot.ai.analyst import AnalystResult
-from bot.handlers.scan import scan_handler
+from bot.handlers.scan import scan_handler, scan_preview_callback, _do_execute_open
 
 
 class FakeStatus:
@@ -74,6 +74,9 @@ TECH: squeeze setup
 FUND: ETF flow
 FUNDING: +0.012
 ENTRY: $4180-4200
+TP1: $4100
+TP2: $4000
+TP3: $3900
 SL: $4300
 RISK: 4/10
 
@@ -108,12 +111,286 @@ SENTIMENT: one short idea"
         reply_texts = [msg for msg, _ in message.replies]
         self.assertTrue(any("EPIC" in text for text in reply_texts))
         self.assertTrue(any("AI top-5 long + top-5 short" in text for text in reply_texts))
+        self.assertTrue(any("TP1" in text and "TP2" in text and "TP3" in text and "SL" in text for text in reply_texts))
 
         card_payloads = [(text, kwargs) for text, kwargs in message.replies if "reply_markup" in kwargs]
         self.assertTrue(card_payloads)
         keyboard = card_payloads[0][1]["reply_markup"]
         callback = keyboard.inline_keyboard[0][0].callback_data
-        self.assertIn("open_", callback)
+        self.assertIn("scan_preview_", callback)
+
+    async def test_scan_preview_shows_full_trade_plan_before_opening(self):
+        class FakeQuery:
+            data = "scan_preview_abc123"
+
+            def __init__(self):
+                self.messages = []
+
+            async def answer(self, *args, **kwargs):
+                return None
+
+            @property
+            def message(self):
+                return self
+
+            async def reply_text(self, text, **kwargs):
+                self.messages.append((text, kwargs))
+
+        class FakeClient:
+            async def get_ticker(self, symbol):
+                return {"last": 100.0}
+
+        q = FakeQuery()
+        context = SimpleNamespace(
+            bot_data={
+                "config": SimpleNamespace(tp_ladder_pcts="50,120,250", default_trade_usdt=10.0),
+                "exchange": FakeClient(),
+            },
+            user_data={
+                "scan_picks": {
+                    "abc123": {
+                        "symbol": "EPIC/USDT:USDT",
+                        "side": "sell",
+                        "direction": "short",
+                        "margin": 10.0,
+                        "leverage": 10,
+                        "pick": {"tp1": "$95", "tp2": "$90", "tp3": "$80", "sl": "$105"},
+                    }
+                }
+            },
+        )
+        update = SimpleNamespace(callback_query=q)
+
+        await scan_preview_callback(update, context)
+
+        text = q.messages[0][0]
+        self.assertIn("SHORT", text)
+        self.assertIn("TP1", text)
+        self.assertIn("TP2", text)
+        self.assertIn("TP3", text)
+        self.assertIn("SL", text)
+        self.assertIn("profit", text)
+        keyboard = q.messages[0][1]["reply_markup"]
+        self.assertIn("scan_confirm_abc123", keyboard.inline_keyboard[0][0].callback_data)
+
+    async def test_scan_preview_filters_invalid_tp_before_confirmation(self):
+        class FakeQuery:
+            data = "scan_preview_bad1"
+
+            def __init__(self):
+                self.messages = []
+
+            async def answer(self, *args, **kwargs):
+                return None
+
+            @property
+            def message(self):
+                return self
+
+            async def reply_text(self, text, **kwargs):
+                self.messages.append((text, kwargs))
+
+        class FakeClient:
+            async def get_ticker(self, symbol):
+                return {"last": 101.0}
+
+        q = FakeQuery()
+        context = SimpleNamespace(
+            bot_data={
+                "config": SimpleNamespace(tp_ladder_pcts="50,120,250", default_trade_usdt=10.0),
+                "exchange": FakeClient(),
+            },
+            user_data={
+                "scan_picks": {
+                    "bad1": {
+                        "symbol": "EPIC/USDT:USDT",
+                        "side": "buy",
+                        "direction": "long",
+                        "margin": 10.0,
+                        "leverage": 10,
+                        "pick": {"tp1": "$100.5", "tp2": "$115", "tp3": "$130", "sl": "$95"},
+                    }
+                }
+            },
+        )
+        update = SimpleNamespace(callback_query=q)
+
+        await scan_preview_callback(update, context)
+
+        text = q.messages[0][0]
+        self.assertIn("only valid", text)
+        self.assertNotIn("TP1:", text)
+        self.assertIn("TP2", text)
+        self.assertIn("TP3", text)
+
+    async def test_scan_confirm_rechecks_market_and_requires_new_confirm_if_plan_changed(self):
+        class FakeQuery:
+            data = "scan_confirm_race1"
+
+            def __init__(self):
+                self.messages = []
+
+            async def answer(self, *args, **kwargs):
+                return None
+
+            @property
+            def message(self):
+                return self
+
+            async def reply_text(self, text, **kwargs):
+                self.messages.append((text, kwargs))
+
+        class FakeClient:
+            async def get_ticker(self, symbol):
+                return {"last": 101.0}
+
+        async def fake_open(*args, **kwargs):
+            raise AssertionError("scan_confirm should ask again when live plan changed")
+
+        q = FakeQuery()
+        context = SimpleNamespace(
+            bot_data={
+                "config": SimpleNamespace(tp_ladder_pcts="50,120,250", default_trade_usdt=10.0),
+                "exchange": FakeClient(),
+            },
+            user_data={
+                "scan_picks": {
+                    "race1": {
+                        "symbol": "EPIC/USDT:USDT",
+                        "side": "buy",
+                        "direction": "long",
+                        "margin": 10.0,
+                        "leverage": 10,
+                        "pick": {"tp1": "$100.5", "tp2": "$115", "tp3": "$130", "sl": "$95"},
+                        "preview_fingerprint": "old-plan",
+                    }
+                }
+            },
+            application=None,
+        )
+        update = SimpleNamespace(callback_query=q)
+
+        with patch("bot.handlers.scan._do_execute_open", fake_open):
+            from bot.handlers.scan import scan_confirm_callback
+            await scan_confirm_callback(update, context)
+
+        text, kwargs = q.messages[-1]
+        self.assertIn("only valid", text)
+        self.assertIn("scan_confirm_race1", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+
+    async def test_scan_confirm_requires_new_confirm_when_entry_reference_changed(self):
+        from bot.services.trade_plan import build_three_tp_plan, plan_fingerprint
+
+        old_plan = build_three_tp_plan(
+            symbol="EPIC/USDT:USDT",
+            side="long",
+            entry=100.0,
+            reference=100.0,
+            leverage=10,
+            margin=10.0,
+            tp_prices=[115.0, 130.0, 150.0],
+            sl_price=95.0,
+        )
+
+        class FakeQuery:
+            data = "scan_confirm_move1"
+
+            def __init__(self):
+                self.messages = []
+
+            async def answer(self, *args, **kwargs):
+                return None
+
+            @property
+            def message(self):
+                return self
+
+            async def reply_text(self, text, **kwargs):
+                self.messages.append((text, kwargs))
+
+        class FakeClient:
+            async def get_ticker(self, symbol):
+                return {"last": 101.0}
+
+        async def fake_open(*args, **kwargs):
+            raise AssertionError("scan_confirm should ask again when entry/reference changed")
+
+        q = FakeQuery()
+        context = SimpleNamespace(
+            bot_data={
+                "config": SimpleNamespace(tp_ladder_pcts="50,120,250", default_trade_usdt=10.0),
+                "exchange": FakeClient(),
+            },
+            user_data={
+                "scan_picks": {
+                    "move1": {
+                        "symbol": "EPIC/USDT:USDT",
+                        "side": "buy",
+                        "direction": "long",
+                        "margin": 10.0,
+                        "leverage": 10,
+                        "pick": {"tp1": "$115", "tp2": "$130", "tp3": "$150", "sl": "$95"},
+                        "preview_fingerprint": plan_fingerprint(old_plan),
+                    }
+                }
+            },
+            application=None,
+        )
+        update = SimpleNamespace(callback_query=q)
+
+        with patch("bot.handlers.scan._do_execute_open", fake_open):
+            from bot.handlers.scan import scan_confirm_callback
+            await scan_confirm_callback(update, context)
+
+        text, kwargs = q.messages[-1]
+        self.assertIn("Updated open preview", text)
+        self.assertIn("Reference: `101`", text)
+        self.assertIn("scan_confirm_move1", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+
+    async def test_scan_open_summary_lists_three_tps_when_pick_is_used(self):
+        class FakeQuery:
+            def __init__(self):
+                self.messages = []
+
+            @property
+            def message(self):
+                return self
+
+            async def reply_text(self, text, **kwargs):
+                self.messages.append((text, kwargs))
+
+        async def fake_execute_open(*args, **kwargs):
+            return {
+                "symbol": "EPIC/USDT:USDT",
+                "side": "sell",
+                "margin": 10.0,
+                "leverage": 10,
+                "entry_price": 100.0,
+                "liquidation_price": 150.0,
+                "tp_price": 95.0,
+                "sl_price": 105.0,
+            }
+
+        q = FakeQuery()
+        app = SimpleNamespace(bot_data={"config": SimpleNamespace(tp_ladder_pcts="50,120,250")})
+        with patch("bot.handlers.trading.execute_open", fake_execute_open):
+            await _do_execute_open(
+                q,
+                client=object(),
+                app=app,
+                symbol="EPIC/USDT:USDT",
+                side="sell",
+                margin=10.0,
+                leverage=10,
+                pick={"tp1": "95", "tp2": "90", "tp3": "80", "sl": "105"},
+                exit_mode_override="ladder",
+            )
+
+        final_text = q.messages[-1][0]
+        self.assertIn("TP1", final_text)
+        self.assertIn("TP2", final_text)
+        self.assertIn("TP3", final_text)
+        self.assertIn("profit", final_text)
 
 
 if __name__ == "__main__":
