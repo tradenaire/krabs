@@ -135,6 +135,31 @@ class BalanceLadderFormatTests(unittest.TestCase):
         self.assertIn("TP3", text)
         self.assertNotIn("TP:", text)
 
+    def test_position_block_warns_when_exchange_has_no_tpsl_orders(self):
+        config = SimpleNamespace(
+            max_reentry_cycles=3,
+            averaging_enabled=True,
+            averaging_threshold=-100,
+            averaging_amount=0.5,
+            max_averaging_count=10,
+            tp_ladder_pcts="50,120,250",
+        )
+
+        with patch("bot.db.get_tp_ladder", return_value=None):
+            text = format_position_block(
+                self._pos(),
+                db_rec={"tp_pct": 500, "sl_pct": 500, "averaging_count": 0, "total_invested": 10.0},
+                re_rec=None,
+                config=config,
+                tp_sl_pcts={},
+                active_tpsl_orders=[],
+            )
+
+        self.assertIn("TP/SL на бирже: не найдены", text)
+        self.assertNotIn("TP1:", text)
+        self.assertNotIn("TP2:", text)
+        self.assertNotIn("TP3:", text)
+
 
 if __name__ == "__main__":
     unittest.main()

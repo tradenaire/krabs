@@ -52,8 +52,11 @@ class _BinanceThreadedDNS(ccxt.binanceusdm):
         self._session = value
 
     async def close(self):
+        session = self._session
         await super().close()
-        if self._session and not self._session.closed:
+        if session and not session.closed:
+            await session.close()
+        if self._session and self._session is not session and not self._session.closed:
             await self._session.close()
         self._session = None
 

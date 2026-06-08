@@ -181,12 +181,12 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
         lines.append(f"☠️ {liq:.6g}{dist_str}")
     if ladder:
         lines.extend(_format_ladder_lines(ladder, entry, lev, side))
-    elif active_tpsl_orders:
+    elif active_tpsl_orders is not None:
         order_lines = _format_order_lines(active_tpsl_orders, entry, lev, side)
         if order_lines:
             lines.extend(order_lines)
         else:
-            lines.extend(_format_config_ladder_lines(entry, lev, side, config, sl_price))
+            lines.append("⚠️ TP/SL на бирже: не найдены")
     else:
         lines.extend(_format_config_ladder_lines(entry, lev, side, config, sl_price))
 
