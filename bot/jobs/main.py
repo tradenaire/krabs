@@ -676,6 +676,11 @@ async def reentry_job(app):
             cooldown_text: str = "",
         ) -> str:
             reason_code, reason_label = _close_reason_parts(closed_by_tp_flag, profitable_sl_flag)
+            realized_pnl = (
+                _close_pnl_amount(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin)
+                if exit_price
+                else None
+            )
             return format_close_message(
                 CloseFacts(
                     symbol=symbol,
@@ -686,7 +691,7 @@ async def reentry_job(app):
                     exit_price=float(exit_price or 0),
                     leverage=pnl_lev,
                     margin=pnl_margin,
-                    realized_pnl=_close_pnl_amount(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin),
+                    realized_pnl=realized_pnl,
                 ),
                 ReentryFacts(
                     enabled=reentry_enabled,

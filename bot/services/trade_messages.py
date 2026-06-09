@@ -13,7 +13,7 @@ class CloseFacts:
     exit_price: float
     leverage: int
     margin: float
-    realized_pnl: float
+    realized_pnl: float | None
     hold_seconds: int = 0
 
 
@@ -65,22 +65,30 @@ def format_hold(seconds: int) -> str:
 
 
 def format_close_message(close: CloseFacts, reentry: ReentryFacts) -> str:
-    pnl_pct = calc_pnl_pct(close.entry_price, close.exit_price, close.side, close.leverage)
-    pnl_icon = "✅" if close.realized_pnl >= 0 else "🛑"
+    pnl_known = close.realized_pnl is not None and close.entry_price > 0 and close.exit_price > 0
+    pnl_pct = calc_pnl_pct(close.entry_price, close.exit_price, close.side, close.leverage) if pnl_known else None
+    pnl_icon = "⚪" if not pnl_known else ("✅" if close.realized_pnl >= 0 else "🛑")
     reentry_line = "Перезаход: да" if reentry.will_reenter else "Перезаход: нет"
     if reentry.will_reenter and reentry.cycle_next is not None and reentry.max_cycles is not None:
         reentry_line += f", цикл `{reentry.cycle_next}/{reentry.max_cycles}`"
     if reentry.cooldown_text:
         reentry_line += f" ({reentry.cooldown_text})"
 
+    pnl_line = (
+        f"Маржа: `${close.margin:.2f}` | PnL: `{pnl_pct:+.1f}%` / `{_money(close.realized_pnl)}`"
+        if pnl_known
+        else "Маржа: `${:.2f}` | PnL: `неизвестен`".format(close.margin)
+    )
     lines = [
         f"{pnl_icon} *{_coin(close.symbol)}* {_side_label(close.side)} закрыта",
         f"Причина: {close.reason_label}",
         f"Entry: `{_price(close.entry_price)}` | Exit: `{_price(close.exit_price)}` | Плечо: `×{close.leverage}`",
-        f"Маржа: `${close.margin:.2f}` | PnL: `{pnl_pct:+.1f}%` / `{_money(close.realized_pnl)}`",
+        pnl_line,
         reentry_line,
         f"Почему: {reentry.why}",
     ]
+    if not pnl_known:
+        lines.insert(4, "PnL неизвестен: Binance/история не дали цену закрытия, бот не выдумывает прибыль или убыток.")
     if close.hold_seconds:
         lines.insert(4, f"Время в позиции: `{format_hold(close.hold_seconds)}`")
     return "\n".join(lines)

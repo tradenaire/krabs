@@ -245,9 +245,12 @@ async def close_position(client, bot_data, symbol: str, *,
     exit_price and cycles_left (None when re-entry is not kept).
     """
     pos = await client.get_position(symbol)
-    pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
+    raw_pnl = pos.get("unrealized_pnl") if pos else None
+    pnl = float(raw_pnl) if raw_pnl is not None else None
     margin = float(pos.get("margin", 0)) if pos else 0.0
     exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
+    if exit_price <= 0:
+        exit_price = None
 
     if keep_reentry:
         re_rec = db_mod.get_reentry(symbol)
@@ -276,8 +279,8 @@ async def close_position(client, bot_data, symbol: str, *,
         await client.close_futures_position(symbol)
     note = note or ("manual_reentry" if keep_reentry else "manual")
     db_mod.close_position(symbol)
-    db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note=note)
-    db_mod.close_position_history(symbol, exit_price, pnl, note)
+    db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl if pnl is not None else 0.0, note=note)
+    db_mod.close_position_history(symbol, exit_price or 0, pnl if pnl is not None else 0.0, note)
 
     result = {
         "symbol": client.futures_symbol(symbol),
@@ -311,6 +314,7 @@ def format_manual_close_result(res: dict, *, keep_reentry: bool) -> str:
     cycles_left = res.get("cycles_left")
     cycle_next = 1 if keep_reentry else None
     max_cycles = (int(cycles_left) + 1) if keep_reentry and cycles_left is not None else None
+    res_pnl = res.get("pnl")
     return format_close_message(
         CloseFacts(
             symbol=res.get("symbol") or "",
@@ -321,7 +325,7 @@ def format_manual_close_result(res: dict, *, keep_reentry: bool) -> str:
             exit_price=float(res.get("exit_price") or 0),
             leverage=int(res.get("leverage") or 1),
             margin=float(res.get("margin") or 0),
-            realized_pnl=float(res.get("pnl") or 0),
+            realized_pnl=None if res_pnl is None else float(res_pnl),
         ),
         ReentryFacts(
             enabled=keep_reentry,

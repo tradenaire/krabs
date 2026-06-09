@@ -368,6 +368,34 @@ class TradeDiagnosticsContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Перезаход: нет", sl_text)
         self.assertIn("reentry_on_sl выключен", sl_text)
 
+    def test_close_message_builder_says_pnl_unknown_when_close_price_missing(self):
+        from bot.services.trade_messages import CloseFacts, ReentryFacts, format_close_message
+
+        text = format_close_message(
+            CloseFacts(
+                symbol="EPIC/USDT:USDT",
+                side="long",
+                reason_code="unknown",
+                reason_label="позиция закрыта на бирже",
+                entry_price=0.4686,
+                exit_price=0,
+                leverage=20,
+                margin=10.0,
+                realized_pnl=None,
+            ),
+            ReentryFacts(
+                enabled=False,
+                will_reenter=False,
+                why="Binance не отдал цену закрытия",
+            ),
+        )
+
+        self.assertIn("PnL: `неизвестен`", text)
+        self.assertIn("Binance/история не дали цену закрытия", text)
+        self.assertIn("бот не выдумывает прибыль или убыток", text)
+        self.assertNotIn("$0.00", text)
+        self.assertNotIn("+0.0%", text)
+
 
 if __name__ == "__main__":
     unittest.main()
