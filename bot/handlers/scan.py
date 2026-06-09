@@ -501,15 +501,8 @@ async def scan_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         await q.message.reply_text(f"Cannot open 3TP plan: {e}")
         return
-    fingerprint = plan_fingerprint(plan)
-    if payload.get("preview_fingerprint") != fingerprint:
-        payload["pick"] = pick_from_plan(plan)
-        payload["preview_fingerprint"] = fingerprint
-        text = format_three_tp_plan(plan, title="Updated open preview")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Confirm open", callback_data=f"scan_confirm_{scan_id}")]])
-        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-        return
     payload["pick"] = pick_from_plan(plan)
+    payload["preview_fingerprint"] = plan_fingerprint(plan)
     try:
         averaging_amount = float(getattr(config, "averaging_amount", 0.10)) if config else 0.10
         min_avg = float(payload.get("min_avg") or 0)

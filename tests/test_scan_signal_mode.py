@@ -223,7 +223,7 @@ SENTIMENT: one short idea"
         self.assertIn("TP2", text)
         self.assertIn("TP3", text)
 
-    async def test_scan_confirm_rechecks_market_and_requires_new_confirm_if_plan_changed(self):
+    async def test_scan_confirm_rechecks_market_and_opens_updated_plan_without_extra_confirm(self):
         class FakeQuery:
             data = "scan_confirm_race1"
 
@@ -244,8 +244,10 @@ SENTIMENT: one short idea"
             async def get_ticker(self, symbol):
                 return {"last": 101.0}
 
+        open_calls = []
+
         async def fake_open(*args, **kwargs):
-            raise AssertionError("scan_confirm should ask again when live plan changed")
+            open_calls.append((args, kwargs))
 
         q = FakeQuery()
         context = SimpleNamespace(
@@ -274,11 +276,13 @@ SENTIMENT: one short idea"
             from bot.handlers.scan import scan_confirm_callback
             await scan_confirm_callback(update, context)
 
-        text, kwargs = q.messages[-1]
-        self.assertIn("only valid", text)
-        self.assertIn("scan_confirm_race1", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+        self.assertEqual(q.messages, [])
+        self.assertEqual(len(open_calls), 1)
+        self.assertEqual(open_calls[0][1]["pick"]["tp1"], "")
+        self.assertEqual(float(open_calls[0][1]["pick"]["tp2"]), 115.0)
+        self.assertEqual(float(open_calls[0][1]["pick"]["tp3"]), 130.0)
 
-    async def test_scan_confirm_requires_new_confirm_when_entry_reference_changed(self):
+    async def test_scan_confirm_opens_when_entry_reference_changed(self):
         from bot.services.trade_plan import build_three_tp_plan, plan_fingerprint
 
         old_plan = build_three_tp_plan(
@@ -312,8 +316,10 @@ SENTIMENT: one short idea"
             async def get_ticker(self, symbol):
                 return {"last": 101.0}
 
+        open_calls = []
+
         async def fake_open(*args, **kwargs):
-            raise AssertionError("scan_confirm should ask again when entry/reference changed")
+            open_calls.append((args, kwargs))
 
         q = FakeQuery()
         context = SimpleNamespace(
@@ -342,10 +348,11 @@ SENTIMENT: one short idea"
             from bot.handlers.scan import scan_confirm_callback
             await scan_confirm_callback(update, context)
 
-        text, kwargs = q.messages[-1]
-        self.assertIn("Updated open preview", text)
-        self.assertIn("Reference: `101`", text)
-        self.assertIn("scan_confirm_move1", kwargs["reply_markup"].inline_keyboard[0][0].callback_data)
+        self.assertEqual(q.messages, [])
+        self.assertEqual(len(open_calls), 1)
+        self.assertEqual(float(open_calls[0][1]["pick"]["tp1"]), 115.0)
+        self.assertEqual(float(open_calls[0][1]["pick"]["tp2"]), 130.0)
+        self.assertEqual(float(open_calls[0][1]["pick"]["tp3"]), 150.0)
 
     async def test_scan_open_summary_lists_three_tps_when_pick_is_used(self):
         class FakeQuery:
