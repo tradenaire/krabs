@@ -16,6 +16,7 @@ class FakeExchange:
         self.cancelled_algo_symbols = []
         self.fail_algo_endpoint = False
         self.conditional_orders_as_algo = False
+        self.positions = []
 
     async def load_markets(self):
         return None
@@ -28,6 +29,11 @@ class FakeExchange:
             order for order in self.orders
             if order.get("symbol") == symbol and order.get("open", True)
         ]
+
+    async def fetch_positions(self, symbols=None):
+        if not symbols:
+            return self.positions
+        return [pos for pos in self.positions if pos.get("symbol") in symbols]
 
     async def cancel_order(self, order_id, symbol):
         self.cancelled_orders.append((order_id, symbol))
@@ -169,6 +175,38 @@ class BinanceAlgoReadbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([order["symbol"] for order in orders], ["RENDER/USDT:USDT", "RENDER/USDT:USDT"])
         self.assertEqual([order["trigger_type"] for order in orders], [1, 2])
+
+    async def test_get_tp_sl_orders_without_symbol_reads_algo_orders_for_open_positions(self):
+        client = BinanceClient("key", "secret", testnet=False)
+        fake_exchange = FakeExchange()
+        fake_exchange.positions = [
+            {
+                "symbol": "LIGHT/USDT:USDT",
+                "side": "short",
+                "contracts": 1746,
+                "entryPrice": 0.1129,
+                "markPrice": 0.1129,
+                "leverage": 20,
+            },
+            {
+                "symbol": "RENDER/USDT:USDT",
+                "side": "long",
+                "contracts": 299,
+                "entryPrice": 1.679,
+                "markPrice": 1.6,
+                "leverage": 1,
+            },
+        ]
+        fake_exchange.algo_orders = [
+            {"algoId": "light-tp", "orderType": "TAKE_PROFIT_MARKET", "symbol": "LIGHTUSDT", "side": "BUY", "triggerPrice": "0.1085"},
+            {"algoId": "render-sl", "orderType": "STOP_MARKET", "symbol": "RENDERUSDT", "side": "SELL", "triggerPrice": "1.1"},
+        ]
+        client._exchange = fake_exchange
+
+        orders = await client.get_tp_sl_orders()
+
+        self.assertEqual([order["id"] for order in orders], ["light-tp", "render-sl"])
+        self.assertEqual([order["symbol"] for order in orders], ["LIGHT/USDT:USDT", "RENDER/USDT:USDT"])
 
     async def test_cancel_tp_sl_orders_cancels_normal_and_algo_orders(self):
         client = BinanceClient("key", "secret", testnet=False)

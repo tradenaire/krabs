@@ -613,16 +613,9 @@ class BinanceClient:
             or _f(info.get("stopPrice"))
         )
 
-    async def _open_tpsl_orders(self, symbol: str | None):
-        orders = []
-        if symbol:
-            orders.extend(await self._exchange.fetch_open_orders(self.futures_symbol(symbol)))
-        else:
-            orders.extend(await self._exchange.fetch_open_orders())
-
+    async def _open_algo_orders(self, symbol: str | None) -> list[dict]:
         if not hasattr(self._exchange, "fapiPrivateGetOpenAlgoOrders"):
-            return orders
-
+            return []
         params = {}
         if symbol:
             params["symbol"] = self._market_id(self.futures_symbol(symbol))
@@ -635,7 +628,39 @@ class BinanceClient:
             algo_orders = raw.get("orders") or raw.get("data") or []
         else:
             algo_orders = raw or []
-        orders.extend(algo_orders)
+        return list(algo_orders)
+
+    async def _open_tpsl_orders(self, symbol: str | None):
+        orders = []
+        try:
+            if symbol:
+                orders.extend(await self._exchange.fetch_open_orders(self.futures_symbol(symbol)))
+            else:
+                orders.extend(await self._exchange.fetch_open_orders())
+        except Exception as e:
+            logger.debug("binance open orders %s: %s", symbol, e)
+
+        if symbol:
+            orders.extend(await self._open_algo_orders(symbol))
+            return orders
+
+        algo_orders = await self._open_algo_orders(None)
+        if algo_orders:
+            orders.extend(algo_orders)
+            return orders
+
+        try:
+            positions = await self.get_positions()
+        except Exception as e:
+            logger.debug("binance open algo fallback positions: %s", e)
+            positions = []
+        seen: set[str] = set()
+        for pos in positions:
+            fsym = str(pos.get("symbol") or "")
+            if not fsym or fsym in seen:
+                continue
+            seen.add(fsym)
+            orders.extend(await self._open_algo_orders(fsym))
         return orders
 
     async def get_tp_sl_orders(self, symbol: str | None = None) -> list[dict]:
