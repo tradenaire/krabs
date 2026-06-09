@@ -176,6 +176,30 @@ class BinanceAlgoReadbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([order["symbol"] for order in orders], ["RENDER/USDT:USDT", "RENDER/USDT:USDT"])
         self.assertEqual([order["trigger_type"] for order in orders], [1, 2])
 
+    async def test_norm_position_derives_binance_cross_effective_leverage(self):
+        raw = {
+            "symbol": "H/USDT:USDT",
+            "side": "long",
+            "contracts": 1654.0,
+            "entryPrice": 0.12088,
+            "markPrice": 0.16648936,
+            "leverage": None,
+            "initialMargin": 13.76867008,
+            "unrealizedPnl": 75.43788144,
+            "info": {
+                "symbol": "HUSDT",
+                "positionSide": "BOTH",
+                "notional": "275.37340144",
+                "positionInitialMargin": "13.76867008",
+            },
+        }
+
+        pos = BinanceClient._norm_position(raw)
+
+        self.assertIsNotNone(pos)
+        self.assertEqual(pos["leverage"], 20)
+        self.assertAlmostEqual(pos["percentage"], 547.9, places=1)
+
     async def test_get_tp_sl_orders_without_symbol_reads_algo_orders_for_open_positions(self):
         client = BinanceClient("key", "secret", testnet=False)
         fake_exchange = FakeExchange()

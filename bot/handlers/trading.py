@@ -189,6 +189,150 @@ async def close_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await q.edit_message_text("Отменено.")
 
 
+async def _find_live_position(client, symbol: str) -> dict | None:
+    fsym = client.futures_symbol(symbol)
+    getter = getattr(client, "get_position", None)
+    if getter:
+        pos = await getter(fsym)
+        if pos:
+            return pos
+    for pos in await client.get_positions():
+        if pos.get("symbol") == fsym:
+            return pos
+    return None
+
+
+def _repair_levels(pos: dict, config) -> tuple[list[float], float]:
+    from bot.services.ladder import compute_levels
+    from bot.services.tpsl import validate_exit_prices
+
+    side = str(pos.get("side") or "long")
+    entry = float(pos.get("entry_price") or 0)
+    mark = float(pos.get("mark_price") or 0) or entry
+    lev = int(pos.get("leverage") or 1)
+    reference = mark if mark > 0 else entry
+    tps, sl = compute_levels(reference, lev, side, None, config)
+    validate_exit_prices(str(pos.get("symbol") or ""), side, reference, tps, sl)
+    return tps, sl
+
+
+def _repair_preview_text(symbol: str, pos: dict, orders: list[dict], tps: list[float], sl: float,
+                         db_records: list[dict] | None = None) -> str:
+    from bot.services.protection import classify_protection
+    from bot.services.protection import protection_summary_line
+
+    side = str(pos.get("side") or "long").upper()
+    lev = int(pos.get("leverage") or 1)
+    entry = float(pos.get("entry_price") or 0)
+    mark = float(pos.get("mark_price") or 0)
+    audit = classify_protection(pos, orders, db_records=db_records)
+    lines = [
+        "🛠 Repair preview",
+        f"{symbol.split('/')[0]} {side} ×{lev}",
+        f"Entry: `{entry:.8g}` | Mark: `{mark:.8g}`",
+        f"сейчас: {audit.tp_count} TP / {audit.sl_count} SL",
+        protection_summary_line(audit),
+        "будет: 3 TP / 1 SL",
+    ]
+    for idx, tp in enumerate(tps, 1):
+        lines.append(f"TP{idx}: `{tp:.8g}`")
+    lines.append(f"SL: `{sl:.8g}`")
+    lines.append("Confirm repair — отменит старые TP/SL по символу и поставит эти уровни.")
+    return "\n".join(lines)
+
+
+async def repair_tpsl_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/repair_tpsl SYMBOL — preview only; confirm button performs exchange mutations."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /repair_tpsl SYMBOL")
+        return
+    client = context.bot_data["exchange"]
+    config = context.bot_data.get("config")
+    symbol = client.futures_symbol(args[0].upper())
+    pos = await _find_live_position(client, symbol)
+    if not pos:
+        await update.message.reply_text(f"❌ `{symbol}` не открыт на бирже.", parse_mode="Markdown")
+        return
+    try:
+        orders = await client.get_tp_sl_orders(symbol)
+        tps, sl = _repair_levels(pos, config)
+        from bot import db as db_mod
+        db_rec = db_mod.get_open_position(symbol)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Repair невозможен для `{symbol}`: {e}", parse_mode="Markdown")
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Confirm repair", callback_data=f"repair_tpsl_confirm_{symbol}"),
+    ]])
+    await update.message.reply_text(
+        _repair_preview_text(symbol, pos, orders, tps, sl, [db_rec] if db_rec else []),
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+async def repair_tpsl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    symbol = q.data[len("repair_tpsl_confirm_"):]
+    client = context.bot_data["exchange"]
+    config = context.bot_data.get("config")
+    pos = await _find_live_position(client, symbol)
+    if not pos:
+        await q.edit_message_text(f"❌ `{symbol}` не открыт на бирже.", parse_mode="Markdown")
+        return
+    try:
+        tps, sl = _repair_levels(pos, config)
+        contracts = float(pos.get("contracts") or 0)
+        side = str(pos.get("side") or "long")
+        lev = int(pos.get("leverage") or 1)
+        entry = float(pos.get("entry_price") or 0)
+        margin = float(pos.get("margin") or 0)
+        from bot.services.ladder import tp_quantities
+        from bot.services.tpsl import verify_exit_orders
+        from bot import db as db_mod
+        from bot.infra import db as adb
+
+        await client.cancel_tp_sl_orders(symbol)
+        await client.place_reduce_sl(symbol, side, sl, qty=None)
+        qtys = tp_quantities(contracts, float(getattr(config, "tp_partial_pct", 50.0)), len(tps))
+        for tp, qty in zip(tps, qtys):
+            if qty > 0:
+                await client.place_reduce_tp(symbol, side, qty, tp)
+        verified = await verify_exit_orders(client, symbol, side, tps, sl)
+
+        if not db_mod.get_open_position(symbol):
+            budget = float(getattr(config, "averaging_amount", 0.5)) * int(getattr(config, "max_averaging_count", 100))
+            db_mod.upsert_position(
+                symbol, side, entry, lev, margin,
+                tp_pct=float(getattr(config, "tp_pct", 500)),
+                sl_pct=float(getattr(config, "sl_pct", 500)),
+                budget=budget,
+                total_invested=margin,
+            )
+            db_mod.open_position_history(
+                symbol, side, lev, entry, margin,
+                tp_pct=float(getattr(config, "tp_pct", 500)),
+                sl_pct=float(getattr(config, "sl_pct", 500)),
+                avg_threshold=float(getattr(config, "averaging_threshold", -100)),
+                avg_amount=float(getattr(config, "averaging_amount", 0.5)),
+                avg_budget=budget,
+                avg_max_count=int(getattr(config, "max_averaging_count", 100)),
+                avg_interval=int(getattr(config, "averaging_interval", 0)),
+            )
+        padded = (list(tps) + [0.0, 0.0, 0.0])[:3]
+        await adb.upsert_tp_ladder(symbol, side, entry, lev, padded[0], padded[1], padded[2], sl)
+        await q.edit_message_text(
+            "✅ Repair complete\n"
+            f"{symbol.split('/')[0]} {side.upper()} ×{lev}\n"
+            f"TP_count={verified['tp_count']} | SL_count={verified['sl_count']}",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await q.edit_message_text(f"❌ Repair failed for `{symbol}`: {e}", parse_mode="Markdown")
+
+
 # ── Avg wizard ────────────────────────────────────────────────────
 
 AVG_WIZARD_STEPS = [

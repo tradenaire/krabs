@@ -5,7 +5,14 @@ from unittest.mock import patch
 
 from bot.handlers.scan import open_callback
 from bot.handlers.signals import prepare_signal_confirmation, signal_callback
-from bot.handlers.trading import close_final_callback, close_reentry_callback, min_open_callback, short_handler
+from bot.handlers.trading import (
+    close_final_callback,
+    close_reentry_callback,
+    min_open_callback,
+    repair_tpsl_callback,
+    repair_tpsl_handler,
+    short_handler,
+)
 from bot.handlers.monitor_callbacks import monitor_close_confirm_callback
 from bot.handlers.assistant import assistant_handler, nlp_close_callback
 
@@ -150,6 +157,119 @@ class TradeDiagnosticsContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("RENDER", user_text)
         self.assertIn("уже есть защитный стоп/тейк", user_text)
         _assert_no_raw_binance_leak(self, user_text)
+
+    async def test_repair_tpsl_preview_does_not_mutate_exchange(self):
+        class RepairClient(FakeFuturesClient):
+            def __init__(self):
+                self.cancel_calls = []
+                self.sl_calls = []
+                self.tp_calls = []
+
+            async def get_positions(self):
+                return [{
+                    "symbol": "H/USDT:USDT",
+                    "side": "long",
+                    "entry_price": 0.12088,
+                    "mark_price": 0.1664,
+                    "contracts": 1654.0,
+                    "leverage": 20,
+                    "margin": 13.76,
+                }]
+
+            async def get_tp_sl_orders(self, symbol=None):
+                return []
+
+            async def cancel_tp_sl_orders(self, symbol):
+                self.cancel_calls.append(symbol)
+                return 0
+
+            async def place_reduce_sl(self, *args, **kwargs):
+                self.sl_calls.append((args, kwargs))
+
+            async def place_reduce_tp(self, *args, **kwargs):
+                self.tp_calls.append((args, kwargs))
+
+        client = RepairClient()
+        context = FakeTelegramContext(
+            args=["H"],
+            bot_data={"config": FakeConfig(tp_ladder_pcts="50,120,250", sl_pct=500), "exchange": client},
+        )
+        message = FakeTelegramMessage("/repair_tpsl H")
+        update = FakeTelegramUpdate(message=message)
+
+        await repair_tpsl_handler(update, context)
+
+        text = message.replies[-1][0]
+        self.assertIn("Repair preview", text)
+        self.assertIn("H LONG", text)
+        self.assertIn("сейчас: 0 TP / 0 SL", text)
+        self.assertIn("будет: 3 TP / 1 SL", text)
+        self.assertIn("Confirm repair", text)
+        self.assertEqual(client.cancel_calls, [])
+        self.assertEqual(client.sl_calls, [])
+        self.assertEqual(client.tp_calls, [])
+
+    async def test_repair_tpsl_confirm_cancels_sets_ladder_and_verifies(self):
+        class RepairClient(FakeFuturesClient):
+            def __init__(self):
+                self.cancel_calls = []
+                self.sl_calls = []
+                self.tp_calls = []
+                self.orders = []
+
+            async def get_position(self, symbol):
+                return {
+                    "symbol": "H/USDT:USDT",
+                    "side": "long",
+                    "entry_price": 0.12088,
+                    "mark_price": 0.1664,
+                    "contracts": 1654.0,
+                    "leverage": 20,
+                    "margin": 13.76,
+                }
+
+            async def get_tp_sl_orders(self, symbol=None):
+                return self.orders
+
+            async def cancel_tp_sl_orders(self, symbol):
+                self.cancel_calls.append(symbol)
+                self.orders = []
+                return 0
+
+            async def place_reduce_sl(self, symbol, side, trigger_price, qty=None):
+                self.sl_calls.append((symbol, side, trigger_price, qty))
+                self.orders.append({"symbol": "H/USDT:USDT", "trigger_type": 2, "trigger_price": trigger_price})
+                return {"id": "sl"}
+
+            async def place_reduce_tp(self, symbol, side, qty, trigger_price):
+                self.tp_calls.append((symbol, side, qty, trigger_price))
+                self.orders.append({"symbol": "H/USDT:USDT", "trigger_type": 1, "trigger_price": trigger_price})
+                return {"id": f"tp{len(self.tp_calls)}"}
+
+            def futures_symbol(self, symbol: str) -> str:
+                return "H/USDT:USDT"
+
+        client = RepairClient()
+        context = FakeTelegramContext(
+            bot_data={"config": FakeConfig(tp_ladder_pcts="50,120,250", sl_pct=500, tp_partial_pct=50), "exchange": client},
+        )
+        query = FakeCallbackQuery("repair_tpsl_confirm_H/USDT:USDT")
+        update = FakeTelegramUpdate(callback_query=query)
+
+        async def fake_upsert_ladder(*args, **kwargs):
+            return None
+
+        with patch("bot.infra.db.upsert_tp_ladder", fake_upsert_ladder), \
+             patch("bot.db.get_open_position", return_value={"symbol": "H/USDT:USDT"}):
+            await repair_tpsl_callback(update, context)
+
+        text = query.edits[-1][0]
+        self.assertIn("Repair complete", text)
+        self.assertIn("TP_count=3", text)
+        self.assertIn("SL_count=1", text)
+        self.assertEqual(client.cancel_calls, ["H/USDT:USDT"])
+        self.assertEqual(len(client.tp_calls), 3)
+        self.assertEqual(len(client.sl_calls), 1)
 
     async def test_close_final_button_explains_reason_pnl_and_no_reentry(self):
         context = self._context()

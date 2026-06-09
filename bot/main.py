@@ -20,7 +20,8 @@ from bot.handlers.positions import positions_handler, positions_callback
 from bot.handlers.trading import (short_handler, close_handler, avg_handler, setkey_handler,
                                    setbet_handler, setstop_handler, settp_handler, avg_callback,
                                    min_open_callback, avgunlock_callback,
-                                   close_reentry_callback, close_final_callback, close_cancel_callback)
+                                   close_reentry_callback, close_final_callback, close_cancel_callback,
+                                   repair_tpsl_handler, repair_tpsl_callback)
 from bot.handlers.assistant import assistant_handler, nlp_close_callback
 from bot.handlers.signals import signal_callback, signal_photo_handler
 from bot.handlers.stats import stats_handler
@@ -172,6 +173,7 @@ def main():
             BotCommand("automode", "Авто-скан и открытие позиций"),
             BotCommand("pin", "Закрепить баланс (авто-обновление)"),
             BotCommand("ask", "Спросить AI"),
+            BotCommand("repair_tpsl", "Проверить и восстановить TP/SL"),
         ])
         logger.info("Bot started.")
 
@@ -219,8 +221,10 @@ def main():
     app.add_handler(CommandHandler("automode", automode_handler))
     app.add_handler(CommandHandler("pin", pin_handler))
     app.add_handler(CommandHandler("ask", ask_handler))
+    app.add_handler(CommandHandler("repair_tpsl", repair_tpsl_handler))
 
     app.add_handler(CallbackQueryHandler(signal_callback, pattern=r"^sig_"))
+    app.add_handler(CallbackQueryHandler(repair_tpsl_callback, pattern=r"^repair_tpsl_confirm_"))
     app.add_handler(CallbackQueryHandler(min_open_callback, pattern=r"^min_open_"))
     app.add_handler(CallbackQueryHandler(open_confirm_callback, pattern=r"^open_confirm_"))
     app.add_handler(CallbackQueryHandler(open_anyway_callback, pattern=r"^open_anyway_"))

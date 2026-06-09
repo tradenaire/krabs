@@ -263,6 +263,56 @@ class TradeJobDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Перезаход: нет", user_text)
         self.assertIn("нельзя честно определить", user_text)
 
+    async def test_tpsl_enforce_warns_unprotected_position_without_auto_repair(self):
+        class UnprotectedClient(FakeFuturesClient):
+            def __init__(self):
+                self.cancel_calls = []
+                self.place_calls = []
+
+            async def get_positions(self):
+                return [{
+                    "symbol": "H/USDT:USDT",
+                    "side": "long",
+                    "entry_price": 0.12088,
+                    "mark_price": 0.1664,
+                    "contracts": 1654.0,
+                    "leverage": 20,
+                    "margin": 13.76,
+                }]
+
+            async def get_tp_sl_orders(self, symbol=None):
+                return []
+
+            async def cancel_tp_sl_orders(self, symbol):
+                self.cancel_calls.append(symbol)
+                return 0
+
+            async def place_reduce_tp(self, *args, **kwargs):
+                self.place_calls.append(("tp", args, kwargs))
+
+            async def place_reduce_sl(self, *args, **kwargs):
+                self.place_calls.append(("sl", args, kwargs))
+
+        client = UnprotectedClient()
+        app = SimpleNamespace(bot_data={"exchange": client, "config": FakeConfig()})
+        notifications: list[str] = []
+
+        async def notify(_app, text, reply_markup=None):
+            notifications.append(text)
+
+        with patch("bot.db.get_open_positions", return_value=[{"symbol": "H/USDT:USDT"}]), \
+            patch("bot.db.get_all_reentry", return_value=[]), \
+            patch("bot.db.get_open_position", return_value={"symbol": "H/USDT:USDT"}), \
+            patch("bot.jobs.main._notify_all", notify):
+            await tpsl_enforce_job(app)
+
+        self.assertEqual(len(notifications), 1)
+        self.assertIn("H", notifications[0])
+        self.assertIn("0 TP / 0 SL", notifications[0])
+        self.assertIn("/repair_tpsl H", notifications[0])
+        self.assertEqual(client.cancel_calls, [])
+        self.assertEqual(client.place_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

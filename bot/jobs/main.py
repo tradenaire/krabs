@@ -1027,6 +1027,35 @@ async def tpsl_enforce_job(app):
             "Почему: нельзя честно определить цену закрытия и PnL после внешнего закрытия",
         ]))
 
+    try:
+        from bot.services.protection import classify_protection, protection_summary_line
+
+        all_orders = await client.get_tp_sl_orders()
+        open_db_rows = db_mod.get_open_positions()
+        warned = app.bot_data.setdefault("_tpsl_protection_warned", set())
+        active_keys: set[tuple] = set()
+        for pos in positions:
+            symbol = pos["symbol"]
+            db_records = [row for row in open_db_rows if row.get("symbol") == symbol]
+            related = [order for order in all_orders if order.get("symbol") == symbol]
+            audit = classify_protection(pos, related, db_records=db_records)
+            key = (symbol, audit.status, audit.tp_count, audit.sl_count)
+            active_keys.add(key)
+            if audit.status not in ("MISSING_ALL", "PARTIAL", "DB_MISSING", "DB_DUPLICATE"):
+                continue
+            if key in warned:
+                continue
+            coin = symbol.split("/")[0]
+            await _notify_all(app, "\n".join([
+                f"⚠️ *{coin}* без нормальной защиты",
+                protection_summary_line(audit),
+                f"Действие: `/repair_tpsl {coin}` покажет preview и попросит подтверждение.",
+            ]))
+            warned.add(key)
+        warned.intersection_update(active_keys)
+    except Exception as e:
+        logger.debug("Protection audit warning failed: %s", e)
+
     # Full plan-order sweep every 5 min (every 5th run)
     run_count = app.bot_data.get("_tpsl_run_count", 0) + 1
     app.bot_data["_tpsl_run_count"] = run_count

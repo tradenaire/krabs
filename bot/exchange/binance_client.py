@@ -307,13 +307,22 @@ class BinanceClient:
         mark = _f(p.get("markPrice")) or entry
         liq = round(_f(p.get("liquidationPrice")), 6)
         pnl = _f(p.get("unrealizedPnl"))
-        lev = int(_f(p.get("leverage")) or 1)
+        info = p.get("info") or {}
+        lev_raw = _f(p.get("leverage"))
+        if lev_raw <= 0:
+            notional = abs(_f(info.get("notional")))
+            pos_margin = (
+                _f(info.get("positionInitialMargin"))
+                or _f(p.get("initialMargin"))
+                or _f(info.get("initialMargin"))
+            )
+            lev_raw = round(notional / pos_margin) if notional > 0 and pos_margin > 0 else 1
+        lev = int(lev_raw or 1)
         margin = _f(p.get("initialMargin")) or _f(p.get("collateral"))
         if margin <= 0 and lev > 0 and entry > 0:
             margin = entry * contracts / lev
         pct = round((pnl / margin * 100), 2) if margin > 0 else 0.0
         mm = p.get("marginMode") or "cross"
-        info = p.get("info") or {}
         return {
             "symbol": p.get("symbol"),
             "side": side,

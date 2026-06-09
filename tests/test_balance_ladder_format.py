@@ -108,8 +108,37 @@ class BalanceLadderFormatTests(unittest.TestCase):
         self.assertIn("TP1:95", text)
         self.assertIn("TP2:90", text)
         self.assertIn("TP3:80", text)
+        self.assertIn("3 TP / 1 SL", text)
         self.assertIn("SL:-50%", text)
         self.assertNotIn("TP:", text)
+
+    def test_position_block_explains_single_mode_orders_without_ladder(self):
+        config = SimpleNamespace(
+            max_reentry_cycles=3,
+            averaging_enabled=True,
+            averaging_threshold=-100,
+            averaging_amount=0.5,
+            max_averaging_count=10,
+            tp_ladder_pcts="50,120,250",
+        )
+        orders = [
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 150.0, "trigger_type": 2},
+            {"symbol": "EPIC/USDT:USDT", "trigger_price": 80.0, "trigger_type": 1},
+        ]
+
+        with patch("bot.db.get_tp_ladder", return_value=None):
+            text = format_position_block(
+                self._pos(),
+                db_rec={"tp_pct": 500, "sl_pct": 500, "averaging_count": 0, "total_invested": 10.0},
+                re_rec=None,
+                config=config,
+                tp_sl_pcts={},
+                active_tpsl_orders=orders,
+            )
+
+        self.assertIn("single mode: 1 TP / 1 SL", text)
+        self.assertIn("TP1:150", text)
+        self.assertIn("SL:+200%", text)
 
     def test_position_block_falls_back_to_configured_three_tp_levels(self):
         config = SimpleNamespace(
@@ -155,10 +184,33 @@ class BalanceLadderFormatTests(unittest.TestCase):
                 active_tpsl_orders=[],
             )
 
-        self.assertIn("TP/SL на бирже: не найдены", text)
+        self.assertIn("TP/SL на бирже: 0 TP / 0 SL", text)
+        self.assertIn("требуется repair", text)
         self.assertNotIn("TP1:", text)
         self.assertNotIn("TP2:", text)
         self.assertNotIn("TP3:", text)
+
+    def test_position_block_marks_db_missing_for_exchange_position(self):
+        config = SimpleNamespace(
+            max_reentry_cycles=3,
+            averaging_enabled=True,
+            averaging_threshold=-100,
+            averaging_amount=0.5,
+            max_averaging_count=10,
+            tp_ladder_pcts="50,120,250",
+        )
+
+        with patch("bot.db.get_tp_ladder", return_value=None):
+            text = format_position_block(
+                self._pos(),
+                db_rec=None,
+                re_rec=None,
+                config=config,
+                tp_sl_pcts={},
+                active_tpsl_orders=[],
+            )
+
+        self.assertIn("позиция есть на бирже, но нет open DB record", text)
 
 
 if __name__ == "__main__":

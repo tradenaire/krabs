@@ -3,6 +3,7 @@ from bot.fmt import fmt_pct, fmt_usd
 from bot.services.tpsl import calc_tp_price as _calc_tp_price
 from bot.services.tpsl import calc_sl_price as _calc_sl_price
 from bot.services.tpsl import pnl_pct_at_price as _pnl_pct_at_price
+from bot.services.protection import classify_protection, protection_summary_line
 
 
 def _fmt_funding(rate: float, lev: int, margin: float, next_ts: str | None = None) -> str:
@@ -179,14 +180,15 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     ]
     if liq > 0:
         lines.append(f"☠️ {liq:.6g}{dist_str}")
+    db_records = [db_rec] if db_rec else []
     if ladder:
         lines.extend(_format_ladder_lines(ladder, entry, lev, side))
     elif active_tpsl_orders is not None:
+        audit = classify_protection(pos, active_tpsl_orders, db_records=db_records)
+        lines.append(protection_summary_line(audit))
         order_lines = _format_order_lines(active_tpsl_orders, entry, lev, side)
         if order_lines:
             lines.extend(order_lines)
-        else:
-            lines.append("⚠️ TP/SL на бирже: не найдены")
     else:
         lines.extend(_format_config_ladder_lines(entry, lev, side, config, sl_price))
 
