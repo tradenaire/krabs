@@ -34,11 +34,14 @@ class _BinanceThreadedDNS(ccxt.binanceusdm):
     """
     def __init__(self, config=None):
         self._session = None
+        self._closing = False
         super().__init__(config or {})
 
     @property
     def session(self):
         if self._session is None:
+            if self._closing:
+                return None
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
@@ -53,12 +56,16 @@ class _BinanceThreadedDNS(ccxt.binanceusdm):
 
     async def close(self):
         session = self._session
-        if session and not session.closed:
-            await session.close()
-        await super().close()
-        if self._session and self._session is not session and not self._session.closed:
-            await self._session.close()
-        self._session = None
+        self._closing = True
+        try:
+            await super().close()
+        finally:
+            if session and not session.closed:
+                await session.close()
+            if self._session and self._session is not session and not self._session.closed:
+                await self._session.close()
+            self._session = None
+            self._closing = False
 
 _TP_TYPES = ("take_profit_market", "take_profit")
 _SL_TYPES = ("stop_market", "stop")

@@ -13,6 +13,13 @@ class BinanceClientCloseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.closed)
         self.assertIsNone(client._exchange._session)
 
+    async def test_close_does_not_create_session_when_none_exists(self):
+        client = BinanceClient("dummy", "dummy", testnet=True)
+
+        await client.close()
+
+        self.assertIsNone(client._exchange._session)
+
 
 if __name__ == "__main__":
     unittest.main()
