@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from bot.exchange.binance_client import BinanceClient
+from bot.services.ladder import setup_on_open
 from bot.signals.execution import execute_signal
 from bot.signals.model import ParsedSignal, TpTarget
 
@@ -10,12 +11,51 @@ from bot.signals.model import ParsedSignal, TpTarget
 class FakeExchange:
     def __init__(self):
         self.orders = []
+        self.algo_orders = []
+        self.cancelled_orders = []
+        self.cancelled_algo_symbols = []
+        self.fail_algo_endpoint = False
+        self.conditional_orders_as_algo = False
 
     async def load_markets(self):
         return None
 
+    def market(self, symbol):
+        return {"id": symbol.replace("/", "").replace(":USDT", "")}
+
     async def fetch_open_orders(self, symbol):
-        return []
+        return [
+            order for order in self.orders
+            if order.get("symbol") == symbol and order.get("open", True)
+        ]
+
+    async def cancel_order(self, order_id, symbol):
+        self.cancelled_orders.append((order_id, symbol))
+        for order in self.orders:
+            if order.get("id") == order_id:
+                order["open"] = False
+        return {"id": order_id}
+
+    async def fapiPrivateGetOpenAlgoOrders(self, params):
+        if self.fail_algo_endpoint:
+            raise RuntimeError("algo endpoint unavailable")
+        symbol = params.get("symbol")
+        return [
+            order for order in self.algo_orders
+            if order.get("symbol") == symbol and order.get("algoStatus", "NEW") == "NEW"
+        ]
+
+    async def fapiPrivateDeleteAlgoOpenOrders(self, params):
+        if self.fail_algo_endpoint:
+            raise RuntimeError("algo endpoint unavailable")
+        symbol = params.get("symbol")
+        self.cancelled_algo_symbols.append(symbol)
+        count = 0
+        for order in self.algo_orders:
+            if order.get("symbol") == symbol and order.get("algoStatus", "NEW") == "NEW":
+                order["algoStatus"] = "CANCELED"
+                count += 1
+        return {"success": True, "canceled": count}
 
     def amount_to_precision(self, symbol, amount):
         return f"{float(amount):.8f}".rstrip("0").rstrip(".")
@@ -34,8 +74,158 @@ class FakeExchange:
             "params": params,
             "info": {},
         }
-        self.orders.append(order)
+        if self.conditional_orders_as_algo and order_type in ("TAKE_PROFIT_MARKET", "STOP_MARKET"):
+            algo = {
+                "algoId": str(len(self.algo_orders) + 1),
+                "algoType": "CONDITIONAL",
+                "orderType": order_type,
+                "symbol": symbol.replace("/", "").replace(":USDT", ""),
+                "side": side.upper(),
+                "triggerPrice": str(params.get("stopPrice")),
+                "closePosition": bool(params.get("closePosition")),
+                "reduceOnly": bool(params.get("reduceOnly")),
+                "algoStatus": "NEW",
+            }
+            self.algo_orders.append(algo)
+            order["info"] = algo
+        else:
+            self.orders.append(order)
         return order
+
+
+class BinanceAlgoReadbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_tp_sl_orders_reads_short_binance_open_algo_orders(self):
+        client = BinanceClient("key", "secret", testnet=False)
+        fake_exchange = FakeExchange()
+        fake_exchange.algo_orders = [
+            {
+                "algoId": "tp1",
+                "algoType": "CONDITIONAL",
+                "orderType": "TAKE_PROFIT_MARKET",
+                "symbol": "LIGHTUSDT",
+                "side": "BUY",
+                "triggerPrice": "0.10850",
+                "reduceOnly": True,
+            },
+            {
+                "algoId": "tp2",
+                "algoType": "CONDITIONAL",
+                "orderType": "TAKE_PROFIT_MARKET",
+                "symbol": "LIGHTUSDT",
+                "side": "BUY",
+                "triggerPrice": "0.10280",
+                "reduceOnly": True,
+            },
+            {
+                "algoId": "tp3",
+                "algoType": "CONDITIONAL",
+                "orderType": "TAKE_PROFIT_MARKET",
+                "symbol": "LIGHTUSDT",
+                "side": "BUY",
+                "triggerPrice": "0.09550",
+                "reduceOnly": True,
+            },
+            {
+                "algoId": "sl",
+                "algoType": "CONDITIONAL",
+                "orderType": "STOP_MARKET",
+                "symbol": "LIGHTUSDT",
+                "side": "BUY",
+                "triggerPrice": "0.12180",
+                "closePosition": True,
+            },
+        ]
+        client._exchange = fake_exchange
+
+        orders = await client.get_tp_sl_orders("LIGHT")
+
+        self.assertEqual([order["id"] for order in orders], ["tp1", "tp2", "tp3", "sl"])
+        self.assertEqual({order["symbol"] for order in orders}, {"LIGHT/USDT:USDT"})
+        self.assertEqual([order["trigger_type"] for order in orders], [2, 2, 2, 1])
+        self.assertEqual([order["trigger_price"] for order in orders], [0.1085, 0.1028, 0.0955, 0.1218])
+
+    async def test_get_tp_sl_orders_reads_long_binance_open_algo_orders(self):
+        client = BinanceClient("key", "secret", testnet=False)
+        fake_exchange = FakeExchange()
+        fake_exchange.algo_orders = [
+            {
+                "algoId": "tp1",
+                "orderType": "TAKE_PROFIT_MARKET",
+                "symbol": "RENDERUSDT",
+                "side": "SELL",
+                "triggerPrice": "2.50",
+            },
+            {
+                "algoId": "sl",
+                "orderType": "STOP_MARKET",
+                "symbol": "RENDERUSDT",
+                "side": "SELL",
+                "triggerPrice": "1.10",
+            },
+        ]
+        client._exchange = fake_exchange
+
+        orders = await client.get_tp_sl_orders("RENDER")
+
+        self.assertEqual([order["symbol"] for order in orders], ["RENDER/USDT:USDT", "RENDER/USDT:USDT"])
+        self.assertEqual([order["trigger_type"] for order in orders], [1, 2])
+
+    async def test_cancel_tp_sl_orders_cancels_normal_and_algo_orders(self):
+        client = BinanceClient("key", "secret", testnet=False)
+        fake_exchange = FakeExchange()
+        fake_exchange.orders = [
+            {"id": "normal-tp", "symbol": "LIGHT/USDT:USDT", "type": "TAKE_PROFIT_MARKET", "side": "buy"},
+        ]
+        fake_exchange.algo_orders = [
+            {"algoId": "algo-tp", "orderType": "TAKE_PROFIT_MARKET", "symbol": "LIGHTUSDT", "side": "BUY"},
+        ]
+        client._exchange = fake_exchange
+
+        count = await client.cancel_tp_sl_orders("LIGHT")
+
+        self.assertEqual(count, 2)
+        self.assertEqual(fake_exchange.cancelled_orders, [("normal-tp", "LIGHT/USDT:USDT")])
+        self.assertEqual(fake_exchange.cancelled_algo_symbols, ["LIGHTUSDT"])
+
+    async def test_cancel_tp_sl_orders_ignores_missing_algo_endpoint(self):
+        client = BinanceClient("key", "secret", testnet=False)
+        fake_exchange = FakeExchange()
+        fake_exchange.fail_algo_endpoint = True
+        fake_exchange.orders = [
+            {"id": "normal-sl", "symbol": "LIGHT/USDT:USDT", "type": "STOP_MARKET", "side": "buy"},
+        ]
+        client._exchange = fake_exchange
+
+        count = await client.cancel_tp_sl_orders("LIGHT")
+
+        self.assertEqual(count, 1)
+        self.assertEqual(fake_exchange.cancelled_orders, [("normal-sl", "LIGHT/USDT:USDT")])
+
+    async def test_ladder_setup_accepts_binance_algo_readback(self):
+        client = BinanceClient("key", "secret", testnet=False)
+        fake_exchange = FakeExchange()
+        fake_exchange.conditional_orders_as_algo = True
+        client._exchange = fake_exchange
+        app = SimpleNamespace(bot_data={"config": SimpleNamespace(tp_partial_pct=50)})
+        calls = []
+
+        async def fake_upsert(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        with patch("bot.infra.db.upsert_tp_ladder", fake_upsert):
+            await setup_on_open(
+                client,
+                app,
+                symbol="LIGHT/USDT:USDT",
+                side="short",
+                entry=0.1145,
+                leverage=20,
+                contracts=1746.0,
+                pick={"tp1": "0.1085", "tp2": "0.1028", "tp3": "0.0955", "sl": "0.1218"},
+            )
+
+        self.assertEqual(len(fake_exchange.algo_orders), 4)
+        self.assertEqual(len(calls), 1)
 
 
 class FakeClient:

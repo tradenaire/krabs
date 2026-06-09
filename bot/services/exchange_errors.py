@@ -57,6 +57,18 @@ def format_open_error(
     side_norm = (side or "").lower()
     side_label = "SHORT" if side_norm in ("short", "sell") else "LONG" if side_norm in ("long", "buy") else "позиции"
 
+    verify_match = re.search(r"expected\s+(\d+)\s+TP orders,\s+found\s+(\d+)", raw, re.IGNORECASE)
+    if verify_match:
+        expected_tp, found_tp = verify_match.groups()
+        return "\n".join([
+            header,
+            "Причина: TP/SL не подтвердились через Binance после входа.",
+            "Бот открыл вход, но вход был закрыт, чтобы не оставить без TP/SL.",
+            f"Проверка: ожидал {expected_tp} TP, нашёл {found_tp}.",
+            "Что сделать: повторить открытие после фикса/обновления; бот оставит позицию только если Binance readback подтвердит защиту.",
+            "Сырой ответ Binance скрыт. Подробности есть в логах.",
+        ])
+
     if code == -2021 or "would immediately trigger" in raw_low or "сработал бы сразу" in raw_low:
         if "tp" in stage.lower() or "tp" in raw_low:
             if side_label == "SHORT":

@@ -152,6 +152,15 @@ class BinanceClient:
         except Exception:
             return sym.replace("/", "").replace(":USDT", "")
 
+    @staticmethod
+    def _ccxt_symbol(raw_symbol: str) -> str:
+        symbol = str(raw_symbol or "")
+        if "/" in symbol:
+            return symbol if ":USDT" in symbol else f"{symbol}:USDT"
+        if symbol.endswith("USDT") and len(symbol) > 4:
+            return f"{symbol[:-4]}/USDT:USDT"
+        return symbol
+
     async def close(self):
         await self._exchange.close()
 
@@ -553,6 +562,8 @@ class BinanceClient:
             sym, "TAKE_PROFIT_MARKET", close_side, q, None,
             {"stopPrice": stop, "reduceOnly": True, "workingType": "MARK_PRICE"},
         )
+        log_event("exchange", "binance_raw_response",
+                  operation="place_reduce_tp", raw=order.get("info"))
         return {"id": order.get("id"), "symbol": sym, "qty": q,
                 "trigger_price": stop, "info": order.get("info", {})}
 
@@ -570,22 +581,62 @@ class BinanceClient:
             q = float(self._exchange.amount_to_precision(sym, qty))
             params = {"stopPrice": stop, "reduceOnly": True, "workingType": "MARK_PRICE"}
             order = await self._exchange.create_order(sym, "STOP_MARKET", close_side, q, None, params)
+        log_event("exchange", "binance_raw_response",
+                  operation="place_reduce_sl", raw=order.get("info"))
         return {"id": order.get("id"), "symbol": sym, "trigger_price": stop,
                 "info": order.get("info", {})}
 
     @staticmethod
     def _order_kind(o: dict) -> str | None:
-        t = str(o.get("type") or (o.get("info") or {}).get("type") or "").lower()
+        info = o.get("info") or {}
+        t = str(
+            o.get("type")
+            or o.get("orderType")
+            or info.get("type")
+            or info.get("orderType")
+            or ""
+        ).lower()
         if any(x in t for x in _TP_TYPES):
             return "TP"
         if any(x in t for x in _SL_TYPES):
             return "SL"
         return None
 
+    @staticmethod
+    def _trigger_price(o: dict) -> float:
+        info = o.get("info") or {}
+        return (
+            _f(o.get("triggerPrice"))
+            or _f(o.get("trigger_price"))
+            or _f(o.get("stopPrice"))
+            or _f(info.get("triggerPrice"))
+            or _f(info.get("stopPrice"))
+        )
+
     async def _open_tpsl_orders(self, symbol: str | None):
+        orders = []
         if symbol:
-            return await self._exchange.fetch_open_orders(self.futures_symbol(symbol))
-        return await self._exchange.fetch_open_orders()
+            orders.extend(await self._exchange.fetch_open_orders(self.futures_symbol(symbol)))
+        else:
+            orders.extend(await self._exchange.fetch_open_orders())
+
+        if not hasattr(self._exchange, "fapiPrivateGetOpenAlgoOrders"):
+            return orders
+
+        params = {}
+        if symbol:
+            params["symbol"] = self._market_id(self.futures_symbol(symbol))
+        try:
+            raw = await self._exchange.fapiPrivateGetOpenAlgoOrders(params)
+        except Exception as e:
+            logger.debug("binance open algo orders %s: %s", symbol, e)
+            return orders
+        if isinstance(raw, dict):
+            algo_orders = raw.get("orders") or raw.get("data") or []
+        else:
+            algo_orders = raw or []
+        orders.extend(algo_orders)
+        return orders
 
     async def get_tp_sl_orders(self, symbol: str | None = None) -> list[dict]:
         try:
@@ -598,7 +649,7 @@ class BinanceClient:
             kind = self._order_kind(o)
             if not kind:
                 continue
-            stop = _f(o.get("stopPrice")) or _f((o.get("info") or {}).get("stopPrice"))
+            stop = self._trigger_price(o)
             if stop <= 0:
                 continue
             o_side = (o.get("side") or "").lower()
@@ -611,8 +662,8 @@ class BinanceClient:
             else:
                 trigger_type = 2 if is_tp else 1
             out.append({
-                "id": o.get("id"),
-                "symbol": o.get("symbol"),
+                "id": o.get("id") or o.get("algoId"),
+                "symbol": self._ccxt_symbol(o.get("symbol")),
                 "trigger_price": stop,
                 "side": close_side,
                 "trigger_type": trigger_type,
@@ -622,17 +673,37 @@ class BinanceClient:
 
     async def cancel_tp_sl_orders(self, symbol: str) -> int:
         sym = self.futures_symbol(symbol)
+        market_id = self._market_id(sym)
+        cancelled = 0
         try:
             orders = await self._exchange.fetch_open_orders(sym)
         except Exception:
-            return 0
+            orders = []
         targets = [o for o in orders if self._order_kind(o)]
         for o in targets:
             try:
                 await self._exchange.cancel_order(o.get("id"), sym)
+                cancelled += 1
             except Exception as e:
                 logger.debug("binance cancel tp/sl %s: %s", o.get("id"), e)
-        return len(targets)
+        if hasattr(self._exchange, "fapiPrivateGetOpenAlgoOrders"):
+            try:
+                raw = await self._exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+                if isinstance(raw, dict):
+                    algo_orders = raw.get("orders") or raw.get("data") or []
+                else:
+                    algo_orders = raw or []
+                algo_targets = [o for o in algo_orders if self._order_kind(o)]
+            except Exception as e:
+                logger.debug("binance list algo tp/sl %s: %s", sym, e)
+                algo_targets = []
+            if algo_targets and hasattr(self._exchange, "fapiPrivateDeleteAlgoOpenOrders"):
+                try:
+                    await self._exchange.fapiPrivateDeleteAlgoOpenOrders({"symbol": market_id})
+                    cancelled += len(algo_targets)
+                except Exception as e:
+                    logger.debug("binance cancel algo tp/sl %s: %s", sym, e)
+        return cancelled
 
     async def cancel_plan_orders(self, symbol: str) -> None:
         sym = self.futures_symbol(symbol)

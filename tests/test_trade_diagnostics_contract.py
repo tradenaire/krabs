@@ -297,6 +297,24 @@ class TradeDiagnosticsContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("старые TP/SL будут отменены", existing)
         _assert_no_raw_binance_leak(self, existing)
 
+    def test_exchange_error_formatter_explains_unconfirmed_tpsl_readback(self):
+        from bot.services.exchange_errors import format_open_error
+
+        text = format_open_error(
+            RuntimeError("LIGHT/USDT:USDT: expected 3 TP orders, found 0; missing 0.1085, 0.1028, 0.0955"),
+            symbol="LIGHT/USDT:USDT",
+            side="short",
+        )
+
+        self.assertIn("LIGHT", text)
+        self.assertIn("TP/SL", text)
+        self.assertIn("вход был закрыт", text)
+        self.assertIn("чтобы не оставить без TP/SL", text)
+        self.assertIn("ожидал 3 TP", text)
+        self.assertIn("нашёл 0", text)
+        self.assertNotIn("expected 3 TP orders", text)
+        self.assertNotIn("missing 0.1085", text)
+
     def test_close_message_builder_contract_for_tp_sl_and_reentry(self):
         from bot.services.trade_messages import CloseFacts, ReentryFacts, format_close_message
 
