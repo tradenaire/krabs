@@ -1,0 +1,76 @@
+name: Deploy krabs to Railway
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: krabs-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_KRABS_TOKEN }}
+      DEPLOY_SHA: ${{ github.sha }}
+    steps:
+      - name: Deploy repository commit and wait for Railway
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          token = os.environ["RAILWAY_TOKEN"]
+          if not token:
+              raise SystemExit("Missing RAILWAY_KRABS_TOKEN repository secret")
+          service = "cc6ea924-0964-4715-aa25-98ec73776706"
+          environment = "256d3870-df52-437c-bb92-fa976c5a39de"
+          sha = os.environ["DEPLOY_SHA"]
+
+          def api(query, variables):
+              request = urllib.request.Request(
+                  "https://backboard.railway.com/graphql/v2",
+                  data=json.dumps({"query": query, "variables": variables}).encode(),
+                  headers={"Content-Type": "application/json",
+                           "User-Agent": "Railway CLI krabs-github-actions",
+                           "Project-Access-Token": token})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+              if result.get("errors"):
+                  raise SystemExit("Railway API rejected the deployment operation")
+              return result["data"]
+
+          variables = {"service": service, "environment": environment}
+          result = api("""mutation($service:String!,$environment:String!,$sha:String!){
+              serviceInstanceDeploy(serviceId:$service,environmentId:$environment,commitSha:$sha)
+          }""", {**variables, "sha": sha})
+          if not result["serviceInstanceDeploy"]:
+              raise SystemExit("Railway did not accept the deployment")
+          print(f"Requested tradenaire/krabs main commit {sha}", flush=True)
+          for _ in range(90):
+              instance = api("""query($service:String!,$environment:String!){
+                  serviceInstance(serviceId:$service,environmentId:$environment){
+                      latestDeployment{id status meta}
+                  }
+              }""", variables)["serviceInstance"]
+              deployment = instance["latestDeployment"]
+              if deployment and (deployment.get("meta") or {}).get("commitHash") == sha:
+                  status = deployment["status"]
+                  print(f"{deployment['id']}: {status}", flush=True)
+                  if status == "SUCCESS":
+                      break
+                  if status in {"FAILED", "CRASHED", "REMOVED", "SKIPPED"}:
+                      raise SystemExit(f"Deployment ended with {status}")
+              time.sleep(10)
+          else:
+              raise SystemExit("Timed out waiting for the requested commit to deploy")
+          PY
