@@ -117,6 +117,9 @@ async def _fetch_all(client, context):
     if isinstance(spot_bal, Exception):
         spot_bal = None
 
+    # Keep balance text and numbered buttons in descending return (%) order.
+    positions = sorted(positions, key=lambda p: float(p.get("percentage") or 0), reverse=True)
+
     futures_bal["_prices"] = {"USDT": 1.0} if isinstance(prices, Exception) else prices
 
     db_recs = {p["symbol"]: r for p in positions if (r := db_mod.get_managed_position(p))}
