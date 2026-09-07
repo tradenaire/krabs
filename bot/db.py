@@ -3,19 +3,26 @@ import json
 import logging
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent.parent / "data" / "bot.db"
+DATA_DIR = Path(os.environ.get("KRABS_DATA_DIR", Path(__file__).parent.parent / "data"))
+DB_PATH = DATA_DIR / "bot.db"
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -145,6 +152,38 @@ def init_db():
             if col not in existing:
                 conn.execute(f"ALTER TABLE position_history ADD COLUMN {col} {coldef}")
 
+        # Old symbol-only records do not prove ownership of a live exchange position.
+        migrations = {
+            "positions": [("exchange_position_id", "TEXT"), ("opened_at_ms", "INTEGER"),
+                          ("locked_sl", "REAL"), ("profit_lock_step", "REAL DEFAULT 0"),
+                          ("profit_lock_enabled", "INTEGER DEFAULT 1")],
+            "reentry": [("position_key", "INTEGER")],
+            "position_history": [("position_key", "INTEGER")],
+            "trade_log": [("position_key", "INTEGER")],
+        }
+        for table, columns in migrations.items():
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, declaration in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        conn.executescript("""
+            CREATE UNIQUE INDEX IF NOT EXISTS managed_exchange_position
+                ON positions(exchange_position_id) WHERE exchange_position_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS close_once ON trade_log(position_key)
+                WHERE action='close' AND position_key IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS bot_orders (
+                order_id TEXT NOT NULL, order_type TEXT NOT NULL,
+                position_key INTEGER NOT NULL, symbol TEXT NOT NULL,
+                kind TEXT NOT NULL, price REAL, confirmed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(order_id, order_type)
+            );
+            CREATE TABLE IF NOT EXISTS closures (
+                position_key INTEGER PRIMARY KEY, reason TEXT NOT NULL,
+                pnl REAL, exit_price REAL, closed_at TEXT NOT NULL,
+                order_ids TEXT NOT NULL, notified INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+
 
 def get_all_config() -> dict[str, str]:
     with _connect() as conn:
@@ -169,14 +208,24 @@ def get_config(key: str, default: str = "") -> str:
 def upsert_position(symbol: str, side: str, entry_price: float, leverage: int,
                     margin: float, tp_pct: float = 500, sl_pct: float = 500,
                     budget: float = 5.0, total_invested: float = 0,
-                    avg_count: int = 0) -> int:
+                    avg_count: int = 0, exchange_position_id: str | None = None,
+                    opened_at_ms: int | None = None) -> int:
     ti = total_invested if total_invested > 0 else margin
     with _connect() as conn:
+        if exchange_position_id:
+            old = conn.execute("SELECT * FROM positions WHERE exchange_position_id=?",
+                               (str(exchange_position_id),)).fetchone()
+            if old:
+                if old["status"] != "open" or old["opened_at_ms"] != opened_at_ms or old["side"] != side:
+                    raise ValueError("Exchange position identity conflicts with a previous record")
+                return old["id"]
         conn.execute("""
             INSERT OR IGNORE INTO positions (symbol, side, entry_price, leverage, margin,
-                total_invested, averaging_count, averaging_budget, tp_pct, sl_pct, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
-        """, (symbol, side, entry_price, leverage, margin, ti, avg_count, budget, tp_pct, sl_pct))
+                total_invested, averaging_count, averaging_budget, tp_pct, sl_pct, status,
+                exchange_position_id, opened_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+        """, (symbol, side, entry_price, leverage, margin, ti, avg_count, budget, tp_pct, sl_pct,
+              str(exchange_position_id) if exchange_position_id else None, opened_at_ms))
         row = conn.execute(
             "SELECT id FROM positions WHERE symbol=? AND status='open' ORDER BY id DESC LIMIT 1",
             (symbol,)
@@ -199,6 +248,100 @@ def get_open_position(symbol: str) -> dict | None:
             (symbol,)
         ).fetchone()
     return dict(row) if row else None
+
+
+def get_managed_position(live: dict) -> dict | None:
+    """Never infer ownership from a symbol, runtime cache, or an old DB record."""
+    exchange_id = live.get("position_id")
+    if not exchange_id:
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM positions WHERE exchange_position_id=? AND symbol=? AND status='open'",
+            (str(exchange_id), live["symbol"]),
+        ).fetchone()
+    if (row and row["side"] == live["side"]
+            and live.get("opened_at_ms") is not None
+            and int(row["opened_at_ms"] or 0) == int(live["opened_at_ms"])):
+        return dict(row)
+    return None
+
+
+def get_position_by_id(position_key: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM positions WHERE id=?", (position_key,)).fetchone()
+    return dict(row) if row else None
+
+
+def save_bot_order(order_id, position_key: int, symbol: str, kind: str,
+                   price: float = 0, order_type: str = "plan", confirmed: bool = False):
+    if not order_id:
+        raise ValueError("Exchange did not return an order ID")
+    with _connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO bot_orders VALUES (?,?,?,?,?,?,?)",
+                     (str(order_id), order_type, position_key, symbol, kind, price, int(confirmed)))
+
+
+def get_bot_orders(position_key: int | None = None, order_type: str = "plan") -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM bot_orders WHERE order_type=? AND (? IS NULL OR position_key=?)",
+            (order_type, position_key, position_key),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def confirm_protection(position_key: int, order_id: str, locked_sl: float | None = None,
+                       profit_lock_step: float | None = None):
+    with _connect() as conn:
+        conn.execute("UPDATE bot_orders SET confirmed=1 WHERE order_id=? AND order_type='plan'",
+                     (str(order_id),))
+        if locked_sl is not None:
+            conn.execute("UPDATE positions SET locked_sl=?, profit_lock_step=COALESCE(?, profit_lock_step) WHERE id=?",
+                         (locked_sl, profit_lock_step, position_key))
+
+
+def get_closure(position_key: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM closures WHERE position_key=?", (position_key,)).fetchone()
+    return dict(row) if row else None
+
+
+def record_closure(position: dict, result: dict) -> bool:
+    """One transaction per position, shared by polling and every manual-close path."""
+    import datetime as dt
+    key = position["id"]
+    closed_at = result["closed_at"]
+    with _connect() as conn:
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO closures(position_key,reason,pnl,exit_price,closed_at,order_ids) VALUES (?,?,?,?,?,?)",
+            (key, result["reason"], result.get("pnl"), result.get("exit_price"), closed_at,
+             json.dumps(result.get("order_ids", []))),
+        ).rowcount
+        if not inserted:
+            old = conn.execute("SELECT * FROM closures WHERE position_key=?", (key,)).fetchone()
+            result = dict(result)
+            if old["pnl"] is not None:
+                result["pnl"] = old["pnl"]
+            if old["reason"] != "unknown":
+                result["reason"] = old["reason"]
+            conn.execute("UPDATE closures SET reason=?,pnl=?,exit_price=?,order_ids=? WHERE position_key=?",
+                         (result["reason"], result.get("pnl"), result.get("exit_price"),
+                          json.dumps(result.get("order_ids", [])), key))
+        conn.execute("UPDATE positions SET status='closed' WHERE id=?", (key,))
+        conn.execute(
+            "INSERT OR IGNORE INTO trade_log(date,symbol,action,amount,pnl,note,position_key) VALUES (?,?,'close',?,?,?,?)",
+            (closed_at[:10], position["symbol"], position["total_invested"], result.get("pnl"), result["reason"], key),
+        )
+        conn.execute("UPDATE trade_log SET pnl=?,note=? WHERE position_key=? AND action='close'",
+                     (result.get("pnl"), result["reason"], key))
+        opened = position.get("opened_at_ms")
+        held = max(0, int(dt.datetime.fromisoformat(closed_at).timestamp() - opened / 1000)) if opened else 0
+        conn.execute(
+            "UPDATE position_history SET exit_price=?,pnl=?,close_reason=?,closed_at=?,hold_seconds=? WHERE position_key=?",
+            (result.get("exit_price"), result.get("pnl"), result["reason"], closed_at, held, key),
+        )
+    return bool(inserted)
 
 
 def update_averaging(pos_id: int, total_invested: float, avg_count: int,
@@ -224,14 +367,6 @@ def update_position_tpsl(symbol: str, tp_pct: float, sl_pct: float):
         )
 
 
-def close_position(symbol: str):
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE positions SET status='closed' WHERE symbol=? AND status='open'",
-            (symbol,)
-        )
-
-
 # ── re-entry ──────────────────────────────────────────────────────
 
 def get_reentry(symbol: str) -> dict | None:
@@ -242,27 +377,19 @@ def get_reentry(symbol: str) -> dict | None:
 
 def upsert_reentry(symbol: str, side: str, margin: float, leverage: int,
                    tp_pct: float, sl_pct: float, max_cycles: int = 3,
-                   cycle_count: int = 0):
+                   cycle_count: int = 0, position_key: int | None = None):
     with _connect() as conn:
         # Preserve existing cycle_count on update — only reset on fresh insert
         conn.execute("""
             INSERT INTO reentry
-                (symbol, side, margin, leverage, tp_pct, sl_pct, max_cycles, cycle_count, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, datetime('now'))
+                (symbol, side, margin, leverage, tp_pct, sl_pct, max_cycles, cycle_count, updated_at, position_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side=excluded.side, margin=excluded.margin, leverage=excluded.leverage,
                 tp_pct=excluded.tp_pct, sl_pct=excluded.sl_pct, max_cycles=excluded.max_cycles,
+                cycle_count=excluded.cycle_count, position_key=excluded.position_key,
                 updated_at=excluded.updated_at
-        """, (symbol, side, margin, leverage, tp_pct, sl_pct, max_cycles))
-
-
-def increment_reentry_cycle(symbol: str) -> int:
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE reentry SET cycle_count=cycle_count+1 WHERE symbol=?", (symbol,)
-        )
-        row = conn.execute("SELECT cycle_count FROM reentry WHERE symbol=?", (symbol,)).fetchone()
-    return row["cycle_count"] if row else 0
+        """, (symbol, side, margin, leverage, tp_pct, sl_pct, max_cycles, cycle_count, position_key))
 
 
 def delete_reentry(symbol: str):
@@ -276,50 +403,12 @@ def get_all_reentry() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def dedupe_open_positions():
-    """Keep only the record with the highest total_invested per symbol; close others."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, symbol, total_invested FROM positions WHERE status='open' ORDER BY symbol, total_invested DESC"
-        ).fetchall()
-        seen: set[str] = set()
-        to_close: list[int] = []
-        for row in rows:
-            sym = row["symbol"]
-            if sym in seen:
-                to_close.append(row["id"])
-            else:
-                seen.add(sym)
-        if to_close:
-            conn.execute(
-                f"UPDATE positions SET status='closed' WHERE id IN ({','.join('?' * len(to_close))})",
-                to_close
-            )
-            logger.info("dedupe_open_positions: closed %d duplicate records", len(to_close))
-    return len(to_close)
-
-
-def sync_closed_positions(open_symbols: set[str]) -> list[str]:
-    """Mark 'open' DB records as 'closed' for symbols not in open_symbols (exchange state)."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT symbol FROM positions WHERE status='open'"
-        ).fetchall()
-        to_close = [r["symbol"] for r in rows if r["symbol"] not in open_symbols]
-        for sym in to_close:
-            conn.execute(
-                "UPDATE positions SET status='closed' WHERE symbol=? AND status='open'", (sym,)
-            )
-            logger.info("sync_closed_positions: marked %s as closed (not on exchange)", sym)
-    return to_close
-
-
 # ── trade_log ─────────────────────────────────────────────────────
 
 def log_trade(symbol: str, action: str, amount: float = 0,
               pnl: float = 0, note: str = ""):
-    from datetime import date
-    today = date.today().isoformat()
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
     with _connect() as conn:
         conn.execute(
             "INSERT INTO trade_log (date, symbol, action, amount, pnl, note) VALUES (?,?,?,?,?,?)",
@@ -328,8 +417,8 @@ def log_trade(symbol: str, action: str, amount: float = 0,
 
 
 def get_daily_stats(date_str: str | None = None) -> dict:
-    from datetime import date
-    d = date_str or date.today().isoformat()
+    from datetime import datetime, timezone
+    d = date_str or datetime.now(timezone.utc).date().isoformat()
     with _connect() as conn:
         rows = conn.execute(
             "SELECT action, SUM(amount) as total_amount, SUM(pnl) as total_pnl, COUNT(*) as cnt "
@@ -353,12 +442,14 @@ def get_daily_stats(date_str: str | None = None) -> dict:
         elif action == "reentry":
             stats["reentry_count"] = r["cnt"]
     with _connect() as conn:
-        # Win = pnl > 0 (manual close in profit) OR note='tp' (closed by TP or profit-lock SL)
         stats["wins"] = conn.execute(
-            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND (pnl > 0 OR note='tp')", (d,)
+            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND pnl > 0", (d,)
         ).fetchone()[0]
         stats["losses"] = conn.execute(
-            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND pnl <= 0 AND note != 'tp'", (d,)
+            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND pnl < 0", (d,)
+        ).fetchone()[0]
+        stats["unknown_pnl"] = conn.execute(
+            "SELECT COUNT(*) FROM trade_log WHERE date=? AND action='close' AND pnl IS NULL", (d,)
         ).fetchone()[0]
     return stats
 
@@ -370,7 +461,7 @@ def open_position_history(symbol: str, side: str, leverage: int,
                           tp_pct: float = 500, sl_pct: float = 500,
                           avg_threshold: float = -100, avg_amount: float = 0,
                           avg_budget: float = 0, avg_max_count: int = 0,
-                          avg_interval: int = 0):
+                          avg_interval: int = 0, position_key: int | None = None):
     import datetime
     now = datetime.datetime.utcnow().isoformat()
     with _connect() as conn:
@@ -378,11 +469,11 @@ def open_position_history(symbol: str, side: str, leverage: int,
             INSERT INTO position_history
             (symbol, side, leverage, entry_price, initial_margin, total_invested, avg_count,
              tp_pct, sl_pct, avg_threshold, avg_amount, avg_budget, avg_max_count, avg_interval,
-             opened_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+             opened_at, position_key)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (symbol, side, leverage, entry_price, margin, margin,
               tp_pct, sl_pct, avg_threshold, avg_amount, avg_budget, avg_max_count, avg_interval,
-              now))
+              now, position_key))
 
 
 def update_position_history_avg(symbol: str, total_invested: float, avg_count: int):
@@ -395,29 +486,6 @@ def update_position_history_avg(symbol: str, total_invested: float, avg_count: i
             conn.execute("""
                 UPDATE position_history SET total_invested=?, avg_count=? WHERE id=?
             """, (total_invested, avg_count, row["id"]))
-
-
-def close_position_history(symbol: str, exit_price: float, pnl: float, close_reason: str):
-    import datetime
-    now = datetime.datetime.utcnow().isoformat()
-    with _connect() as conn:
-        row = conn.execute("""
-            SELECT id, opened_at FROM position_history
-            WHERE symbol=? AND closed_at IS NULL
-            ORDER BY id DESC LIMIT 1
-        """, (symbol,)).fetchone()
-        if not row:
-            return
-        try:
-            opened_dt = datetime.datetime.fromisoformat(row["opened_at"])
-            hold_seconds = int((datetime.datetime.utcnow() - opened_dt).total_seconds())
-        except Exception:
-            hold_seconds = 0
-        conn.execute("""
-            UPDATE position_history
-            SET exit_price=?, pnl=?, close_reason=?, closed_at=?, hold_seconds=?
-            WHERE id=?
-        """, (exit_price, pnl, close_reason, now, hold_seconds, row["id"]))
 
 
 def get_last_position_history(symbol: str) -> dict | None:

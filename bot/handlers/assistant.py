@@ -347,8 +347,10 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sl_price = _calc_sl_price(entry, lev, new_sl_pct, side)
 
             try:
-                await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price,
+                confirmed = await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price,
                                        pos_data=pos)
+                prices = {r["type"]: r["price"] for r in confirmed}
+                tp_price, sl_price = prices["TP"], prices["SL"]
                 tp_sl_pcts[symbol] = {"tp_pct": new_tp_pct, "sl_pct": new_sl_pct}
                 results.append(
                     f"✅ `{coin}`: TP `{tp_price:.6g}` (+{new_tp_pct:.0f}%) "
@@ -518,19 +520,12 @@ async def nlp_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             symbol = pos["symbol"]
             coin = symbol.split("/")[0]
             try:
-                pnl = float(pos.get("unrealized_pnl", 0))
-                margin = float(pos.get("margin", 0))
-                exit_price = float(pos.get("mark_price", 0))
-                await client.cancel_tp_sl_orders(symbol)
-                await client.close_futures_position(symbol)
-                db_mod.close_position(symbol)
-                db_mod.delete_reentry(symbol)
-                db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note="manual")
-                db_mod.close_position_history(symbol, exit_price, pnl, "manual")
-                results.append(f"✅ `{coin}`")
+                from bot.handlers.trading import _do_close
+                await _do_close(client, context, symbol, keep_reentry=False)
+                results.append(f"{coin}: ордер отправлен, PnL ожидает исполнения")
             except Exception as e:
                 results.append(f"❌ `{coin}`: {e}")
-        await q.edit_message_text("Закрыто:\n" + "\n".join(results), parse_mode="Markdown")
+        await q.edit_message_text("Результат:\n" + "\n".join(results), parse_mode="Markdown")
         return
 
     # nlp_close_SYMBOL
@@ -550,18 +545,8 @@ async def nlp_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     symbol = targets[0]["symbol"]
     coin = symbol.split("/")[0]
     try:
-        pnl = float(targets[0].get("unrealized_pnl", 0))
-        margin = float(targets[0].get("margin", 0))
-        exit_price = float(targets[0].get("mark_price", 0))
-        await client.cancel_tp_sl_orders(symbol)
-        await client.close_futures_position(symbol)
-        db_mod.close_position(symbol)
-        db_mod.delete_reentry(symbol)
-        db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note="manual")
-        db_mod.close_position_history(symbol, exit_price, pnl, "manual")
-        sign = "+" if pnl >= 0 else ""
-        await q.edit_message_text(
-            f"✅ `{coin}` закрыт ({sign}${pnl:.2f})", parse_mode="Markdown"
-        )
+        from bot.handlers.trading import _do_close
+        await _do_close(client, context, symbol, keep_reentry=False)
+        await q.edit_message_text(f"{coin}: ордер закрытия отправлен, PnL ожидает исполнения")
     except Exception as e:
         await q.edit_message_text(f"❌ {e}")

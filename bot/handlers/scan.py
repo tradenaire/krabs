@@ -4,7 +4,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from bot.ai.scanner import scan_overbought, analyze_single_coin, mexc_find_futures_symbol, format_coin_card
-from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks, extract_sentiment,
+from bot.ai.analyst import (deep_short_analysis, parse_short_candidates, extract_sentiment,
                              format_usage_footer, DEFAULT_MODEL, FALLBACK_MODEL)
 
 logger = logging.getLogger(__name__)
@@ -108,18 +108,20 @@ async def scan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
     await status.edit_text(f"🔍 Анализирую через {model}...")
 
-    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n)
+    from bot.ai.research_snapshot import research_context
+    snapshot = await research_context(client, config, local_results)
+    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=n, research_snapshot=snapshot)
 
     if ai_result.error and not ai_result.text:
         logger.warning("Primary model failed, trying fallback %s", FALLBACK_MODEL)
         await status.edit_text(f"🌐 Пробую {FALLBACK_MODEL}...")
-        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=n)
+        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=n, research_snapshot=snapshot)
 
     if ai_result.error and not ai_result.text:
         await status.edit_text(f"❌ AI недоступен: {ai_result.error}")
         return
 
-    picks = parse_analyst_blocks(ai_result.text, n=n)
+    picks = parse_short_candidates(ai_result.text, n=n)
     if not picks:
         await status.edit_text(
             f"📝 AI ответил не по формату:\n\n{ai_result.text[:3000]}\n\n"
@@ -550,7 +552,7 @@ async def scan_avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(f"⏳ Докупаю `{coin}` +`${step:.2f}`...", parse_mode="Markdown")
 
     try:
-        await client.place_futures_order(symbol, avg_side, step, lev, margin_mode=margin_mode)
+        await client.place_futures_order(symbol, avg_side, step, lev, margin_mode=margin_mode, expected_position_id=pos["position_id"])
     except Exception as e:
         await q.message.reply_text(f"❌ Ошибка докупки {coin}: {e}")
         return
@@ -617,7 +619,7 @@ async def avg_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     try:
-        await client.place_futures_order(symbol, avg_side, min_avg, lev, margin_mode=margin_mode)
+        await client.place_futures_order(symbol, avg_side, min_avg, lev, margin_mode=margin_mode, expected_position_id=pos["position_id"])
     except Exception as e:
         await q.message.reply_text(f"❌ Ошибка докупки {coin}: {e}")
         return

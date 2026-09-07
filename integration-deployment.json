@@ -1,0 +1,45 @@
+{
+  "checked_at": "2026-09-07T16:10:25.742515+00:00",
+  "project": "t3-remote",
+  "service": "krabs",
+  "deployment_id": "7da7c2ec-c6a7-4be1-9e2a-4cc1c2a8eb0f",
+  "status": "SUCCESS",
+  "commit": "3c643ad7ac0d28835fb548a26a7aac8df35d3038",
+  "mode": "standby",
+  "container_tests": 58,
+  "container_tests_seconds": 8.8,
+  "container_tests_result": "PASS",
+  "source_match": "PASS",
+  "container_source_digest": "0adf930b479cc8f616abfc03a4bb733a20ccf39392f1dea99dcd7ccc1672e19e",
+  "container_source_files": 34,
+  "source_digest_note": "Python source, tests, start.py and requirements.txt; build config also hashed separately in integration-verification.json",
+  "database_counts": {
+    "config": 0,
+    "positions": 0
+  },
+  "services": [
+    {
+      "name": "t3-remote",
+      "id": "1cb7e34c-d3b5-4d2f-b693-91175f553821",
+      "deployment_id": "650be978-b83c-4d03-8a86-2367b88bb24e",
+      "status": "SUCCESS",
+      "source_repo": null
+    },
+    {
+      "name": "t3-local-relay",
+      "id": "fdd396c2-1ceb-47e3-b15d-907a10f5344b",
+      "deployment_id": "63eca23a-aebd-4084-87e6-48059545321c",
+      "status": "SUCCESS",
+      "source_repo": null
+    },
+    {
+      "name": "krabs",
+      "id": "cc6ea924-0964-4715-aa25-98ec73776706",
+      "deployment_id": "7da7c2ec-c6a7-4be1-9e2a-4cc1c2a8eb0f",
+      "status": "SUCCESS",
+      "source_repo": null
+    }
+  ],
+  "source_repo": null,
+  "volume_mount": "/data"
+}

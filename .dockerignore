@@ -1,0 +1,8 @@
+.git
+.env
+data
+**/__pycache__
+**/*.db*
+tests/tmp*
+*.log
+test-results.txt

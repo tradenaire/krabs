@@ -12,14 +12,6 @@ def _calc_sl_price(entry: float, lev: int, sl_pct: float, side: str) -> float:
     return entry + move if side == "short" else entry - move
 
 
-def _pnl_pct_at_price(entry: float, lev: int, price: float, side: str) -> float:
-    if entry <= 0:
-        return 0.0
-    if side == "short":
-        return (entry - price) / entry * lev * 100
-    return (price - entry) / entry * lev * 100
-
-
 def _fmt_funding(rate: float, lev: int, margin: float, next_ts: str | None = None) -> str:
     if rate == 0:
         return ""
@@ -62,12 +54,18 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     pnl = float(pos.get("unrealized_pnl", 0))
     pct = float(pos.get("percentage", 0))
     margin = float(pos.get("margin", 0))
+    managed = bool(db_rec and db_rec.get("exchange_position_id") == str(pos.get("position_id"))
+                   and db_rec.get("opened_at_ms") == pos.get("opened_at_ms") and db_rec.get("side") == side)
+    if not managed:
+        return (f"{coin} · {side} ×{lev} · не под управлением\n"
+                f"Вход: {entry:.6g} · PnL: {fmt_usd(pnl)} ({fmt_pct(pct)})\n"
+                "Для управления: /adopt SYMBOL")
+    if re_rec and re_rec.get("position_key") != db_rec["id"]:
+        re_rec = None
 
     # Re-entry info (always shown)
     cycle_count = int(re_rec.get("cycle_count", 0)) if re_rec else 0
-    max_cycles = int(re_rec.get("max_cycles", 3)) if re_rec else (
-        int(getattr(config, "max_reentry_cycles", 3)) if config else 3
-    )
+    max_cycles = int(re_rec.get("max_cycles", 0)) if re_rec else 0
     re_label = f"RE{cycle_count}/{max_cycles}"
 
     # PnL indicator
@@ -85,6 +83,8 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     sl_pct_val = stored.get("sl_pct") or (db_rec.get("sl_pct") if db_rec else None) or 500.0
     tp_price = _calc_tp_price(entry, lev, tp_pct_val, side)
     sl_price = _calc_sl_price(entry, lev, sl_pct_val, side)
+    if db_rec.get("locked_sl") is not None:
+        sl_price = db_rec["locked_sl"]
 
     # Averaging info
     threshold = float(getattr(config, "averaging_threshold", -100)) if config else -100
@@ -115,9 +115,9 @@ def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,
     ]
     if liq > 0:
         lines.append(f"☠️ {liq:.6g}{dist_str}")
-    sl_pnl_pct = _pnl_pct_at_price(entry, lev, sl_price, side)
-    lines.append(f"SL:{sl_pnl_pct:+.0f}% ({sl_price:.6g})")
-    lines.append(f"TP:{tp_price:.6g} (+{tp_pct_val:.0f}%)")
+    sl_return = ((entry - sl_price) if side == "short" else (sl_price - entry)) / entry * lev * 100 if entry > 0 else 0
+    lines.append(f"Цель SL: {sl_price:.6g} ({sl_return:+.1f}%); цель TP: {tp_price:.6g}")
+    lines.append("Уровни расчётные; наличие ордеров в этом сообщении не проверено.")
 
     # Max leverage / position limit (if provided)
     if max_lev > 0 or max_pos_usdt > 0:

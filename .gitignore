@@ -4,3 +4,7 @@ __pycache__/
 data/
 .env
 *.log
+test-results.txt
+tests/tmp*/
+tests/*.db*
+.railway/

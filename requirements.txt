@@ -1,7 +1,7 @@
-python-telegram-bot==22.7
-ccxt>=4.5.46
-apscheduler>=3.10
-pandas>=2.0
-pandas-ta>=0.3.14b
+python-telegram-bot==22.1
+ccxt==4.5.46
+apscheduler==3.10.4
+pandas==3.0.2
+pandas-ta==0.4.71b0
 openai>=1.30          # for OpenRouter calls
 anthropic>=0.39       # optional: Claude backend

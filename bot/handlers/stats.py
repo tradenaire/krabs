@@ -5,9 +5,9 @@ from telegram.ext import ContextTypes
 
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from bot import db as db_mod
-    from datetime import date
+    from datetime import datetime, timezone
 
-    today = date.today().isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
     s = db_mod.get_daily_stats(today)
 
     client = context.bot_data.get("exchange")
@@ -45,7 +45,7 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Перезаходов: `{s['reentry_count']}`",
         "",
         f"*P&L*",
-        f"Реализовано: `{r_sign}${s['realized_pnl']:.4f}`",
+        f"Известный PnL: `{r_sign}${s['realized_pnl']:.4f}`; неизвестен: {s.get('unknown_pnl', 0)}",
         f"Нереализовано: `{u_sign}${unrealized:.4f}`",
         "",
         f"*Баланс*",

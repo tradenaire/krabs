@@ -3,29 +3,63 @@ import argparse
 import os
 import sys
 from pathlib import Path
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-PID_FILE = Path(__file__).parent / "data" / "bot.pid"
+PID_FILE = Path(os.environ.get("KRABS_DATA_DIR", Path(__file__).parent / "data")) / "bot.pid"
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/health":
+            self.send_error(404)
+            return
+        body = json.dumps({"service": "krabs", "mode": os.environ.get("KRABS_RUN_MODE", "standby"),
+                           "revision": os.environ.get("KRABS_REVISION", "local")}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def serve_standby():
+    from bot import db
+    db.init_db()
+    print("Krabs standby: health endpoint only; Telegram polling and trading are disabled.", flush=True)
+    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), HealthHandler).serve_forever()
+
+
+_pid_handle = None
 
 
 def _acquire_pid_lock():
-    """Exit if another instance is already running."""
-    if PID_FILE.exists():
-        try:
-            existing_pid = int(PID_FILE.read_text().strip())
-            # Check if that process is actually alive
-            os.kill(existing_pid, 0)
-            print(f"ERROR: bot already running (PID {existing_pid}). Exiting.")
-            sys.exit(1)
-        except (ProcessLookupError, PermissionError):
-            # Stale PID file — process is dead
-            PID_FILE.unlink(missing_ok=True)
-
+    global _pid_handle
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
+    handle = PID_FILE.open("a+")
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if not PID_FILE.stat().st_size:
+                handle.write("0")
+                handle.flush()
+                handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise RuntimeError("Another bot process holds the data-directory lock")
+    _pid_handle = handle
 
 
 def _release_pid_lock():
-    PID_FILE.unlink(missing_ok=True)
+    global _pid_handle
+    if _pid_handle:
+        _pid_handle.close()
+        _pid_handle = None
 
 
 def setup():
@@ -52,8 +86,17 @@ def setup():
 
 
 def run():
+    mode = os.environ.get("KRABS_RUN_MODE", "standby")
+    if mode == "standby":
+        serve_standby()
+        return
+    if mode != "bot":
+        raise ValueError("KRABS_RUN_MODE must be standby or bot")
     _acquire_pid_lock()
     try:
+        from threading import Thread
+        server = HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), HealthHandler)
+        Thread(target=server.serve_forever, daemon=True).start()
         from bot.main import main
         main()
     finally:

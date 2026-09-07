@@ -8,23 +8,6 @@ from bot.fmt import fmt_pct, fmt_usd
 
 logger = logging.getLogger(__name__)
 
-_PLOCK_PATH = Path(__file__).parent.parent.parent / "data" / "profit_lock_disabled.json"
-
-
-def _load_plock() -> set:
-    try:
-        return set(json.loads(_PLOCK_PATH.read_text()))
-    except Exception:
-        return set()
-
-
-def _save_plock(s: set) -> None:
-    try:
-        _PLOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _PLOCK_PATH.write_text(json.dumps(list(s)))
-    except Exception as e:
-        logger.warning("_save_plock: %s", e)
-
 # Numbered emoji 1️⃣–9️⃣
 _NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
@@ -102,7 +85,7 @@ def _format_pos_detail(pos: dict, extra: dict | None = None) -> str:
     if tp_pct or sl_pct:
         tp_s = f"+{tp_pct:.0f}%" if tp_pct else "—"
         sl_s = f"-{sl_pct:.0f}%" if sl_pct else "—"
-        lines.append(f"TP: `{tp_s}` | SL: `{sl_s}`")
+        lines.append(f"Настройки: TP `{tp_s}` | SL `{sl_s}` (не подтверждение ордеров)")
 
     # Max leverage / max position
     max_lev = extra.get("max_lev")
@@ -164,7 +147,7 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
             await message.reply_text(text)
         return
 
-    db_map = {r["symbol"]: r for r in db_mod.get_open_positions()}
+    db_map = {p["symbol"]: r for p in positions if (r := db_mod.get_managed_position(p))}
     re_map = {r["symbol"]: r for r in db_mod.get_all_reentry()}
     config = context.bot_data.get("config")
     tp_sl_pcts = context.bot_data.get("tp_sl_pcts", {})
@@ -215,8 +198,6 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
         lines.append(block)
 
     # Inline buttons: close + profit-lock toggle per position
-    plock_disabled: set = context.bot_data.setdefault("_profit_lock_disabled", _load_plock())
-    plock_step: dict = context.bot_data.get("_profit_lock_step", {})
     btn_rows = []
     for i, pos in enumerate(positions, 1):
         sym = pos["symbol"]
@@ -225,10 +206,14 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
         pct = float(pos.get("percentage", 0))
         icon = "✅" if pnl >= 0 else "🔻"
         label = f"{i}. {icon} {coin}  {fmt_pct(pct)}  {fmt_usd(pnl)}"
-        if sym in plock_disabled:
+        from bot import db as db_mod
+        managed = db_mod.get_managed_position(pos)
+        if not managed:
+            lock_label = "Не под управлением"
+        elif not managed["profit_lock_enabled"]:
             lock_label = "🔓 лок выкл"
-        elif sym in plock_step:
-            lock_sl = plock_step[sym] - 50
+        elif managed["profit_lock_step"]:
+            lock_sl = managed["profit_lock_step"] - 50
             lock_label = f"🔒 SL+{lock_sl}%"
         else:
             lock_label = "🔒 лок"
@@ -267,72 +252,29 @@ async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if data.startswith("pos_plock_"):
+        from bot import db as db_mod
+        from bot.jobs.main import _calc_tp_price, _calc_sl_price
         symbol = data[len("pos_plock_"):]
-        plock_disabled: set = context.bot_data.setdefault("_profit_lock_disabled", _load_plock())
-        plock_step_map: dict = context.bot_data.setdefault("_profit_lock_step", {})
-        coin = symbol.split("/")[0]
-        client = context.bot_data.get("exchange")
-        config = context.bot_data.get("config")
-
-        from bot.jobs.main import _calc_tp_price, _calc_sl_price, _set_tp_sl_verified
-
-        def _lev(pos):
-            cfg_lev = int(getattr(config, "default_leverage", 0) or 0) if config else 0
-            return cfg_lev or int(pos.get("leverage", 1) or 1)
-
-        if symbol in plock_disabled:
-            # ── Включить профит-лок ──────────────────────────────────
-            plock_disabled.discard(symbol)
-            _save_plock(plock_disabled)
-            # Если уже в профите — сразу выставить нужный шаг
-            try:
-                pos = await client.get_position(symbol)
-                pnl_pct = float(pos.get("percentage", 0)) if pos else 0.0
-                plt = float(getattr(config, "averaging_profit_lock_trigger", 0)) if config else 0
-                if pos and plt > 0 and pnl_pct >= 100:
-                    _PL_STEP = 50
-                    new_step = (int(pnl_pct) // _PL_STEP) * _PL_STEP
-                    lock_sl_pct = new_step - _PL_STEP
-                    entry = float(pos.get("entry_price", 0) or 0)
-                    side = pos.get("side", "short")
-                    lev = _lev(pos)
-                    tp_stored = context.bot_data.get("tp_sl_pcts", {}).get(symbol, {})
-                    tp_pct_v = tp_stored.get("tp_pct") or float(getattr(config, "tp_pct", 500))
-                    new_tp = _calc_tp_price(entry, lev, tp_pct_v, side)
-                    new_sl = _calc_tp_price(entry, lev, lock_sl_pct, side)
-                    sl_lim = new_sl * 1.005 if side == "short" else new_sl * 0.995
-                    await _set_tp_sl_verified(
-                        client, symbol, side, new_tp, new_sl, pos, sl_limit_price=sl_lim
-                    )
-                    plock_step_map[symbol] = new_step
-                    await q.answer(f"🔒 Лок ВКЛ → SL выставлен +{lock_sl_pct}%", show_alert=True)
-                else:
-                    await q.answer(f"🔒 Лок {coin}: включён (сработает при +100%)", show_alert=False)
-            except Exception as e:
-                await q.answer(f"🔒 Лок вкл, SL: {e}", show_alert=True)
-        else:
-            # ── Выключить профит-лок → вернуть обычный SL ───────────
-            plock_disabled.add(symbol)
-            plock_step_map.pop(symbol, None)
-            _save_plock(plock_disabled)
-            try:
-                pos = await client.get_position(symbol)
-                if pos and config:
-                    entry = float(pos.get("entry_price", 0) or 0)
-                    side = pos.get("side", "short")
-                    lev = _lev(pos)
-                    tp_stored = context.bot_data.get("tp_sl_pcts", {}).get(symbol, {})
-                    tp_pct_v = tp_stored.get("tp_pct") or float(getattr(config, "tp_pct", 500))
-                    sl_pct_v = tp_stored.get("sl_pct") or float(getattr(config, "sl_pct", 500))
-                    new_tp = _calc_tp_price(entry, lev, tp_pct_v, side)
-                    new_sl = _calc_sl_price(entry, lev, sl_pct_v, side)
-                    await client.set_tp_sl(symbol, tp_price=new_tp, sl_price=new_sl, pos_data=pos)
-                    await q.answer(f"🔓 Лок ВЫКЛ → SL возвращён -{sl_pct_v:.0f}%", show_alert=True)
-                else:
-                    await q.answer(f"🔓 Лок {coin}: отключён", show_alert=False)
-            except Exception as e:
-                await q.answer(f"🔓 Лок выкл, SL: {e}", show_alert=True)
-
+        client = context.bot_data["exchange"]
+        pos = await client.get_position(symbol)
+        record = db_mod.get_managed_position(pos) if pos else None
+        if not record:
+            await q.message.reply_text("Позиция не принята под управление. /adopt SYMBOL")
+            return
+        enabled = not record["profit_lock_enabled"]
+        with db_mod._connect() as conn:
+            conn.execute("UPDATE positions SET profit_lock_enabled=? WHERE id=?", (int(enabled), record["id"]))
+            if not enabled:
+                conn.execute("UPDATE positions SET locked_sl=NULL,profit_lock_step=0 WHERE id=?", (record["id"],))
+        try:
+            entry, lev, side = pos["entry_price"], pos["leverage"], pos["side"]
+            step = (int(pos["percentage"]) // 50) * 50 if enabled and pos["percentage"] >= 100 else None
+            sl = _calc_tp_price(entry, lev, step - 50, side) if step else _calc_sl_price(entry, lev, record["sl_pct"], side)
+            await client.set_tp_sl(symbol, _calc_tp_price(entry, lev, record["tp_pct"], side), sl,
+                                   pos_data=pos, profit_lock_step=step)
+            await q.message.reply_text(f"Profit-lock {'включён' if enabled else 'выключен'}; защита подтверждена.")
+        except Exception as error:
+            await q.message.reply_text(f"Настройка изменена; защита не подтверждена: {error}")
         await _send_positions(q.message, context, edit=True)
         return
 
@@ -354,7 +296,7 @@ async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         extra: dict = {}
         tp_sl_pcts: dict = context.bot_data.get("tp_sl_pcts", {})
         stored = tp_sl_pcts.get(symbol, {})
-        db_rec = db_mod.get_open_position(symbol)
+        db_rec = db_mod.get_managed_position(pos)
         extra["tp_pct"] = stored.get("tp_pct") or (db_rec.get("tp_pct") if db_rec else None)
         extra["sl_pct"] = stored.get("sl_pct") or (db_rec.get("sl_pct") if db_rec else None)
         try:

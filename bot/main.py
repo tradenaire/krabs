@@ -1,17 +1,17 @@
 """Entry point — Telegram bot."""
 import logging
 import sys
+import os
+from dataclasses import fields
 from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
-                          MessageHandler, TypeHandler, filters)
+                          MessageHandler, filters, TypeHandler)
 
 from bot import db as db_mod
 from bot.config import Config
 from bot.exchange.client import ExchangeClient
-from bot.event_logger import (patch_bot_logging, telegram_error_logger,
-                              telegram_update_logger)
 from bot.handlers.scan import (scan_handler, open_callback, open_confirm_callback,
                                open_anyway_callback, scan_avg_callback, avg_force_callback)
 from bot.handlers.balance import balance_handler, balance_callback
@@ -29,15 +29,20 @@ from bot.handlers.paper import paper_handler, paper_callback
 from bot.handlers.automode import automode_handler
 from bot.handlers.pin import pin_handler
 from bot.handlers.ask import ask_handler
+from bot.handlers.protection import repair_tpsl_handler, repair_tpsl_callback
+from bot.event_logger import configure_audit, telegram_update_logger, telegram_error_logger
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     handlers=[
-        logging.FileHandler(str(Path(__file__).parent.parent / "data" / "bot.log"), encoding="utf-8"),
+        logging.StreamHandler(),
     ],
 )
 logger = logging.getLogger(__name__)
+# Telegram request URLs contain the bot token; never emit HTTP wire logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 async def start_handler(update: Update, context):
@@ -46,6 +51,8 @@ async def start_handler(update: Update, context):
         "/scan — AI шорт-пикер (LLM + web search)\n"
         "/balance — фьючерсный баланс и маржа\n"
         "/positions — открытые позиции\n"
+        "/adopt SYMBOL — принять ручную позицию\n"
+        "`/repair_tpsl SYMBOL` — проверить и восстановить защиту\n"
         "/short SYMBOL [amount] — открыть шорт\n"
         "/close SYMBOL — закрыть позицию\n"
         "/avg — все настройки (ставка, тп, сл, докупка)\n"
@@ -72,7 +79,10 @@ async def start_handler(update: Update, context):
 def main():
     db_mod.init_db()
     cfg_dict = db_mod.get_all_config()
+    cfg_dict.update({f.name: os.environ[f.name.upper()] for f in fields(Config) if f.name.upper() in os.environ})
     config = Config.from_dict(cfg_dict)
+    if config.exchange_provider != "mexc":
+        raise ValueError("This deployment supports MEXC; BinanceTest requires a separate validated deployment")
 
     if not config.telegram_token:
         logger.error("No telegram_token. Run: python start.py --setup")
@@ -83,64 +93,20 @@ def main():
     async def post_init(application: Application):
         application.bot_data["config"] = config
         application.bot_data["exchange"] = client
-        patch_bot_logging(application.bot)
-        # Pre-populate tp_sl_pcts from config so tpsl_enforce_job uses correct values after restart
-        tp_pct = float(getattr(config, "tp_pct", 500))
-        sl_pct = float(getattr(config, "sl_pct", 500))
-        from bot import db as db_mod
-        tp_sl_pcts = {
-            p["symbol"]: {"tp_pct": tp_pct, "sl_pct": sl_pct}
-            for p in db_mod.get_open_positions()
+        configure_audit(config)
+        application.bot_data["tp_sl_pcts"] = {
+            p["symbol"]: {"tp_pct": p["tp_pct"], "sl_pct": p["sl_pct"]}
+            for p in db_mod.get_open_positions() if p.get("exchange_position_id")
         }
-        application.bot_data["tp_sl_pcts"] = tp_sl_pcts
-        from bot.jobs.main import _load_exhausted
-        application.bot_data["_avg_notified_exhausted"] = _load_exhausted()
         setup_scheduler(application)
-
-        # Deduplicate + sync DB with exchange on startup
-        dupes = db_mod.dedupe_open_positions()
-        try:
-            live_positions = await client.get_positions()
-            live_symbols = {p["symbol"] for p in live_positions}
-            closed = db_mod.sync_closed_positions(live_symbols)
-            if dupes or closed:
-                logger.info("Startup sync: removed %d dupes, closed %d stale DB records", dupes, len(closed))
-            # Auto-register exchange positions missing from DB
-            cfg_tp = float(getattr(config, "tp_pct", 500))
-            cfg_sl = float(getattr(config, "sl_pct", 500))
-            cfg_avg_amount = float(getattr(config, "averaging_amount", 0.25))
-            cfg_max_count = int(getattr(config, "max_averaging_count", 200))
-            registered = 0
-            for lp in live_positions:
-                sym = lp["symbol"]
-                if not db_mod.get_open_position(sym):
-                    cur_margin = float(lp.get("margin", cfg_avg_amount) or cfg_avg_amount)
-                    est_count = max(0, round(cur_margin / cfg_avg_amount) - 1) if cfg_avg_amount > 0 else 0
-                    db_mod.upsert_position(
-                        sym, lp.get("side", "short"),
-                        float(lp.get("entry_price", 0) or 0),
-                        int(lp.get("leverage", 1) or 1),
-                        cur_margin,
-                        tp_pct=cfg_tp, sl_pct=cfg_sl,
-                        budget=cfg_avg_amount * cfg_max_count,
-                        total_invested=cur_margin,
-                        avg_count=est_count,
-                    )
-                    application.bot_data.setdefault("tp_sl_pcts", {}).setdefault(
-                        sym, {"tp_pct": cfg_tp, "sl_pct": cfg_sl}
-                    )
-                    registered += 1
-                    logger.info("Startup: auto-registered position %s in DB", sym)
-            if registered:
-                logger.info("Startup: registered %d untracked positions from exchange", registered)
-        except Exception as e:
-            logger.warning("Startup sync failed (exchange unavailable): %s", e)
 
         from telegram import BotCommand
         await application.bot.set_my_commands([
             BotCommand("start", "Помощь"),
             BotCommand("balance", "Баланс и позиции"),
             BotCommand("positions", "Открытые позиции"),
+            BotCommand("repair_tpsl", "Проверить и восстановить TP/SL"),
+            BotCommand("adopt", "Принять ручную позицию"),
             BotCommand("scan", "AI шорт-пикер"),
             BotCommand("short", "Открыть шорт"),
             BotCommand("close", "Закрыть позицию"),
@@ -156,16 +122,25 @@ def main():
         ])
         logger.info("Bot started.")
 
+    async def post_shutdown(application):
+        await client.close()
+
     app = (
         Application.builder()
         .token(config.telegram_token)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(TypeHandler(Update, telegram_update_logger), group=-100)
+    from bot.lifecycle import adopt_handler, authorize_update
+    app.add_handler(TypeHandler(Update, authorize_update), group=-2)
+    app.add_handler(TypeHandler(Update, telegram_update_logger), group=-1)
     app.add_error_handler(telegram_error_logger)
+    app.add_handler(CommandHandler("repair_tpsl", repair_tpsl_handler))
+    app.add_handler(CallbackQueryHandler(repair_tpsl_callback, pattern=r"^repair_tpsl_"))
+    app.add_handler(CommandHandler("adopt", adopt_handler))
+    app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", start_handler))
     app.add_handler(CommandHandler("scan", scan_handler))
     app.add_handler(CommandHandler("balance", balance_handler))

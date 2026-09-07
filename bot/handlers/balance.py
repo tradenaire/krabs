@@ -1,12 +1,15 @@
 """/balance — полный баланс с деталями по каждой позиции."""
 import asyncio
-import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from bot.fmt import fmt_usd
 
-logger = logging.getLogger(__name__)
-_SEP = "─" * 20
+def _value_assets(balance, prices):
+    amounts = {c: float(q) for c, q in balance.get("total", {}).items() if q}
+    missing = [c for c in amounts if c not in prices]
+    if missing:
+        return "нет цены: " + ", ".join(missing)
+    return f"≈ {sum(q * prices[c] for c, q in amounts.items()):.2f} USDT"
 
 
 def _build_balance_text(futures_raw: dict, positions: list[dict],
@@ -14,116 +17,49 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
                         config, daily_stats: dict,
                         lev_cache: dict | None = None,
                         spot_raw: dict | None = None) -> str:
-    from bot.pos_format import format_position_block
+    from bot.exchange.client import available_margin
 
-    free = float(futures_raw.get("free", {}).get("USDT", 0) or 0)
-    total = float(futures_raw.get("total", {}).get("USDT", 0) or 0)
-    raw = futures_raw.get("_raw", {})
-    avail_open = float(raw.get("availableOpen", raw.get("availableBalance", free)) or free)
-
-    total_pnl = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
-
-    # Header: just position summary
-    if positions:
-        word = "зарабатываем" if total_pnl >= 0 else "теряем"
-        lines = [f"*💰 Баланс · Позиции ({len(positions)}) — {word} `{fmt_usd(total_pnl)}`*"]
+    prices = futures_raw.get("_prices", {"USDT": 1.0})
+    # MEXC exposes negative multi-asset equity as zero equity plus debtAmount.
+    # Negative equity, if provided, already includes that debt and is not deducted twice.
+    net = dict(futures_raw.get("total", {}))
+    assets = futures_raw.get("_assets", {})
+    for currency, asset in assets.items():
+        equity = float(asset.get("equity") or 0)
+        debt = float(asset.get("debtAmount") or 0)
+        net[currency] = -debt if equity == 0 and debt > 0 else equity
+    combined = dict(net)
+    for currency, quantity in (spot_raw or {}).get("total", {}).items():
+        combined[currency] = float(combined.get(currency, 0)) + float(quantity or 0)
+    lines = ["💰 Баланс", 
+        "Всего: " + (_value_assets({"total": combined}, prices) if spot_raw is not None else "нет данных спота"),
+        "Фьючерсы: " + _value_assets({"total": net}, prices),
+        "Спот: " + (_value_assets(spot_raw, prices) if spot_raw is not None else "нет данных")]
+    contributions = [a.get("contributeMarginAmount") for a in assets.values()]
+    if contributions and all(v is not None for v in contributions):
+        lines.append(f"Обеспечение MEXC: {sum(float(v) for v in contributions):.2f} USDT")
+    multi_asset = any(c != "USDT" and float(a.get("equity") or 0) for c, a in assets.items())
+    if multi_asset:
+        lines.append("Свободная маржа: нет подтверждённых данных")
     else:
-        lines = ["*Баланс💰*", "_Нет открытых позиций_"]
-
-    lev_cache = lev_cache or {}
-
-    # Per-position blocks
-    for pos in positions:
-        lines.append(_SEP)
-        symbol = pos["symbol"]
-        cached = lev_cache.get(symbol, {})
-        block = format_position_block(
-            pos,
-            db_rec=db_map.get(symbol),
-            re_rec=re_map.get(symbol),
-            config=config,
-            tp_sl_pcts=tp_sl_pcts,
-            max_lev=cached.get("max_lev", 0),
-            max_pos_usdt=cached.get("max_pos_usdt", 0),
-        )
-        lines.append(block)
-
-    # Balance summary — shown after positions, before margin block
-    lines.append(_SEP)
-    spot_free = 0.0
-    if spot_raw:
-        spot_free = float((spot_raw.get("free") or {}).get("USDT", 0) or 0)
-    bal_lines = [
-        f"💵 Фьючерсы: `${total:.2f}` · Свободно: `${free:.2f}` · Avail: `${avail_open:.2f}`"
-        + (f" (`{avail_open / free * 100:.0f}%`)" if free > 0 else "")
-    ]
-    if spot_raw is not None:
-        bal_lines.append(f"💳 Спот: `${spot_free:.2f}`")
-    if daily_stats:
-        day_pnl = float(daily_stats.get("pnl", 0) or 0)
-        day_trades = int(daily_stats.get("trades", 0) or 0)
-        icon = "📈" if day_pnl >= 0 else "📉"
-        bal_lines.append(f"{icon} Сегодня: `{fmt_usd(day_pnl)}` ({day_trades} сд.)")
-    lines.append("\n".join(bal_lines))
-
-    # Margin requirements block — shown below balance, before buttons
-    if positions and config:
-        avg_amount = float(getattr(config, "averaging_amount", 0.10))
-        avg_budget = float(getattr(config, "averaging_budget", 5.00))
-        sl_pct = float(getattr(config, "sl_pct", 500))
-        max_avg_count = int(getattr(config, "max_averaging_count", 100))
-        profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
-        min_order_cache: dict = {}
         try:
-            from bot import db as _db_bal
-            min_order_cache = _db_bal.get_min_order_cache()
-        except Exception:
-            pass
-
-        invested_total = 0.0
-        remaining_avg_total = 0.0
-        avg_violations: list[str] = []
-        for pos in positions:
-            sym = pos["symbol"]
-            db_rec = db_map.get(sym, {}) or {}
-            pos_invested = float(db_rec.get("total_invested") or pos.get("margin") or 0)
-            avg_count = int(db_rec.get("averaging_count") or 0)
-            remaining_steps = max(0, max_avg_count - avg_count)
-            pos_lev = int(pos.get("leverage") or 1)
-            min_notional = min_order_cache.get(sym, 0)
-            eff_avg = (max(avg_amount, min_notional / max(pos_lev, 1) * 1.05)
-                       if min_notional > 0 else avg_amount)
-            remaining_avg = remaining_steps * eff_avg
-            if eff_avg > avg_amount + 0.001:
-                avg_violations.append(f"{sym.split('/')[0]} `${eff_avg:.2f}`")
-            invested_total += pos_invested
-            remaining_avg_total += remaining_avg
-
-        base_total = invested_total + remaining_avg_total
-        if profit_lock_trigger > 0:
-            risk_total = base_total
-            sl_label = f"profit-lock SL {profit_lock_trigger:.0f}%"
-        else:
-            risk_total = base_total * (sl_pct / 100.0)
-            sl_label = f"SL {sl_pct:.0f}%"
-
-        deficit = risk_total - (free + invested_total)
-        if deficit > 0:
-            budget_status = f"⚠️ дефицит `${deficit:.2f}`"
-        else:
-            budget_status = f"✅ запас `${-deficit:.2f}`"
-
-        lines.append(_SEP)
-        lines.append(
-            f"📊 *Требуется маржи ({sl_label}):*\n"
-            f"Вложено: `${invested_total:.2f}` · Докупок ост.: `${remaining_avg_total:.2f}`\n"
-            f"Итого риск: `${risk_total:.2f}` · {budget_status}"
-        )
-        if avg_violations:
-            lines.append(
-                f"⚠️ Мин. докупка > `${avg_amount:.2f}`: " + ", ".join(avg_violations)
-            )
-
+            lines.append(f"Доступно для новых сделок: {available_margin(futures_raw):.2f} USDT")
+        except ValueError:
+            lines.append("Доступная маржа: нет данных")
+    lines.append("≈ с учётом долга; обеспечение ≠ свободная маржа.")
+    total_pnl = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
+    lines.append(f"Позиции: {len(positions)} · PnL: {fmt_usd(total_pnl)}")
+    for pos in positions:
+        symbol = pos["symbol"]
+        direction = "↓" if pos.get("side") == "short" else "↑"
+        status = "бот" if symbol in db_map else "вручную"
+        lines.append(f"{symbol.split('/')[0]} {direction}×{int(pos.get('leverage') or 1)} · "
+                     f"{float(pos.get('unrealized_pnl') or 0):+.2f} USDT · {status}")
+    if daily_stats:
+        unknown = int(daily_stats.get("unknown_pnl", 0) or 0)
+        lines.append(f"Сегодня (бот): {float(daily_stats.get('realized_pnl') or 0):+.2f} USDT · "
+                     f"{int(daily_stats.get('closes') or 0)} сд."
+                     + (f" · PnL неизвестен: {unknown}" if unknown else ""))
     return "\n".join(lines)
 
 
@@ -164,29 +100,14 @@ def _build_close_kb(positions: list[dict], config=None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _fetch_lev_cache(client, positions: list[dict]) -> dict:
-    """Fetch max_lev and max_pos_usdt per symbol (best-effort, errors ignored)."""
-    cache = {}
-    for pos in positions:
-        symbol = pos["symbol"]
-        lev = int(pos.get("leverage", 1))
-        try:
-            max_lev = await client.get_max_leverage(symbol)
-            max_pos = await client.get_position_limit_usdt(symbol, lev)
-            cache[symbol] = {"max_lev": max_lev, "max_pos_usdt": max_pos}
-        except Exception:
-            pass
-    return cache
-
-
 async def _fetch_all(client, context):
     from bot import db as db_mod
-    from datetime import date
 
-    futures_bal, spot_bal, positions = await asyncio.gather(
+    futures_bal, spot_bal, positions, prices = await asyncio.gather(
         client.get_futures_balance(),
         client.get_spot_balance(),
         client.get_positions(),
+        client.get_asset_prices(),
         return_exceptions=True,
     )
     if isinstance(futures_bal, Exception):
@@ -196,21 +117,41 @@ async def _fetch_all(client, context):
     if isinstance(spot_bal, Exception):
         spot_bal = None
 
-    db_recs = {r["symbol"]: r for r in db_mod.get_open_positions()}
+    futures_bal["_prices"] = {"USDT": 1.0} if isinstance(prices, Exception) else prices
+
+    db_recs = {p["symbol"]: r for p in positions if (r := db_mod.get_managed_position(p))}
     re_recs = {r["symbol"]: r for r in db_mod.get_all_reentry()}
     config = context.bot_data.get("config")
     tp_sl_pcts = context.bot_data.get("tp_sl_pcts", {})
-    daily_stats = db_mod.get_daily_stats(date.today().isoformat())
-    lev_cache = await _fetch_lev_cache(client, positions)
+    daily_stats = db_mod.get_daily_stats()
+    lev_cache = {}
 
     return futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal
+
+
+async def _fetch_with_typing(client, context, message):
+    async def typing():
+        from telegram.error import TelegramError
+        while True:
+            try:
+                await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+            except TelegramError:
+                return
+            await asyncio.sleep(4)
+
+    task = asyncio.create_task(typing())
+    try:
+        return await _fetch_all(client, context)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = context.bot_data["exchange"]
     try:
         futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
-            await _fetch_all(client, context)
+            await _fetch_with_typing(client, context, update.message)
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")
         return
@@ -258,7 +199,7 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client = context.bot_data["exchange"]
         try:
             futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
-                await _fetch_all(client, context)
+                await _fetch_with_typing(client, context, q.message)
         except Exception as e:
             await q.answer(f"Ошибка: {e}", show_alert=True)
             return
@@ -364,7 +305,7 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client = context.bot_data["exchange"]
         try:
             futures_bal, positions, tp_sl_pcts, db_recs, re_recs, config, daily_stats, lev_cache, spot_bal = \
-                await _fetch_all(client, context)
+                await _fetch_with_typing(client, context, q.message)
         except Exception as e:
             await q.answer(f"Ошибка: {e}", show_alert=True)
             return

@@ -7,12 +7,11 @@ from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.event_logger import log_event, set_correlation_id, snapshot_exchange_state
-
 logger = logging.getLogger(__name__)
 SCHEDULER = AsyncIOScheduler()
 
-_EXHAUSTED_PATH = Path(__file__).parent.parent.parent / "data" / "avg_exhausted.json"
+from bot.db import DATA_DIR
+_EXHAUSTED_PATH = DATA_DIR / "avg_exhausted.json"
 
 
 def _load_exhausted() -> set:
@@ -41,44 +40,12 @@ def _lock() -> asyncio.Lock:
 
 def _calc_tp_price(entry: float, leverage: int, tp_pct: float, side: str) -> float:
     move = entry * tp_pct / 100 / leverage
-    return entry - move if side == "short" else entry + move
+    return entry - move if side in ("short", "sell") else entry + move
 
 
 def _calc_sl_price(entry: float, leverage: int, sl_pct: float, side: str) -> float:
     move = entry * sl_pct / 100 / leverage
-    return entry + move if side == "short" else entry - move
-
-
-def _trigger_price_matches(want: float, got: float, rel_tol: float = 0.003) -> bool:
-    if want <= 0 or got <= 0:
-        return False
-    return abs(got - want) / want <= rel_tol
-
-
-async def _verify_active_sl(client, symbol: str, side: str, sl_price: float) -> None:
-    sl_type = 2 if side == "long" else 1
-    orders = await client.get_tp_sl_orders(symbol)
-    for order in orders:
-        if int(order.get("trigger_type", 0) or 0) != sl_type:
-            continue
-        if _trigger_price_matches(sl_price, float(order.get("trigger_price", 0) or 0)):
-            return
-    raise RuntimeError(f"active SL not found at {sl_price:.6g}")
-
-
-async def _set_tp_sl_verified(client, symbol: str, side: str,
-                              tp_price: float | None, sl_price: float,
-                              pos_data: dict, **kwargs) -> None:
-    results = await client.set_tp_sl(
-        symbol, tp_price=tp_price, sl_price=sl_price, pos_data=pos_data, **kwargs
-    )
-    for result in results or []:
-        if result.get("error"):
-            raise RuntimeError(result["error"])
-        body = result.get("result")
-        if isinstance(body, dict) and body.get("success") is False:
-            raise RuntimeError(str(body.get("message", body)))
-    await _verify_active_sl(client, symbol, side, sl_price)
+    return entry + move if side in ("short", "sell") else entry - move
 
 
 # ── Live positions monitor (pinned message, 3s) ───────────────────
@@ -306,14 +273,11 @@ async def averaging_job(app):
     config = app.bot_data.get("config")
     if not config:
         return
-    if not getattr(config, "averaging_enabled", True):
-        return
 
     client = app.bot_data["exchange"]
     threshold = float(getattr(config, "averaging_threshold", -100))
     amount = float(getattr(config, "averaging_amount", 0.50))
     max_count = int(getattr(config, "max_averaging_count", 100))
-    cfg_leverage = int(getattr(config, "default_leverage", 0) or 0)
 
     # Load dynamic averaging rules (sorted by "after" asc)
     import json as _json
@@ -328,19 +292,11 @@ async def averaging_job(app):
     profit_lock_trigger = float(getattr(config, "averaging_profit_lock_trigger", 0))
     profit_lock_sl_pct = float(getattr(config, "averaging_profit_lock_sl_pct", 0))
 
-    # Skip averaging during emergency cooldown
-    if time.time() < app.bot_data.get("_avg_disabled_until", 0):
-        remain = int(app.bot_data["_avg_disabled_until"] - time.time())
-        logger.debug("Averaging paused after emergency close, %ds left", remain)
+    try:
+        positions = [p for p in await client.get_positions() if db_mod.get_managed_position(p)]
+    except Exception as error:
+        logger.error("Averaging: positions unavailable: %s", error)
         return
-
-    positions = app.bot_data.get("_pos_cache")
-    if positions is None:
-        try:
-            positions = await client.get_positions()
-        except Exception as e:
-            logger.error("Averaging: get_positions failed: %s", e)
-            return
 
     if not positions:
         return
@@ -357,49 +313,7 @@ async def averaging_job(app):
     except Exception:
         free_balance = app.bot_data.get("_bal_cache", 0.0)
 
-    # ── Margin emergency check (раз в 10 сек) ────────────────────────
-    _emerg_pct = float(getattr(config, "margin_emergency_threshold_pct", 0))
-    if _emerg_pct > 0 and time.time() - app.bot_data.get("_emerg_last_check", 0) >= 10:
-        app.bot_data["_emerg_last_check"] = time.time()
-        try:
-            _full_bal = await client.get_futures_balance()
-            _raw_bal = _full_bal.get("_raw", {})
-            _free = float(_full_bal.get("free", {}).get("USDT", 0) or 0)
-            _avail = float(_raw_bal.get("availableOpen", _raw_bal.get("availableBalance", _free)) or _free)
-            if _free > 0 and _avail < (_emerg_pct / 100.0) * _free:
-                # Откусить 5% контрактов от каждой позиции равномерно
-                _TRIM_PCT = 0.05
-                import math as _math
-                logger.warning("Margin emergency: avail=$%.2f < %.0f%% of free=$%.2f, trimming %.0f%% of all positions",
-                               _avail, _emerg_pct, _free, _TRIM_PCT * 100)
-                _trimmed = []
-                for _ep in positions:
-                    _sym = _ep["symbol"]
-                    _coin = _sym.split("/")[0]
-                    _total_c = int(round(float(_ep.get("contracts", 0))))
-                    _close_c = max(1, _math.floor(_total_c * _TRIM_PCT))
-                    try:
-                        await client.partial_close_futures_position(_sym, _close_c)
-                        _pnl_ep = float(_ep.get("unrealized_pnl", 0))
-                        _margin_ep = float(_ep.get("margin", 0))
-                        _freed_est = _margin_ep * _TRIM_PCT
-                        _trimmed.append(f"`{_coin}` -{_close_c}к (~`${_freed_est:.2f}`)")
-                        logger.info("margin_emergency: trimmed %s by %d contracts", _sym, _close_c)
-                    except Exception as _ce:
-                        logger.error("margin_emergency trim %s: %s", _sym, _ce)
-                if _trimmed:
-                    await _notify_all(app,
-                        f"✂️ *Сократил позиции* (avail `${_avail:.2f}` < `{_emerg_pct:.0f}%` от `${_free:.2f}`)\n"
-                        + "\n".join(_trimmed))
-                app.bot_data["_avg_disabled_until"] = time.time() + 300
-                await _notify_all(app, "⏸ *Докупки приостановлены на 5 минут* (аварийное закрытие)")
-                return
-        except Exception as _be:
-            logger.warning("margin_emergency balance check: %s", _be)
-    # ─────────────────────────────────────────────────────────────────
-
-    db_positions = {p["symbol"]: p for p in db_mod.get_open_positions()}
-    synth_store = app.bot_data.setdefault("_avg_synth", {})
+    db_positions = {p["symbol"]: db_mod.get_managed_position(p) for p in positions}
     notified_exhausted: set = app.bot_data.setdefault("_avg_notified_exhausted", set())
 
     # Contracts tracking: compare our expected count vs exchange
@@ -407,15 +321,6 @@ async def averaging_job(app):
     _contracts_warned: set = app.bot_data.setdefault("_contracts_warned", set())
     _profit_lock_step: dict = app.bot_data.setdefault("_profit_lock_step", {})
 
-    # Lazy-load profit lock disabled set from file
-    if "_profit_lock_disabled" not in app.bot_data:
-        _plock_path = Path(__file__).parent.parent.parent / "data" / "profit_lock_disabled.json"
-        try:
-            app.bot_data["_profit_lock_disabled"] = set(
-                json.loads(_plock_path.read_text()))
-        except Exception:
-            app.bot_data["_profit_lock_disabled"] = set()
-    _profit_lock_disabled: set = app.bot_data["_profit_lock_disabled"]
     _age_12h_notified: set = app.bot_data.setdefault("_age_12h_notified", set())
 
     # Cleanup stale symbols (position closed on exchange)
@@ -493,72 +398,40 @@ async def averaging_job(app):
 
         # ── Stepped profit lock: SL ratchets up every 50% of PnL ────
         # +100% PnL → SL at +50%, +150% → SL at +100%, +200% → SL at +150%, ...
-        if profit_lock_trigger > 0 and pnl_pct >= 100 and symbol not in _profit_lock_disabled:
+        if profit_lock_trigger > 0 and pnl_pct >= 100 and db_positions[symbol]["profit_lock_enabled"]:
             _PL_STEP = 50
             new_pl_step = (int(pnl_pct) // _PL_STEP) * _PL_STEP
-            current_pl_step = _profit_lock_step.get(symbol, 0)
+            current_pl_step = db_positions[symbol].get("profit_lock_step") or 0
             if new_pl_step > current_pl_step:
                 lock_sl_pct = new_pl_step - _PL_STEP  # e.g., step=100 → lock at +50%
                 _pl_entry = float(pos.get("entry_price", 0) or 0)
                 _pl_side = pos.get("side", "short")
-                _pl_lev = cfg_leverage or int(pos.get("leverage") or 1)
+                _pl_lev = int(pos.get("leverage") or 1)
                 if _pl_entry > 0:
                     _tp_sl_pcts_pl = app.bot_data.get("tp_sl_pcts", {})
                     _stored_pl = _tp_sl_pcts_pl.get(symbol, {})
                     _tp_pct_val = _stored_pl.get("tp_pct") or float(getattr(config, "tp_pct", 500))
                     _new_tp = _calc_tp_price(_pl_entry, _pl_lev, _tp_pct_val, _pl_side)
                     _new_sl = _calc_tp_price(_pl_entry, _pl_lev, lock_sl_pct, _pl_side)
-                    _profit_lock_step[symbol] = new_pl_step  # guard before await
                     try:
-                        await _set_tp_sl_verified(client, symbol, _pl_side, _new_tp, _new_sl, pos)
-                        app.bot_data.setdefault("_was_profit_locked", set()).add(symbol)
+                        await client.set_tp_sl(symbol, tp_price=_new_tp, sl_price=_new_sl,
+                                               pos_data=pos, profit_lock_step=new_pl_step)
                         _pl_coin = symbol.split("/")[0]
                         await _notify_all(app,
                             f"🔒 *{_pl_coin}* профит-лок +{new_pl_step}%\n"
                             f"PnL `{pnl_pct:+.1f}%` → SL в `+{lock_sl_pct:.0f}%` PnL\n"
                             f"Триггер: `{_new_sl:.6g}`")
                     except Exception as _pl_e:
-                        _profit_lock_step[symbol] = current_pl_step  # rollback
-                        app.bot_data.setdefault("_was_profit_locked", set()).discard(symbol)
                         logger.warning("Profit lock SL %s: %s", symbol, _pl_e)
+                        await _notify_all(app, f"⚠️ {symbol}: profit-lock не подтверждён: {_pl_e}")
 
         # Skip if position-limit or count-exhausted (notified_exhausted acts as permanent block)
         if symbol in notified_exhausted:
             continue
 
-        # Auto-register external positions before any threshold check
-        db_rec = db_positions.get(symbol)
-        if db_rec is None:
-            _tp = float(getattr(config, "tp_pct", 500))
-            _sl = float(getattr(config, "sl_pct", 500))
-            _cur_margin = float(pos.get("margin", amount) or amount)
-            _est_count = max(0, round(_cur_margin / amount) - 1) if amount > 0 else 0
-            db_mod.upsert_position(
-                symbol, pos.get("side", "short"),
-                float(pos.get("entry_price", 0) or 0),
-                cfg_leverage or int(pos.get("leverage", 1) or 1),
-                _cur_margin,
-                tp_pct=_tp, sl_pct=_sl,
-                budget=amount * max_count,
-                total_invested=_cur_margin,
-                avg_count=_est_count,
-            )
-            db_rec = db_mod.get_open_position(symbol)
-            if db_rec:
-                db_positions[symbol] = db_rec
-                app.bot_data.setdefault("tp_sl_pcts", {}).setdefault(
-                    symbol, {"tp_pct": _tp, "sl_pct": _sl}
-                )
-                logger.info("Auto-registered position %s in DB (id=%d)", symbol, db_rec["id"])
-            else:
-                if symbol not in synth_store:
-                    synth_store[symbol] = {
-                        "id": None, "symbol": symbol,
-                        "total_invested": float(pos.get("margin", 0) or amount),
-                        "averaging_count": 0,
-                        "tp_pct": _tp, "sl_pct": _sl,
-                    }
-                db_rec = synth_store[symbol]
+        if not config.averaging_enabled or time.time() < app.bot_data.get("_avg_disabled_until", 0):
+            continue
+        db_rec = db_positions[symbol]
 
         total_invested = float(db_rec.get("total_invested") or 0)
         avg_count = int(db_rec.get("averaging_count") or 0)
@@ -591,7 +464,7 @@ async def averaging_job(app):
             continue
 
         avg_side = "buy" if pos.get("side") == "long" else "sell"
-        avg_lev = cfg_leverage or int(pos.get("leverage") or 1)
+        avg_lev = int(pos.get("leverage") or 1)
         avg_mm = pos.get("margin_mode")
         old_entry = float(pos.get("entry_price", 0) or 0)
         old_contracts = int(round(float(pos.get("contracts", 0) or 0)))
@@ -632,7 +505,7 @@ async def averaging_job(app):
         async with _lock():
             try:
                 order_result = await client.place_futures_order(symbol, avg_side, actual_amount, avg_lev,
-                                                                margin_mode=avg_mm)
+                                                                margin_mode=avg_mm, expected_position_id=pos["position_id"])
             except Exception as e:
                 err_msg = str(e).lower()
                 raw_err = str(e)
@@ -737,8 +610,10 @@ async def averaging_job(app):
                                      symbol, new_tp, new_entry)
                         new_tp = None
                     if new_tp or new_sl:
-                        await client.set_tp_sl(symbol, tp_price=new_tp, sl_price=new_sl,
+                        confirmed = await client.set_tp_sl(symbol, tp_price=new_tp, sl_price=new_sl,
                                                pos_data=pos_after)
+                        prices = {r["type"]: r["price"] for r in confirmed}
+                        new_tp, new_sl = prices.get("TP"), prices.get("SL")
                         parts = []
                         if new_tp:
                             parts.append(f"TP: `{new_tp:.6g}`")
@@ -747,6 +622,7 @@ async def averaging_job(app):
                         tp_sl_text = "\n🔄 " + ", ".join(parts) + f" (avg: `{new_entry:.6g}`)"
                 except Exception as e:
                     logger.warning("TP/SL recalc for %s: %s", symbol, e)
+                    tp_sl_text = f"\n⚠️ Защита не подтверждена: {e}"
 
         # Notify
         coin = symbol.split("/")[0]
@@ -780,276 +656,62 @@ async def averaging_job(app):
 
 # ── Re-entry job ──────────────────────────────────────────────────
 
-async def _resolve_close_reason(client, symbol: str, pos_side_str: str,
-                                opened_at_ms: int | None,
-                                entry_price: float) -> tuple[bool | None, bool, float | None]:
-    """Returns (closed_by_tp, profitable_sl, close_price).
-    closed_by_tp: True=TP, False=SL, None=unknown.
-    profitable_sl: True if SL triggered but at a price better than entry (profit-lock SL).
-    close_price: actual trigger/close price, or None if unknown."""
-    is_tp, trigger_price = await client.was_closed_by_tp(symbol, pos_side_str, opened_at_ms)
-
-    profitable_sl = False
-    if is_tp is False and trigger_price and entry_price > 0:
-        profitable_sl = (
-            (trigger_price < entry_price) if pos_side_str == "short"
-            else (trigger_price > entry_price)
-        )
-
-    if is_tp is None and entry_price > 0:
-        try:
-            ticker = await client._exchange.fetch_ticker(symbol)
-            mark = float(ticker.get("last", 0) or 0)
-            if mark > 0:
-                is_tp = (mark < entry_price) if pos_side_str == "short" else (mark > entry_price)
-                if trigger_price is None:
-                    trigger_price = mark
-        except Exception as e:
-            logger.debug("_resolve_close_reason price fallback %s: %s", symbol, e)
-
-    return is_tp, profitable_sl, trigger_price
-
-
-def _fmt_close_pnl(entry: float, close_price: float | None,
-                   side: str, leverage: int, margin: float) -> str:
-    """Returns '+120.5% / +$0.24' string, or '' if data missing."""
-    if not close_price or not entry or entry == 0:
-        return ""
-    if side == "short":
-        pct = (entry - close_price) / entry * leverage * 100
-    else:
-        pct = (close_price - entry) / entry * leverage * 100
-    usd = pct / 100 * margin
-    return f"`{pct:+.1f}%` / `{usd:+.2f}$`"
-
-
 async def reentry_job(app):
-    """После TP — переоткрыть позицию (max_cycles раз)."""
     from bot import db as db_mod
+    from bot.lifecycle import reconcile_closures, reset_runtime, pnl_text
+    import datetime as dt
     client = app.bot_data["exchange"]
-
-    reentry_list = db_mod.get_all_reentry()
-    if not reentry_list:
-        return
-
+    config = app.bot_data["config"]
     try:
-        open_positions = await client.get_positions()
-        open_symbols = {p["symbol"] for p in open_positions}
-    except Exception as e:
-        logger.error("Re-entry: get_positions failed: %s", e)
+        live = await reconcile_closures(app)
+    except Exception as error:
+        logger.warning("Reconciliation unavailable: %s", error)
         return
-
-    # Fetch available futures balance once per run
-    futures_avail = 0.0
-    try:
-        bal = await client.get_futures_balance()
-        raw = bal.get("_raw", {})
-        futures_avail = float(raw.get("availableOpen", raw.get("availableBalance", 0)) or 0)
-        free = float(bal.get("free", {}).get("USDT", 0) or 0)
-        futures_avail = max(futures_avail, free)
-    except Exception:
-        pass
-
-    for re_cfg in reentry_list:
+    for re_cfg in db_mod.get_all_reentry():
         symbol = re_cfg["symbol"]
-        if symbol in open_symbols:
-            app.bot_data.pop(f"_reentry_sl_ts_{symbol}", None)
-            continue
-
-        cycle_count = int(re_cfg.get("cycle_count") or 0)
-        _mc = re_cfg.get("max_cycles")
-        max_cycles = int(_mc) if _mc is not None else 3
-
-        side = re_cfg["side"]
-        coin = symbol.split("/")[0]
-        pos_side_str = "short" if side == "sell" else "long"
-
-        # Get open timestamp and entry price for close reason resolution
-        ph = db_mod.get_last_position_history(symbol)
-        opened_at_ms = None
-        entry_price = float(ph["entry_price"]) if ph and ph.get("entry_price") else 0.0
-        ph_total_invested = float(ph.get("total_invested") or 0) if ph else 0.0
-        ph_leverage = int(ph.get("leverage") or 0) if ph else 0
-        if ph and ph.get("opened_at"):
-            try:
-                import datetime as _dt
-                opened_at_ms = int(
-                    _dt.datetime.fromisoformat(ph["opened_at"]).timestamp() * 1000
-                )
-            except Exception:
-                pass
-
-        if max_cycles == 0:
-            closed_by_tp, profitable_sl, close_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
-            if closed_by_tp is None:
-                continue
-            close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
-            pnl_text, pnl_usdt = _close_pnl(close_price)
-            db_mod.close_position(symbol)
-            db_mod.log_trade(symbol, "close", note=close_note, pnl=pnl_usdt)
-            db_mod.close_position_history(symbol, exit_price=close_price or 0, pnl=pnl_usdt, close_reason=close_note)
-            if not closed_by_tp and not profitable_sl:
-                app.bot_data.setdefault("_sl_cooldown", {})[symbol] = time.time()
-            icon = "✅" if (closed_by_tp or profitable_sl) else "🛑"
-            label = "по тейку" if closed_by_tp else ("по профит-локк SL" if profitable_sl else "по стопу")
-            await _notify_all(app,
-                f"{icon} *{coin}* {label} (перезаход отключён){pnl_text}")
+        record = db_mod.get_position_by_id(re_cfg.get("position_key"))
+        if not record or not record.get("exchange_position_id"):
             db_mod.delete_reentry(symbol)
             continue
-
-        if cycle_count >= max_cycles:
-            logger.info("Re-entry: %s exhausted (%d/%d cycles)", symbol, cycle_count, max_cycles)
-            closed_by_tp, profitable_sl, close_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
-            if closed_by_tp is None:
-                continue
-            close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
-            pnl_text, pnl_usdt = _close_pnl(close_price)
-            db_mod.close_position(symbol)
-            db_mod.log_trade(symbol, "close", note=close_note, pnl=pnl_usdt)
-            db_mod.close_position_history(symbol, exit_price=close_price or 0, pnl=pnl_usdt, close_reason=close_note)
-            icon = "✅" if (closed_by_tp or profitable_sl) else "🛑"
-            label = "по тейку" if closed_by_tp else ("по профит-локк SL" if profitable_sl else "по стопу")
-            await _notify_all(app,
-                f"{icon} *{coin}* {label} — циклы исчерпаны ({cycle_count}/{max_cycles}){pnl_text}")
+        same_symbol = [p for p in live if p["symbol"] == symbol]
+        if same_symbol:
+            if any(str(p["position_id"]) != record["exchange_position_id"] for p in same_symbol):
+                db_mod.delete_reentry(symbol)
+                reset_runtime(app, symbol)
+            continue
+        closure = db_mod.get_closure(record["id"])
+        if not closure:
+            continue
+        maximum = min(int(re_cfg["max_cycles"]), int(config.max_reentry_cycles))
+        reason = closure["reason"]
+        if maximum <= 0 or int(re_cfg["cycle_count"]) >= maximum or reason not in ("tp", "sl", "profit_lock", "manual_reentry"):
             db_mod.delete_reentry(symbol)
             continue
-
-        # 30s cooldown between cycles
-        last_check_key = f"_reentry_ts_{symbol}"
-        last_ts = app.bot_data.get(last_check_key, 0)
-        if time.time() - last_ts < 30:
+        if reason == "sl" and not config.reentry_on_sl:
+            app.bot_data.setdefault("_sl_cooldown", {})[symbol] = time.time()
+            db_mod.delete_reentry(symbol)
             continue
-        app.bot_data[last_check_key] = time.time()
-
-        config_obj = app.bot_data.get("config")
-        margin = (float(getattr(config_obj, "default_trade_usdt", 0) or 0)
-                  or float(re_cfg.get("margin") or 1.0))
-        leverage = (int(getattr(config_obj, "default_leverage", 0) or 0)
-                    or int(re_cfg.get("leverage") or 0) or None)
-        tp_pct = (float(getattr(config_obj, "tp_pct", 0) or 0)
-                  or float(re_cfg.get("tp_pct") or 500))
-        sl_pct = (float(getattr(config_obj, "sl_pct", 0) or 0)
-                  or float(re_cfg.get("sl_pct") or 500))
-
-        logger.info("Re-entry #%d %s %s $%.2f", cycle_count + 1, symbol, side, margin)
-
-        pnl_margin = ph_total_invested or float(re_cfg.get("margin") or 1.0)
-        pnl_lev = ph_leverage or int(re_cfg.get("leverage") or 0) or 1
-
-        def _close_pnl(exit_price: float | None) -> tuple[str, float]:
-            if not exit_price or entry_price <= 0:
-                return "", 0.0
-            pnl_s = _fmt_close_pnl(entry_price, exit_price, pos_side_str, pnl_lev, pnl_margin)
-            if side == "short":
-                pct = (entry_price - exit_price) / entry_price * pnl_lev * 100
-            else:
-                pct = (exit_price - entry_price) / entry_price * pnl_lev * 100
-            pnl_usdt = pct / 100 * pnl_margin
-            return (f" · PnL {pnl_s}" if pnl_s else "", pnl_usdt)
-
-        # Determine close reason: TP or profitable-SL → re-enter, loss-SL → skip
-        closed_by_tp, profitable_sl, close_price = await _resolve_close_reason(client, symbol, pos_side_str, opened_at_ms, entry_price)
-
-        if closed_by_tp is None:
-            logger.info("Re-entry: %s close reason unknown, retrying next cycle", symbol)
+        delay = 60 if reason == "profit_lock" else (config.reentry_sl_cooldown_min * 60 if reason == "sl" else 30)
+        closed_ts = dt.datetime.fromisoformat(closure["closed_at"]).timestamp()
+        if time.time() - closed_ts < delay:
             continue
-
-        close_note = "tp" if (closed_by_tp or profitable_sl) else "sl"
-        still_open = db_mod.get_open_position(symbol) is not None
-        if still_open:
-            db_mod.close_position(symbol)
-            db_mod.log_trade(symbol, "close", note=close_note)
-            db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason=close_note)
-
-        # Fallback: if price bounced above entry before reentry_job ran,
-        # _resolve_close_reason misses the profit-lock. Check persistent flag.
-        if not closed_by_tp and not profitable_sl:
-            _was_pl: set = app.bot_data.setdefault("_was_profit_locked", set())
-            if symbol in _was_pl:
-                profitable_sl = True
-                _was_pl.discard(symbol)
-
-        if profitable_sl and not closed_by_tp:
-            # Profit-lock SL fired because price bounced. Wait 1 min, then re-enter.
-            pl_cd_key = f"_reentry_pl_ts_{symbol}"
-            pl_ts = app.bot_data.get(pl_cd_key, 0)
-
-            if pl_ts == 0:
-                app.bot_data[pl_cd_key] = time.time()
-                await _notify_all(app,
-                    f"🔒 *{coin}* закрыта в прибыль (профит-локк SL)\n"
-                    f"⏳ Пауза 1м, отмена ордеров, перезаход "
-                    f"#{cycle_count + 1}/{max_cycles}")
-                continue
-
-            if time.time() - pl_ts < 60:
-                continue  # still waiting
-
-            # Cooldown elapsed — cancel stale plan orders then proceed to re-entry
-            app.bot_data.pop(pl_cd_key, None)
-            await client.cancel_plan_orders(symbol)
-
-        if not closed_by_tp and not profitable_sl:
-            config_obj = app.bot_data.get("config")
-            reentry_on_sl = bool(getattr(config_obj, "reentry_on_sl", False))
-
-            if not reentry_on_sl:
-                # Classic behaviour: block re-entry after SL
-                app.bot_data.setdefault("_sl_cooldown", {})[symbol] = time.time()
-                await _notify_all(app,
-                    f"🛑 *{coin}* закрыта по стопу — перезаход пропущен\n"
-                    f"⏳ Кулдаун авто-скана на 2ч")
+        try:
+            # Recheck after cooldown; execute_open also refuses any existing position.
+            if await client.get_position(symbol):
                 db_mod.delete_reentry(symbol)
                 continue
-
-            # Tight-stop strategy: wait cooldown, then re-enter at (hopefully) better price
-            cooldown_min = int(getattr(config_obj, "reentry_sl_cooldown_min", 10))
-            sl_cd_key = f"_reentry_sl_ts_{symbol}"
-            sl_ts = app.bot_data.get(sl_cd_key, 0)
-
-            if sl_ts == 0:
-                app.bot_data[sl_cd_key] = time.time()
-                app.bot_data.setdefault("_sl_cooldown", {})[symbol] = time.time()
-                await _notify_all(app,
-                    f"🛑 *{coin}* закрыта по стопу\n"
-                    f"⏳ Пауза {cooldown_min}м, затем перезаход "
-                    f"#{cycle_count + 1}/{max_cycles}")
-                continue
-
-            if time.time() - sl_ts < cooldown_min * 60:
-                continue  # still waiting
-
-            # Cooldown elapsed — proceed to re-entry below
-            app.bot_data.pop(sl_cd_key, None)
-
-        # Cancel re-entry if no free futures balance — don't retry
-        if futures_avail < margin * 0.1:
-            logger.info("Re-entry %s cancelled: no free balance (avail=%.4f)", symbol, futures_avail)
-            await _notify_all(app, f"⚠️ *{coin}* перезаход отменён — недостаточно средств")
-            db_mod.delete_reentry(symbol)
-            continue
-
-        try:
+            await client.cancel_tp_sl_orders(symbol, record["id"])
             from bot.handlers.trading import execute_open
-            result = await execute_open(client, app, symbol, side, margin, leverage,
-                                        tp_pct=tp_pct, sl_pct=sl_pct)
-            new_cycle = db_mod.increment_reentry_cycle(symbol)
-            pnl_text, pnl_usdt = _close_pnl(close_price)
-            db_mod.log_trade(symbol, "reentry", amount=margin, note=f"cycle {new_cycle}", pnl=pnl_usdt)
-            # Clear exhausted flag so new cycle gets fresh averaging tracking
-            notified_exhausted: set = app.bot_data.setdefault("_avg_notified_exhausted", set())
-            notified_exhausted.discard(symbol)
-            _save_exhausted(notified_exhausted)
-            close_label = "по TP" if closed_by_tp else "в прибыль (профит-локк SL)"
-            msg = (
-                f"✅ *{coin}* закрыта {close_label} → перезаход #{new_cycle}/{max_cycles}"
-                f"{pnl_text}\n"
-                f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']}\n"
-                f"TP: `{result.get('tp_price', 0):.6g}` | SL: `{result.get('sl_price', 0):.6g}`"
-            )
-            await _notify_all(app, msg)
-        except Exception as e:
-            logger.error("Re-entry failed for %s: %s", symbol, e)
+            reset_runtime(app, symbol)
+            cycle = int(re_cfg["cycle_count"]) + 1
+            result = await execute_open(client, app, symbol, re_cfg["side"], config.default_trade_usdt,
+                config.default_leverage or re_cfg["leverage"], config.tp_pct, config.sl_pct,
+                cycle_count=cycle)
+            db_mod.log_trade(symbol, "reentry", amount=result["margin"], note=f"cycle {cycle}")
+            await _notify_all(app, f"Перезаход {symbol} #{cycle}/{maximum}; предыдущая сделка: {reason}\n"
+                f"{pnl_text(closure)}\nEntry: {result['entry_price']}; защита: {result['protection_status']}")
+        except Exception as error:
+            logger.warning("Re-entry %s: %s", symbol, error)
 
 
 # ── Balance alert job ─────────────────────────────────────────────
@@ -1065,7 +727,8 @@ async def balance_alert_job(app):
         total = float(bal.get("total", {}).get("USDT", 0) or 0)
         avail = float(raw.get("availableOpen", raw.get("availableBalance", 0)) or 0)
         free = float(bal.get("free", {}).get("USDT", 0) or 0)
-        free = max(avail, free)
+        from bot.exchange.client import available_margin
+        free = available_margin(bal)
 
         if total <= 0:
             return
@@ -1089,117 +752,78 @@ async def balance_alert_job(app):
 # ── TP/SL enforce job ─────────────────────────────────────────────
 
 async def tpsl_enforce_job(app):
-    """Sync closed positions and clean orphaned plan orders without restoring TP/SL."""
     from bot import db as db_mod
     client = app.bot_data["exchange"]
-    tp_sl_pcts = app.bot_data.get("tp_sl_pcts", {})
-    set_correlation_id("job-tpsl-enforce")
-
     try:
         positions = await client.get_positions()
-    except Exception as e:
-        log_event("errors", "tpsl_enforce_get_positions_failed", error=str(e))
-        logger.error("TP/SL enforce: get_positions: %s", e)
-        return
-    await snapshot_exchange_state(client, "tpsl_enforce_run")
-
-    sem = asyncio.Semaphore(5)  # max 5 concurrent MEXC requests
-
-    async def _check_pos(pos):
-        symbol = pos["symbol"]
-        stored = tp_sl_pcts.get(symbol)
-        if not stored:
-            db_rec = db_mod.get_open_position(symbol)
-            if not db_rec:
-                # Auto-register externally opened position
-                config = app.bot_data.get("config")
-                _tp = float(getattr(config, "tp_pct", 500)) if config else 500.0
-                _sl = float(getattr(config, "sl_pct", 500)) if config else 500.0
-                _amount = float(getattr(config, "averaging_amount", 0.25)) if config else 0.25
-                _max_count = int(getattr(config, "max_averaging_count", 200)) if config else 200
-                _cur_margin = float(pos.get("margin", _amount) or _amount)
-                _est_count = max(0, round(_cur_margin / _amount) - 1) if _amount > 0 else 0
-                _cfg_lev = int(getattr(config, "default_leverage", 0) or 0) if config else 0
-                db_mod.upsert_position(
-                    symbol, pos.get("side", "short"),
-                    float(pos.get("entry_price", 0) or 0),
-                    _cfg_lev or int(pos.get("leverage", 1) or 1),
-                    _cur_margin,
-                    tp_pct=_tp, sl_pct=_sl,
-                    budget=_amount * _max_count,
-                    total_invested=_cur_margin,
-                    avg_count=_est_count,
-                )
-                db_rec = db_mod.get_open_position(symbol)
-                if db_rec:
-                    tp_sl_pcts[symbol] = {"tp_pct": _tp, "sl_pct": _sl}
-                    app.bot_data.setdefault("tp_sl_pcts", {})[symbol] = {"tp_pct": _tp, "sl_pct": _sl}
-                    log_event(
-                        "decisions", "tpsl_enforce_auto_registered_position",
-                        symbol=symbol, tp_pct=_tp, sl_pct=_sl,
-                        margin=_cur_margin, avg_count=_est_count,
-                    )
-                    logger.info("tpsl_enforce: auto-registered position %s in DB (id=%d)", symbol, db_rec["id"])
-                else:
-                    return
-            stored = {"tp_pct": db_rec.get("tp_pct", 500), "sl_pct": db_rec.get("sl_pct", 500)}
-            tp_sl_pcts[symbol] = stored
-
-    if len(positions) >= 5:
-        await asyncio.gather(*[_check_pos(pos) for pos in positions])
-    else:
         for pos in positions:
-            await _check_pos(pos)
-
-    # Clean up orphaned plan orders: cancel any active plan order whose symbol
-    # has no open position on the exchange (covers DB-missing cases too)
-    exchange_symbols = {pos["symbol"] for pos in positions}
-    db_open_symbols = {p["symbol"] for p in db_mod.get_open_positions()}
-    # DB-based cleanup (fast, no extra API call)
-    async def _cancel_orphan(symbol):
-        async with sem:
+            record = db_mod.get_managed_position(pos)
+            if not record:
+                continue
+            entry, lev, side = pos["entry_price"], pos["leverage"], pos["side"]
             try:
-                n = await client.cancel_tp_sl_orders(symbol)
-                if n > 0:
-                    logger.info("Cancelled %d orphaned plan orders for closed position %s", n, symbol)
-            except Exception as e:
-                logger.warning("Orphan order cleanup %s: %s", symbol, e)
-
-    orphan_syms = db_open_symbols - exchange_symbols
-    log_event(
-        "decisions", "tpsl_enforce_summary",
-        exchange_symbols=sorted(exchange_symbols), db_open_symbols=sorted(db_open_symbols),
-        orphan_symbols=sorted(orphan_syms),
-    )
-    if orphan_syms:
-        await asyncio.gather(*[_cancel_orphan(s) for s in orphan_syms])
-
-    # Sync DB: close any position that's open in DB but gone from exchange
-    reentry_symbols = {r["symbol"] for r in db_mod.get_all_reentry()}
-    for symbol in orphan_syms:
-        if symbol in reentry_symbols:
-            continue  # reentry_job will handle it (close + re-entry logic)
-        db_mod.close_position(symbol)
-        db_mod.close_position_history(symbol, exit_price=0, pnl=0, close_reason="liquidated")
-        coin = symbol.split("/")[0]
-        logger.info("DB sync: closed stale open position %s (not on exchange)", symbol)
-        await _notify_all(app, f"💀 *{coin}* закрыта принудительно (ликвидация или внешнее закрытие)")
-
-    # Full plan-order sweep every 5 min (every 5th run)
-    run_count = app.bot_data.get("_tpsl_run_count", 0) + 1
-    app.bot_data["_tpsl_run_count"] = run_count
-    if run_count % 5 == 0:
-        try:
-            all_plan_orders = await client.get_tp_sl_orders()
-            order_syms = {o["symbol"] for o in all_plan_orders}
-            sweep_syms = order_syms - exchange_symbols
-            if sweep_syms:
-                await asyncio.gather(*[_cancel_orphan(s) for s in sweep_syms])
-        except Exception as e:
-            logger.debug("Plan order sweep failed: %s", e)
+                await client.set_tp_sl(pos["symbol"],
+                    tp_price=_calc_tp_price(entry, lev, record["tp_pct"], side),
+                    sl_price=_calc_sl_price(entry, lev, record["sl_pct"], side), pos_data=pos)
+            except Exception as error:
+                logger.error("Protection %s: %s", pos["symbol"], error)
+                await _notify_all(app, f"⚠️ {pos['symbol']}: защита не подтверждена: {error}")
+        # Cancel only our order IDs after a fresh position-ID check, never CancelAll.
+        live_ids = {str(p["position_id"]) for p in positions}
+        for key in {o["position_key"] for o in db_mod.get_bot_orders()}:
+            record = db_mod.get_position_by_id(key)
+            if record and record["exchange_position_id"] not in live_ids:
+                fresh = await client.get_positions()
+                if record["exchange_position_id"] not in {str(p["position_id"]) for p in fresh}:
+                    await client.cancel_tp_sl_orders(record["symbol"], key)
+    except Exception as error:
+        logger.warning("Protection scan aborted: %s", error)
 
 
-# ── BTC trend helper ──────────────────────────────────────────────
+async def margin_emergency_job(app):
+    from bot import db as db_mod
+    from bot.exchange.client import available_margin
+    import math
+    config = app.bot_data["config"]
+    threshold, trim = config.margin_emergency_threshold_pct, config.margin_emergency_trim_pct
+    if not 0 < threshold <= 100 or not 0 < trim <= 100:
+        return
+    client = app.bot_data["exchange"]
+    try:
+        positions = [p for p in await client.get_positions() if db_mod.get_managed_position(p)]
+        balance = await client.get_futures_balance()
+        for currency in {p.get("settle_currency", "USDT") for p in positions}:
+            avail = available_margin(balance, currency)
+            free = float(balance.get("free", {}).get(currency, 0))
+            low = avail <= 0 or (free > 0 and avail < free * threshold / 100)
+            key = f"emergency_latched_{currency}"
+            if not low:
+                db_mod.set_config(key, "")
+                continue
+            app.bot_data["_avg_disabled_until"] = time.time() + 300
+            if db_mod.get_config(key):
+                continue
+            # Persist before sending: no repeated trim after a timeout or restart.
+            db_mod.set_config(key, "pending")
+            for pos in positions:
+                if pos.get("settle_currency", "USDT") != currency:
+                    continue
+                count = int(pos["contracts"])
+                contracts = min(count, max(1, math.floor(count * trim / 100)))
+                if contracts <= 0:
+                    continue
+                try:
+                    await client.partial_close_futures_position(pos["symbol"], contracts,
+                        expected_position_id=pos["position_id"])
+                    await _notify_all(app, f"Аварийное сокращение {pos['symbol']}: отправлен ордер на "
+                        f"{contracts}/{count} контрактов ({contracts/count*100:.1f}%). "
+                        f"Доступно {avail:g} {currency}; порог {threshold:g}% от {free:g}. PnL ожидает исполнения.")
+                except Exception as error:
+                    await _notify_all(app, f"⚠️ Сокращение {pos['symbol']} не подтверждено: {error}")
+            db_mod.set_config(key, "latched")
+    except Exception as error:
+        logger.warning("Emergency check aborted: %s", error)
+
 
 async def _get_btc_rsi_4h(client) -> float | None:
     """Return BTC RSI on 4h candles, or None on error."""
@@ -1270,7 +894,7 @@ async def auto_scan_job(app):
                 slots, ask_n, btc_rsi or 0)
 
     from bot.ai.scanner import scan_overbought, analyze_single_coin, mexc_find_futures_symbol
-    from bot.ai.analyst import (deep_short_analysis, parse_analyst_blocks,
+    from bot.ai.analyst import (deep_short_analysis, parse_short_candidates,
                                 DEFAULT_MODEL, FALLBACK_MODEL)
 
     try:
@@ -1280,9 +904,11 @@ async def auto_scan_job(app):
         local_results = []
 
     model = getattr(config, "openrouter_model", DEFAULT_MODEL) or DEFAULT_MODEL
-    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=ask_n)
+    from bot.ai.research_snapshot import research_context
+    snapshot = await research_context(client, config, local_results)
+    ai_result = await deep_short_analysis(local_results, api_key, model=model, n=ask_n, research_snapshot=snapshot)
     if ai_result.error and not ai_result.text:
-        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=ask_n)
+        ai_result = await deep_short_analysis(local_results, api_key, model=FALLBACK_MODEL, n=ask_n, research_snapshot=snapshot)
     if ai_result.error and not ai_result.text:
         logger.warning("AutoScan: AI unavailable — %s", ai_result.error)
         await _notify_all(app,
@@ -1290,7 +916,7 @@ async def auto_scan_job(app):
             f"Следующий: {next_str}")
         return
 
-    picks = parse_analyst_blocks(ai_result.text, n=ask_n)
+    picks = parse_short_candidates(ai_result.text, n=ask_n)
 
     def _risk_int(pick):
         m = _re.match(r"(\d+)", pick.get("risk", "10"))
@@ -1421,7 +1047,7 @@ async def daily_report_job(app):
     """Ежедневный отчёт в 23:00 — статистика закрытых позиций за день."""
     import datetime as _dt
     from bot import db as db_mod
-    today = _dt.datetime.now().strftime("%Y-%m-%d")
+    today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
     try:
         with db_mod._connect() as conn:
             rows = conn.execute(
@@ -1448,7 +1074,7 @@ async def daily_report_job(app):
     lines = [
         f"📊 *Отчёт за {today}*",
         f"Закрыто: {len(closed)} | ✅ {len(winners)} | 🛑 {len(losers)}",
-        f"Итог: {icon} `{total_pnl:+.2f}$`",
+        f"Известный итог: {icon} `{total_pnl:+.2f}$`; PnL неизвестен: {sum(r.get('pnl') is None for r in closed)}",
     ]
     if best and (best.get("pnl") or 0) > 0:
         coin = best["symbol"].split("/")[0]
@@ -1505,6 +1131,8 @@ def setup_scheduler(app):
         max_instances=1,
         replace_existing=True,
     )
+    SCHEDULER.add_job(margin_emergency_job, trigger=IntervalTrigger(seconds=10), args=[app],
+                      id="margin_emergency", max_instances=1, replace_existing=True)
     SCHEDULER.add_job(
         reentry_job,
         trigger=IntervalTrigger(seconds=30),
@@ -1584,6 +1212,7 @@ def setup_scheduler(app):
 
 
 async def _notify_all(app, text: str, reply_markup=None):
+    from bot.event_logger import log_event
     config = app.bot_data.get("config")
     if not config:
         return
@@ -1591,5 +1220,7 @@ async def _notify_all(app, text: str, reply_markup=None):
         try:
             await app.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown",
                                        reply_markup=reply_markup)
+            log_event("notification_sent", user_id=uid, text_length=len(text))
         except Exception as e:
+            log_event("notification_failed", user_id=uid, error_type=type(e).__name__)
             logger.warning("notify uid=%s: %s", uid, e)

@@ -1,0 +1,32 @@
+{
+  "project": "t3-remote",
+  "project_id": "1ed37980-57a9-49aa-a414-7febda404768",
+  "service": "krabs",
+  "service_id": "cc6ea924-0964-4715-aa25-98ec73776706",
+  "deployment_id": "d55f1f1e-33f7-4636-9f5a-43bf98cb6f92",
+  "status": "SUCCESS",
+  "created_at": "2026-09-07T10:34:21.422Z",
+  "source_repo": null,
+  "volume_mount": "/data",
+  "volume_id": "7cf2bc36-f8c9-4bdd-8bcf-6dd8301b273e",
+  "health_mode": "standby",
+  "health_revision": "b7c27b7a37fdac24d740fedf7fe369a663bc292c",
+  "remote_code_digest": "1e8b553ff5b623508762ea70c27a9d4bbc4a364a81c78af2032307f9f2a3bbeb",
+  "remote_config_rows": 0,
+  "remote_position_rows": 0,
+  "container_tests": 41,
+  "container_tests_seconds": 2.358,
+  "container_tests_result": "OK",
+  "other_services": [
+    {
+      "name": "t3-remote",
+      "deployment_id": "650be978-b83c-4d03-8a86-2367b88bb24e",
+      "status": "SUCCESS"
+    },
+    {
+      "name": "t3-local-relay",
+      "deployment_id": "63eca23a-aebd-4084-87e6-48059545321c",
+      "status": "SUCCESS"
+    }
+  ]
+}

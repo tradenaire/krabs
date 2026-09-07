@@ -8,6 +8,7 @@ class Config:
 
     mexc_api_key: str = ""
     mexc_secret: str = ""
+    exchange_provider: str = "mexc"
 
     openrouter_api_key: str = ""
     openrouter_model: str = "x-ai/grok-4-fast:online"
@@ -27,7 +28,8 @@ class Config:
     max_averaging_count: int = 100               # hard cap
     averaging_profit_lock_trigger: float = 0.0   # move SL to profit when PnL ≥ this % (0=off)
     averaging_profit_lock_sl_pct: float = 0.0    # lock SL at this PnL % (e.g. 100 = lock at +100%)
-    margin_emergency_threshold_pct: float = 10.0  # trim 5% positions when avail < X% of free (0=off)
+    margin_emergency_threshold_pct: float = 10.0  # available/free threshold (0=off)
+    margin_emergency_trim_pct: float = 10.0  # separate fraction of contracts to close
 
     # Re-entry
     max_reentry_cycles: int = 3

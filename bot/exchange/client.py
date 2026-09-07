@@ -4,12 +4,58 @@ import logging
 import math
 import time
 import uuid
+from bot import db
+from bot.event_logger import log_event, correlation_id
 import aiohttp
 import ccxt.async_support as ccxt
 
-from bot.event_logger import log_event, log_exception
-
 logger = logging.getLogger(__name__)
+
+
+def _mutation(fn):
+    @functools.wraps(fn)
+    async def wrapped(self, *args, **kwargs):
+        # ponytail: one lock per client; one account/replica is the supported deployment.
+        async with self._mutation_lock:
+            token = correlation_id.set(correlation_id.get() or uuid.uuid4().hex)
+            log_event("mutation_started", operation=fn.__name__, args=args, kwargs=kwargs)
+            try:
+                result = await fn(self, *args, **kwargs)
+                log_event("mutation_returned", operation=fn.__name__, result=result)
+                return result
+            except BaseException as error:
+                log_event("mutation_failed", operation=fn.__name__, error_type=type(error).__name__)
+                raise
+            finally:
+                correlation_id.reset(token)
+    return wrapped
+
+
+def _checked(response: dict) -> dict:
+    if not isinstance(response, dict) or response.get("success") is not True:
+        raise RuntimeError(f"MEXC rejected request: {response.get('code')} {response.get('message', '')}"
+                           if isinstance(response, dict) else "Invalid MEXC response")
+    return response
+
+
+def _protection_matches(order, *, side, trigger, contracts, open_type, price):
+    return (order["side"] == side and order["trigger_type"] == trigger
+            and order["vol"] == contracts and order["open_type"] == open_type
+            and order["order_type"] == 5 and order["trend"] == 1
+            and math.isclose(order["trigger_price"], price, rel_tol=1e-10, abs_tol=1e-12))
+
+
+def _protection_snapshot(pos, record):
+    return {**{k: pos[k] for k in ("position_id", "opened_at_ms", "contracts", "entry_price", "leverage", "side", "margin_mode")},
+            **{k: record[k] for k in ("id", "tp_pct", "sl_pct", "locked_sl")}}
+
+
+def available_margin(balance: dict, currency: str = "USDT") -> float:
+    raw = balance.get("_assets", {}).get(currency, balance.get("_raw", {}) if currency == "USDT" else {})
+    for field in ("availableOpen", "availableBalance"):
+        if raw.get(field) is not None:
+            return float(raw[field])
+    raise ValueError(f"Available futures collateral is unknown for {currency}")
 
 
 def _with_retry(tries: int = 3, base_delay: float = 0.8):
@@ -39,20 +85,25 @@ def _with_retry(tries: int = 3, base_delay: float = 0.8):
 
 
 class _MexcThreadedDNS(ccxt.mexc):
-    """MEXC exchange with ThreadedResolver to avoid aiodns DNS failures on Windows.
-    Session is created lazily inside the running async loop (not in sync context).
+    """MEXC with aiohttp ThreadedResolver to avoid aiodns getaddrinfo
+    failures on Windows (same workaround as the MEXC client). Session is created
+    lazily inside the running loop.
     """
     def __init__(self, config=None):
-        self._session = None  # must exist before parent __init__ calls self.session
+        self._session = None
+        self._closing = False
+        self._closed = False
         super().__init__(config or {})
 
     @property
     def session(self):
         if self._session is None:
+            if self._closing or self._closed:
+                return None
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                return None  # sync context, defer creation
+                return None
             connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver(), ssl=True)
             self._session = aiohttp.ClientSession(connector=connector)
         return self._session
@@ -60,7 +111,22 @@ class _MexcThreadedDNS(ccxt.mexc):
     @session.setter
     def session(self, value):
         self._session = value
+        if value is not None:
+            self._closed = False
 
+    async def close(self):
+        session = self._session
+        self._closing = True
+        try:
+            await super().close()
+        finally:
+            if session and not session.closed:
+                await session.close()
+            if self._session and self._session is not session and not self._session.closed:
+                await self._session.close()
+            self._session = None
+            self._closing = False
+            self._closed = True
 
 class ExchangeClient:
     def __init__(self, api_key: str, secret: str):
@@ -84,13 +150,15 @@ class ExchangeClient:
         })
         self._mark_ticker_cache: dict[str, tuple[float, float]] = {}
         self._mark_ticker_errts: dict[str, float] = {}
+        self._mutation_lock = asyncio.Lock()
 
     def futures_symbol(self, symbol: str) -> str:
-        if ":USDT" in symbol:
+        symbol = symbol.upper().replace("_", "/")
+        if ":" in symbol:
             return symbol
         if "/" not in symbol:
             symbol = f"{symbol}/USDT"
-        return f"{symbol}:USDT"
+        return f"{symbol}:{symbol.split('/')[1]}"
 
     @staticmethod
     def _mexc_contract_symbol(market: dict, fallback_sym: str) -> str:
@@ -112,28 +180,28 @@ class ExchangeClient:
 
     async def get_futures_balance(self) -> dict:
         """Return futures balance using contract API directly (avoids spot auth)."""
-        try:
-            raw = await self._exchange.contractPrivateGetAccountAssets()
-            log_event("exchange", "mexc_raw_response", operation="get_futures_balance", raw=raw)
-        except Exception as e:
-            log_exception("exchange", "mexc_raw_error", e, operation="get_futures_balance")
-            raise
+        raw = _checked(await self._exchange.contractPrivateGetAccountAssets())
         assets = raw.get("data") or []
         usdt = next((a for a in assets if a.get("currency") == "USDT"), {})
-        free = float(usdt.get("availableBalance", 0) or 0)
-        total = float(usdt.get("equity", 0) or 0)
-        margin = float(usdt.get("positionMargin", 0) or 0)
-        frozen = float(usdt.get("frozenBalance", 0) or 0)
-        return {
-            "free": {"USDT": free},
-            "total": {"USDT": total},
-            "used": {"USDT": margin + frozen},
-            "USDT": {"free": free, "total": total, "used": margin + frozen},
-            "_raw": usdt,
-        }
+        result = {"free": {}, "total": {}, "used": {}, "_raw": usdt, "_assets": {}}
+        for asset in assets:
+            currency = asset["currency"]
+            values = {"free": float(asset.get("availableBalance") or 0),
+                      "total": float(asset.get("equity") or 0),
+                      "used": float(asset.get("positionMargin") or 0) + float(asset.get("frozenBalance") or 0)}
+            result[currency] = values
+            result["_assets"][currency] = asset
+            for key, value in values.items():
+                result[key][currency] = value
+        return result
 
     async def get_spot_balance(self) -> dict:
         return await self._spot.fetch_balance()
+
+    async def get_asset_prices(self) -> dict:
+        rows = await self._spot.spotPublicGetTickerPrice()
+        return {r["symbol"][:-4]: float(r["price"]) for r in rows
+                if r["symbol"].endswith("USDT") and float(r["price"]) > 0} | {"USDT": 1.0}
 
     async def transfer_usdt(self, amount: float, direction: str) -> None:
         """Transfer USDT between spot and futures. direction: 's2f' or 'f2s'."""
@@ -163,16 +231,14 @@ class ExchangeClient:
         the API key doesn't have spot permissions.
         """
         try:
-            raw = await self._exchange.contractPrivateGetPositionOpenPositions()
-            log_event("exchange", "mexc_raw_response", operation="get_positions", raw=raw)
+            raw = _checked(await self._exchange.contractPrivateGetPositionOpenPositions())
         except Exception as e:
-            log_exception("exchange", "mexc_raw_error", e, operation="get_positions")
             logger.error("contractPrivateGetPositionOpenPositions failed: %s", e)
             raise
 
         positions = raw.get("data") or []
         if not isinstance(positions, list):
-            positions = []
+            raise RuntimeError("Invalid MEXC positions payload")
 
         _now_ts = time.time()
         result = []
@@ -196,7 +262,7 @@ class ExchangeClient:
             ) if k in p})
 
             mexc_sym = p.get("symbol", "")  # e.g. "BTC_USDT"
-            ccxt_sym = markets_by_id.get(mexc_sym, f"{mexc_sym.replace('_', '/')}/USDT:USDT" if "_" in mexc_sym else mexc_sym)
+            ccxt_sym = markets_by_id.get(mexc_sym, self.futures_symbol(mexc_sym))
 
             # side: 1=long, 2=short
             side_raw = int(p.get("positionType", 1) or 1)
@@ -246,7 +312,7 @@ class ExchangeClient:
 
             pct = (pnl / margin * 100) if margin > 0 else 0.0
 
-            open_type = int(p.get("marginType", 2) or 2)
+            open_type = int(p.get("openType", p.get("marginType", 2)) or 2)
             margin_mode = "isolated" if open_type == 1 else "cross"
 
             result.append({
@@ -262,6 +328,8 @@ class ExchangeClient:
                 "percentage": round(pct, 2),
                 "margin_mode": margin_mode,
                 "position_id": p.get("positionId"),
+                "opened_at_ms": p.get("createTime"),
+                "settle_currency": self._exchange.markets.get(ccxt_sym, {}).get("settle") or ccxt_sym.split(":")[-1],
                 "hold_fee": float(p.get("holdFee", 0) or 0),
                 "hold_avg_price": entry,
             })
@@ -270,10 +338,10 @@ class ExchangeClient:
 
     async def get_position(self, symbol: str) -> dict | None:
         sym = self.futures_symbol(symbol)
-        for p in await self.get_positions():
-            if p["symbol"] == sym:
-                return p
-        return None
+        matches = [p for p in await self.get_positions() if p["symbol"] == sym]
+        if len(matches) > 1:
+            raise ValueError("Multiple hedge positions for this symbol; symbol-only commands refused")
+        return matches[0] if matches else None
 
     # ── Futures orders ────────────────────────────────────────────────
 
@@ -292,15 +360,25 @@ class ExchangeClient:
                 raise RuntimeError(f"MEXC set_leverage rejected: {info.get('message', info)}")
         return result
 
+    @_mutation
     async def place_futures_order(self, symbol: str, side: str, amount_usdt: float,
-                                  leverage: int, margin_mode: str | None = None) -> dict:
-        log_event(
-            "decisions", "place_futures_order_start",
-            symbol=symbol, side=side, amount_usdt=amount_usdt,
-            leverage=leverage, margin_mode=margin_mode,
-        )
+                                  leverage: int, margin_mode: str | None = None,
+                                  expected_position_id: str | None = None) -> dict:
         side = self._normalize_side(side)
         sym = self.futures_symbol(symbol)
+        if not math.isfinite(amount_usdt) or amount_usdt <= 0 or leverage <= 0:
+            raise ValueError("Margin and leverage must be positive")
+        existing = await self.get_position(sym)
+        if expected_position_id is not None:
+            if not existing or str(existing["position_id"]) != str(expected_position_id) or not db.get_managed_position(existing):
+                raise ValueError("Averaging refused: managed position changed")
+            if self._normalize_side(existing["side"]) != side:
+                raise ValueError("Averaging side mismatch")
+        elif existing:
+            raise ValueError("Position already exists; opening must not adopt or average it")
+        pending_key = f"order_uncertain_{sym}"
+        if db.get_config(pending_key):
+            raise RuntimeError("Previous opening outcome unknown; reconcile before retry")
 
         ticker = await self.get_ticker(sym)
         price = float(ticker["last"])
@@ -320,17 +398,12 @@ class ExchangeClient:
         logger.info("Futures order: %s %s contracts=%d lev=%dx margin=$%.2f",
                     side.upper(), sym, contracts, leverage, amount_usdt)
 
-        # Auto-transfer from spot if needed
-        try:
-            fut_bal = await self.get_futures_balance()
-            free = float(fut_bal.get("free", {}).get("USDT", 0) or 0)
-            needed = amount_usdt * 1.1
-            if free < needed:
-                shortfall = needed - free + 0.5
-                logger.info("Auto-transfer $%.2f spot→futures", shortfall)
-                await self._exchange.transfer("USDT", shortfall, "spot", "swap")
-        except Exception as e:
-            logger.warning("Auto-transfer failed: %s", e)
+        fut_bal = await self.get_futures_balance()
+        currency = market.get("settle") or sym.split(":")[-1]
+        if currency != "USDT":
+            raise ValueError("USDT sizing is not supported for non-USDT settled orders")
+        if available_margin(fut_bal, currency) < contracts * contract_size * price / leverage:
+            raise ValueError("Insufficient available futures collateral")
 
         if margin_mode is None:
             try:
@@ -342,15 +415,13 @@ class ExchangeClient:
             margin_mode = "cross"
         open_type = 1 if margin_mode == "isolated" else 2
 
-        try:
-            await self.set_leverage(symbol, leverage, side, open_type=open_type)
-        except Exception as e:
-            logger.warning("set_leverage: %s", e)
+        await self.set_leverage(symbol, leverage, side, open_type=open_type)
 
         mexc_side = 1 if side == "buy" else 3
         mexc_symbol = self._mexc_contract_symbol(market, sym)
 
-        params = {
+        db.set_config(pending_key, "pending")
+        result = await self._exchange.contractPrivatePostOrderSubmit({
             "symbol": mexc_symbol,
             "price": 0,
             "vol": contracts,
@@ -358,36 +429,41 @@ class ExchangeClient:
             "type": 5,
             "openType": open_type,
             "leverage": leverage,
-        }
-        try:
-            result = await self._exchange.contractPrivatePostOrderSubmit(params)
-            log_event("exchange", "mexc_raw_response", operation="place_futures_order", params=params, raw=result)
-        except Exception as e:
-            log_exception("exchange", "mexc_raw_error", e, operation="place_futures_order", params=params)
-            raise
+            "externalOid": "krabs-" + uuid.uuid4().hex,
+        })
 
         if not result.get("success", False):
+            db.set_config(pending_key, "")
             raise RuntimeError(f"MEXC order rejected: {result.get('message', result)}")
 
         order_id = str(result.get("data", ""))
+        details = _checked(await self._exchange.contractPrivateGetOrderGetOrderId({"order_id": order_id}))["data"]
+        position_id = details.get("positionId")
+        if not position_id:
+            raise RuntimeError(f"Order {order_id} accepted; position ID pending, do not repeat opening")
+        if expected_position_id is not None:
+            if str(position_id) != str(expected_position_id):
+                raise RuntimeError("Averaging order attached to an unexpected position; reconciliation required")
+            db.set_config(pending_key, "")
+        else:
+            db.set_config(pending_key, order_id)
         logger.info("MEXC futures order placed: %s (id=%s)", mexc_symbol, order_id)
-        log_event(
-            "decisions", "place_futures_order_result",
-            symbol=sym, side=side, contracts=contracts, price=price,
-            leverage=leverage, margin_mode=margin_mode, order_id=order_id,
-            raw=result,
-        )
         return {"id": order_id, "symbol": sym, "side": side,
                 "amount": contracts, "price": price, "leverage": leverage,
+                "position_id": str(position_id),
                 "margin_mode": margin_mode, "info": result}
 
-    @_with_retry(tries=2, base_delay=1.0)
-    async def partial_close_futures_position(self, symbol: str, contracts: int) -> dict:
+    @_mutation
+    async def partial_close_futures_position(self, symbol: str, contracts: int,
+                                             expected_position_id: str | None = None) -> dict:
         """Close `contracts` contracts of an open position (partial close)."""
         sym = self.futures_symbol(symbol)
         pos = await self.get_position(symbol)
         if not pos:
             raise ValueError(f"No open position for {sym}")
+        record = db.get_managed_position(pos)
+        if not record or str(pos["position_id"]) != str(expected_position_id):
+            raise ValueError("Partial close refused: managed position changed")
 
         side = pos["side"]
         total_contracts = int(round(pos["contracts"]))
@@ -412,24 +488,25 @@ class ExchangeClient:
         if pos_id:
             params["positionId"] = pos_id
 
-        try:
-            result = await self._exchange.contractPrivatePostOrderSubmit(params)
-            log_event("exchange", "mexc_raw_response", operation="partial_close_futures_position", params=params, raw=result)
-        except Exception as e:
-            log_exception("exchange", "mexc_raw_error", e, operation="partial_close_futures_position", params=params)
-            raise
+        result = await self._exchange.contractPrivatePostOrderSubmit(params)
         if not result.get("success", False):
             raise RuntimeError(f"MEXC partial close failed: {result.get('message', result)}")
+        db.save_bot_order(result.get("data"), record["id"], sym, "emergency", order_type="regular", confirmed=True)
 
         logger.info("Partial close: %s %s %d/%d contracts", sym, side, contracts, total_contracts)
         return {"id": str(result.get("data", "")), "symbol": sym,
                 "contracts_closed": contracts, "info": result}
 
-    async def close_futures_position(self, symbol: str) -> dict:
+    @_mutation
+    async def close_futures_position(self, symbol: str, expected_position_id: str | None = None,
+                                     reason: str = "manual") -> dict:
         sym = self.futures_symbol(symbol)
         pos = await self.get_position(symbol)
         if not pos:
             raise ValueError(f"No open position for {sym}")
+        record = db.get_managed_position(pos)
+        if not record or str(pos["position_id"]) != str(expected_position_id):
+            raise ValueError("Close refused: managed position changed")
 
         side = pos["side"]
         contracts = int(round(pos["contracts"]))
@@ -453,297 +530,244 @@ class ExchangeClient:
         if pos_id:
             params["positionId"] = pos_id
 
-        try:
-            result = await self._exchange.contractPrivatePostOrderSubmit(params)
-            log_event("exchange", "mexc_raw_response", operation="close_futures_position", params=params, raw=result)
-        except Exception as e:
-            log_exception("exchange", "mexc_raw_error", e, operation="close_futures_position", params=params)
-            raise
+        with db._connect() as conn:
+            conn.execute("UPDATE positions SET status='closing' WHERE id=?", (record["id"],))
+        result = await self._exchange.contractPrivatePostOrderSubmit(params)
         if not result.get("success", False):
+            with db._connect() as conn:
+                conn.execute("UPDATE positions SET status='open' WHERE id=?", (record["id"],))
             raise RuntimeError(f"MEXC close failed: {result.get('message', result)}")
 
         order_id = str(result.get("data", ""))
-        logger.info("Position closed: %s %s (%d contracts)", sym, side, contracts)
-        return {"id": order_id, "symbol": sym, "status": "closed", "info": result}
+        db.save_bot_order(order_id, record["id"], sym, reason, order_type="regular", confirmed=True)
+        with db._connect() as conn:
+            conn.execute("UPDATE positions SET status='closing' WHERE id=?", (record["id"],))
+        logger.info("Close submitted: %s %s (%d contracts)", sym, side, contracts)
+        return {"id": order_id, "symbol": sym, "status": "submitted", "info": result}
 
     # ── TP/SL ────────────────────────────────────────────────────────
 
-    async def cancel_plan_orders(self, symbol: str) -> None:
-        mexc_sym = self.futures_symbol(symbol).replace("/", "_").replace(":USDT", "")
-        try:
-            r = await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
-            log_event("exchange", "mexc_raw_response", operation="cancel_plan_orders", params={"symbol": mexc_sym}, raw=r)
-            logger.info("cancel_plan_orders(%s): done", symbol)
-        except Exception as e:
-            logger.warning("cancel_plan_orders(%s): %s", symbol, e)
+    async def cancel_plan_orders(self, symbol: str) -> int:
+        return await self.cancel_tp_sl_orders(symbol)
 
-    async def set_tp_sl(self, symbol: str, tp_price: float | None = None,
-                        sl_price: float | None = None,
-                        pos_data: dict | None = None,
-                        sl_limit_price: float | None = None) -> list[dict]:
+    async def _plan_orders(self, symbol: str | None = None, **filters) -> list[dict]:
+        params = {"page_size": 100, **filters}
+        if symbol:
+            params["symbol"] = self.futures_symbol(symbol).split(":")[0].replace("/", "_")
+        orders = []
+        for page in range(1, 101):
+            response = _checked(await self._exchange.contractPrivateGetPlanorderListOrders(
+                {**params, "page_num": page}))
+            data = response.get("data")
+            batch = data.get("resultList", data.get("result_list", [])) if isinstance(data, dict) else data
+            if not isinstance(batch, list):
+                raise RuntimeError("Invalid plan-order list")
+            orders.extend(batch)
+            if len(batch) < 100:
+                return orders
+        raise RuntimeError("Plan-order pagination limit reached; cleanup aborted")
+
+    async def get_tp_sl_orders(self, symbol: str | None = None) -> list[dict]:
+        return [{"id": str(o["id"]), "symbol": self.futures_symbol(o["symbol"]),
+                 "trigger_price": float(o.get("triggerPrice") or 0),
+                 "side": int(o.get("side") or 0), "trigger_type": int(o.get("triggerType") or 0),
+                 "vol": float(o.get("vol") or 0), "open_type": int(o.get("openType") or 0),
+                 "order_type": int(o.get("orderType") or 0), "trend": int(o.get("trend") or 0)}
+                for o in await self._plan_orders(symbol, states="1") if str(o.get("state")) == "1"]
+
+    async def _cancel_owned(self, orders: list[dict]) -> int:
+        for order in orders:
+            _checked(await self._exchange.contractPrivatePostPlanorderCancel([
+                {"symbol": order["symbol"].split(":")[0].replace("/", "_"), "orderId": order["id"]}]))
+        return len(orders)
+
+    @_mutation
+    async def cancel_tp_sl_orders(self, symbol: str, position_key: int | None = None) -> int:
         sym = self.futures_symbol(symbol)
-        log_event(
-            "decisions", "set_tp_sl_start", symbol=sym,
-            tp_price=tp_price, sl_price=sl_price, pos_data=pos_data,
-            sl_limit_price=sl_limit_price,
-        )
+        owned = {o["order_id"] for o in db.get_bot_orders(position_key) if o["symbol"] == sym}
+        active = await self.get_tp_sl_orders(sym)
+        return await self._cancel_owned([o for o in active if o["id"] in owned])
 
-        if pos_data:
-            side = pos_data["side"]
-            contracts = int(round(pos_data["contracts"]))
-            margin_mode = pos_data.get("margin_mode", "isolated")
-        else:
-            pos = await self.get_position(symbol)
-            if not pos:
-                raise ValueError(f"No position for {sym}")
-            side = pos["side"]
-            contracts = int(round(pos["contracts"]))
-            margin_mode = pos.get("margin_mode", "isolated")
-
-        open_type = 2 if margin_mode == "cross" else 1
+    async def audit_protection(self, symbol: str) -> dict:
+        """Read-only audit using the same order checks as protection placement."""
+        pos = await self.get_position(symbol)
+        if not pos:
+            raise ValueError("Open position not found")
+        record = db.get_managed_position(pos)
+        if not record:
+            return {"status": "UNMANAGED", "symbol": pos["symbol"], "position_id": pos["position_id"]}
+        sym, side = pos["symbol"], pos["side"]
+        sign = 1 if side == "long" else -1
+        entry, lev = pos["entry_price"], pos["leverage"]
+        prices = {"TP": entry * (1 + sign * record["tp_pct"] / 100 / lev),
+                  "SL": entry * (1 - sign * record["sl_pct"] / 100 / lev)}
+        if record.get("locked_sl") is not None:
+            prices["SL"] = (max if side == "long" else min)(prices["SL"], record["locked_sl"])
         await self._exchange.load_markets()
-        market = self._exchange.market(sym)
-        mexc_sym = self._mexc_contract_symbol(market, sym)
+        prices = {k: float(self._exchange.price_to_precision(sym, v)) for k, v in prices.items()}
+        active = await self.get_tp_sl_orders(sym)
+        saved = {o["order_id"]: o for o in db.get_bot_orders(record["id"])}
+        legs = {}
+        for kind, trigger in (("TP", 1 if side == "long" else 2), ("SL", 2 if side == "long" else 1)):
+            kinds = ("SL", "profit_lock") if kind == "SL" else ("TP",)
+            legs[kind] = [o["id"] for o in active if o["id"] in saved and saved[o["id"]]["kind"] in kinds
+                          and _protection_matches(o, side=4 if side == "long" else 2,
+                              trigger=trigger, contracts=float(pos["contracts"]),
+                              open_type=2 if pos.get("margin_mode") == "cross" else 1, price=prices[kind])]
+        result = {"status": "CONFIRMED" if all(legs.values()) else "INCOMPLETE", "symbol": sym,
+                  "position_id": pos["position_id"], "prices": prices, "legs": legs,
+                  "snapshot": _protection_snapshot(pos, record)}
+        log_event("protection_audit", **result)
+        return result
+
+    @_mutation
+    async def set_tp_sl(self, symbol: str, tp_price: float | None = None,
+                        sl_price: float | None = None, pos_data: dict | None = None,
+                        sl_limit_price: float | None = None,
+                        profit_lock_step: float | None = None,
+                        expected_snapshot: dict | None = None) -> list[dict]:
+        sym = self.futures_symbol(symbol)
+        pos = await self.get_position(sym)
+        if not pos or (pos_data and str(pos["position_id"]) != str(pos_data.get("position_id"))):
+            raise ValueError("Position changed before protection update")
+        record = db.get_managed_position(pos)
+        if not record:
+            raise ValueError("Position is unmanaged; use /adopt SYMBOL confirm first")
+        if expected_snapshot is not None and expected_snapshot != _protection_snapshot(pos, record):
+            raise ValueError("Position or protection settings changed; request a new repair preview")
+        side = pos["side"]
         close_side = 4 if side == "long" else 2
-
-        # Idempotency check — skip if prices within 0.3% to prevent rapid cancel+replace
-        # that exhausts MEXC plan order quota (err=2009) during fast averaging cycles
-        _SKIP_THRESHOLD = 0.003
-
-        def _within(new_price_set, existing_set):
-            if new_price_set is None:
-                return True  # not being changed
-            if not existing_set:
-                return False  # no existing order — must place
-            ex = next(iter(existing_set))
-            new = next(iter(new_price_set))
-            return ex > 0 and abs(new - ex) / ex < _SKIP_THRESHOLD
-
-        try:
-            existing = await self.get_tp_sl_orders(symbol)
-        except Exception:
-            existing = []
-        if existing:
-            tp_type, sl_type = (1, 2) if side == "long" else (2, 1)
-            existing_tp = {round(float(t.get("trigger_price", 0)), 6)
-                           for t in existing if t.get("trigger_type") == tp_type}
-            existing_sl = {round(float(t.get("trigger_price", 0)), 6)
-                           for t in existing if t.get("trigger_type") == sl_type}
-            want_tp = None if tp_price is None else {round(tp_price, 6)}
-            want_sl = None if sl_price is None else {round(sl_price, 6)}
-            if _within(want_tp, existing_tp) and _within(want_sl, existing_sl):
-                logger.info("set_tp_sl(%s): triggers within %.1f%% threshold, skipping",
-                            sym, _SKIP_THRESHOLD * 100)
-                return [{"type": "skip", "result": {"success": True}}]
-
-        # Cancel all then re-place
-        try:
-            cancel_result = await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
-            log_event("exchange", "mexc_raw_response", operation="set_tp_sl_cancel_all", params={"symbol": mexc_sym}, raw=cancel_result)
-            for _ in range(8):
-                await asyncio.sleep(0.25)
-                try:
-                    still = await self.get_tp_sl_orders(symbol)
-                except Exception:
-                    still = []
-                if not still:
-                    break
-        except Exception as e:
-            logger.warning("cancelAll for %s: %s", mexc_sym, e)
-
-        results = []
-
-        async def _place(kind: str, price: float, trigger_type: int,
-                         exec_price: float = 0) -> dict:
-            last_err: Exception | None = None
-            for attempt in range(3):
-                try:
-                    params = {
-                        "symbol": mexc_sym, "price": exec_price, "vol": contracts,
-                        "side": close_side, "orderType": 5, "openType": open_type,
-                        "triggerPrice": str(price), "triggerType": trigger_type,
-                        "trend": 1, "executeCycle": 2,
-                    }
-                    r = await self._exchange.contractPrivatePostPlanorderPlace(params)
-                    log_event("exchange", "mexc_raw_response", operation=f"set_tp_sl_place_{kind.lower()}", params=params, raw=r)
-                    if isinstance(r, dict) and r.get("success") is False:
-                        raise RuntimeError(f"MEXC {kind} plan rejected: {r.get('message', r)}")
-                    return {"type": kind, "price": price, "result": r}
-                except Exception as e:
-                    last_err = e
-                    msg = str(e).lower()
-                    if not any(x in msg for x in ("510", "too frequent", "timeout", "network")):
-                        break
-                    logger.warning("%s place attempt %d/3 for %s: %s", kind, attempt+1, sym, e)
-                    await asyncio.sleep(0.8 * (attempt + 1))
-            logger.error("%s place FAILED for %s: %s", kind, sym, last_err)
-            if last_err:
-                log_exception("exchange", "mexc_raw_error", last_err, operation=f"set_tp_sl_place_{kind.lower()}", symbol=sym)
-            raise RuntimeError(f"{kind} place failed for {sym}: {last_err}")
-
-        if tp_price:
-            tt = 1 if side == "long" else 2
-            results.append(await _place("TP", tp_price, tt))
-
-        if sl_price:
-            tt = 2 if side == "long" else 1
-            exec_p = round(sl_limit_price, 8) if sl_limit_price else 0
-            results.append(await _place("SL", sl_price, tt, exec_price=exec_p))
-
-        log_event("decisions", "set_tp_sl_result", symbol=sym, results=results)
+        open_type = 2 if pos.get("margin_mode") == "cross" else 1
+        contracts = float(pos["contracts"])
+        if contracts <= 0 or not math.isfinite(contracts):
+            raise ValueError("Invalid position volume")
+        if sl_price is not None and record.get("locked_sl") is not None:
+            sl_price = max(sl_price, record["locked_sl"]) if side == "long" else min(sl_price, record["locked_sl"])
+        await self._exchange.load_markets()
+        mexc_sym = self._mexc_contract_symbol(self._exchange.market(sym), sym)
+        active = await self.get_tp_sl_orders(sym)
+        saved = {o["order_id"]: o for o in db.get_bot_orders(record["id"])}
+        results, errors = [], []
+        # Protect downside first. A TP failure must not undo a confirmed SL.
+        for kind, price, trigger in (("SL", sl_price, 2 if side == "long" else 1),
+                                      ("TP", tp_price, 1 if side == "long" else 2)):
+            if price is None:
+                continue
+            pending_key = f"plan_uncertain_{record['id']}_{kind}"
+            try:
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError(f"Invalid {kind} price")
+                price = float(self._exchange.price_to_precision(sym, price))
+                if price <= 0:
+                    raise ValueError(f"{kind} price rounds to zero")
+                old = [o for o in active if o["id"] in saved and saved[o["id"]]["kind"] in
+                       (("SL", "profit_lock") if kind == "SL" else ("TP",))]
+                def matches(order):
+                    return _protection_matches(order, side=close_side, trigger=trigger,
+                                               contracts=contracts, open_type=open_type, price=price)
+                found = next((o for o in old if matches(o)), None)
+                if not found:
+                    if db.get_config(pending_key):
+                        raise RuntimeError("Previous placement outcome is unknown; reconcile order ID before retry")
+                    db.set_config(pending_key, "pending")
+                    response = await self._exchange.contractPrivatePostPlanorderPlace({
+                        "symbol": mexc_sym, "price": 0, "vol": contracts, "side": close_side,
+                        "orderType": 5, "openType": open_type, "leverage": pos["leverage"],
+                        "triggerPrice": str(price), "triggerType": trigger, "trend": 1, "executeCycle": 2,
+                    })
+                    if response.get("success") is False:
+                        db.set_config(pending_key, "")
+                    _checked(response)
+                    order_id = response.get("data")
+                    if isinstance(order_id, dict):
+                        order_id = order_id.get("orderId") or order_id.get("id")
+                    is_lock = kind == "SL" and (profit_lock_step is not None or record.get("locked_sl") is not None)
+                    db.save_bot_order(order_id, record["id"], sym, "profit_lock" if is_lock else kind, price)
+                    db.set_config(pending_key, "")
+                    for attempt in range(4):
+                        fresh = await self.get_tp_sl_orders(sym)
+                        found = next((o for o in fresh if o["id"] == str(order_id) and matches(o)), None)
+                        if found:
+                            break
+                        await asyncio.sleep(0.25)
+                    if not found:
+                        raise RuntimeError(f"{kind} accepted but active protection not confirmed")
+                lock_price = price if kind == "SL" and (profit_lock_step is not None or record.get("locked_sl") is not None) else None
+                db.confirm_protection(record["id"], found["id"], lock_price, profit_lock_step if kind == "SL" else None)
+                # Replacement is confirmed before cancelling only our obsolete leg(s).
+                await self._cancel_owned([o for o in old if o["id"] != found["id"]])
+                results.append({"type": kind, "price": price, "id": found["id"], "confirmed": True})
+            except Exception as error:
+                errors.append(f"{kind}: {error}")
+        if errors:
+            confirmed = ", ".join(r["type"] for r in results) or "none"
+            raise RuntimeError(f"Protection incomplete (confirmed: {confirmed}); " + "; ".join(errors))
         return results
 
-    async def get_limit_close_orders(self, symbol: str) -> list[dict]:
-        """Return open limit close orders (TP limit orders) for a symbol."""
-        sym = self.futures_symbol(symbol)
-        await self._exchange.load_markets()
-        market = self._exchange.market(sym)
-        mexc_sym = self._mexc_contract_symbol(market, sym)
-        close_sides = {2, 4}
-        try:
-            result = await self._exchange.contractPrivateGetOrderListOpenOrdersSymbol(
-                {"symbol": mexc_sym}
-            )
-            orders = result.get("data") or []
-            return [
-                o for o in orders
-                if int(o.get("side", 0) or 0) in close_sides
-                and int(o.get("type", 0) or 0) == 1
-            ]
-        except Exception as e:
-            logger.warning("get_limit_close_orders(%s): %s", symbol, e)
-            return []
+    async def _history(self, method, symbol: str, opened_at_ms: int) -> list[dict]:
+        rows = []
+        for page in range(1, 101):
+            response = _checked(await method({"symbol": self.futures_symbol(symbol).split(":")[0].replace("/", "_"),
+                "start_time": int(opened_at_ms), "end_time": min(int(time.time()*1000), int(opened_at_ms)+90*86400000),
+                "page_num": page, "page_size": 100}))
+            data = response.get("data")
+            batch = data.get("resultList", data.get("result_list", [])) if isinstance(data, dict) else data
+            if not isinstance(batch, list):
+                raise RuntimeError("Invalid history response")
+            rows.extend(batch)
+            if len(batch) < 100:
+                return rows
+        raise RuntimeError("History pagination incomplete")
 
-    async def _cancel_limit_close_orders(self, symbol: str, mexc_sym: str) -> int:
-        """Cancel open regular limit close orders for a symbol (used as TP limit orders)."""
-        close_sides = {2, 4}
-        try:
-            result = await self._exchange.contractPrivateGetOrderListOpenOrdersSymbol(
-                {"symbol": mexc_sym}
-            )
-            orders = result.get("data") or []
-            cancelled = 0
-            for o in orders:
-                side_val = int(o.get("side", 0) or 0)
-                order_type = int(o.get("type", 0) or 0)
-                if side_val not in close_sides or order_type != 1:
-                    continue
-                order_id = o.get("orderId") or o.get("id")
-                if not order_id:
-                    continue
-                try:
-                    await self._exchange.contractPrivatePostOrderCancel({"orderId": str(order_id)})
-                    cancelled += 1
-                    logger.info("Cancelled TP limit order %s for %s", order_id, symbol)
-                except Exception as e:
-                    logger.warning("cancel TP limit %s for %s: %s", order_id, symbol, e)
-            return cancelled
-        except Exception as e:
-            logger.warning("_cancel_limit_close_orders(%s): %s", symbol, e)
-            return 0
-
-    async def was_closed_by_tp(self, symbol: str, pos_side: str,
-                               opened_at_ms: int | None = None) -> tuple[bool | None, float | None]:
-        """Check recent executed plan orders to determine if position closed by TP.
-        Returns (is_tp, trigger_price): True/False/None, and the price that fired."""
-        try:
-            sym = self.futures_symbol(symbol)
-            await self._exchange.load_markets()
-            market = self._exchange.market(sym)
-            mexc_sym = self._mexc_contract_symbol(market, sym)
-            result = await self._exchange.contractPrivateGetPlanorderListOrders(
-                {"symbol": mexc_sym, "page_size": 10, "page_num": 1}
-            )
-            log_event("exchange", "mexc_raw_response", operation="was_closed_by_tp", params={"symbol": mexc_sym}, raw=result)
-            data = result.get("data") or {}
-            orders = (data.get("resultList") or data.get("result_list") or []) \
-                if isinstance(data, dict) else (data or [])
-            executed = [
-                o for o in orders
-                if int(o.get("state", 0) or 0) == 3
-                and (opened_at_ms is None
-                     or int(o.get("createTime", 0) or 0) >= opened_at_ms)
-            ]
-            if not executed:
-                return None, None
-            latest = max(executed, key=lambda o: int(o.get("createTime", 0) or 0))
-            trigger_type = int(latest.get("triggerType", 0) or 0)
-            trigger_price = float(latest.get("triggerPrice", 0) or 0) or None
-            # For short: TP=triggerType 2 (price ≤), SL=triggerType 1 (price ≥)
-            # For long:  TP=triggerType 1 (price ≥), SL=triggerType 2 (price ≤)
-            tp_type = 1 if pos_side == "long" else 2
-            return trigger_type == tp_type, trigger_price
-        except Exception as e:
-            logger.warning("was_closed_by_tp(%s): %s", symbol, e)
-            return None, None
-
-    @_with_retry()
-    async def get_tp_sl_orders(self, symbol: str | None = None) -> list[dict]:
-        # state=1 → not yet triggered (active). No states filter = all statuses.
-        # We fetch without state filter and return only active (state==1) orders.
-        base_params = {"page_size": 100, "page_num": 1}
-        if symbol:
-            sym = self.futures_symbol(symbol)
-            await self._exchange.load_markets()
-            market = self._exchange.market(sym)
-            base_params["symbol"] = self._mexc_contract_symbol(market, sym)
-
-        parsed: list[dict] = []
-        page_num = 1
-        while True:
-            params = dict(base_params)
-            params["page_num"] = page_num
-            result = await self._exchange.contractPrivateGetPlanorderListOrders(params)
-            log_event("exchange", "mexc_raw_response", operation="get_tp_sl_orders", params=params, raw=result)
-            data = result.get("data")
-            orders = (data.get("resultList") or data.get("result_list") or []) \
-                if isinstance(data, dict) else (data or [])
-            if not orders:
-                break
-            for o in orders:
-                state = o.get("state")
-                if state not in (1, "1"):  # only active (not-yet-triggered) orders
-                    continue
-                parsed.append({
-                    "id": o.get("id"),
-                    "symbol": o.get("symbol", ""),
-                    "trigger_price": float(o.get("triggerPrice", 0) or 0),
-                    "side": int(o.get("side", 0) or 0),
-                    "trigger_type": int(o.get("triggerType", 0) or 0),
-                    "state": state,
-                })
-            if len(orders) < 100:
-                break
-            page_num += 1
-            if page_num > 20:
-                break
-        return parsed
-
-    async def cancel_tp_sl_orders(self, symbol: str) -> int:
-        """Cancel all active plan (TP/SL trigger) orders for a symbol. Returns count cancelled."""
-        sym = self.futures_symbol(symbol)
-        try:
-            await self._exchange.load_markets()
-            market = self._exchange.market(sym)
-            mexc_sym = self._mexc_contract_symbol(market, sym)
-        except Exception:
-            mexc_sym = sym.replace("/", "_").replace(":USDT", "")
-
-        before = await self.get_tp_sl_orders()
-        before_count = sum(1 for o in before if o.get("symbol", "") == mexc_sym)
-
-        try:
-            result = await self._exchange.contractPrivatePostPlanorderCancelAll({"symbol": mexc_sym})
-            log_event("exchange", "mexc_raw_response", operation="cancel_tp_sl_orders", params={"symbol": mexc_sym}, raw=result)
-            logger.info("cancel_tp_sl_orders %s: CancelAll sent (had %d orders)", symbol, before_count)
-        except Exception as e:
-            if "1001" in str(e):
-                logger.debug("cancel_tp_sl_orders %s: 1001 (no orders / transient) — skipped", symbol)
-                return 0
-            logger.warning("cancel_tp_sl_orders %s: CancelAll failed: %s", symbol, e)
-            return 0
-
-        return before_count
+    async def get_closed_position_result(self, record: dict) -> dict | None:
+        import datetime as dt
+        pid, opened = record.get("exchange_position_id"), record.get("opened_at_ms")
+        if not pid or not opened:
+            return None
+        positions = await self._history(self._exchange.contractPrivateGetPositionListHistoryPositions, record["symbol"], opened)
+        closed = next((p for p in positions if str(p.get("positionId")) == pid
+                       and self.futures_symbol(p["symbol"]) == record["symbol"]
+                       and int(p.get("positionType") or 0) == (1 if record["side"] == "long" else 2)
+                       and str(p.get("state")) == "3" and int(p.get("createTime") or 0) == int(opened)), None)
+        if closed is None:
+            return None
+        closed_ms = int(closed.get("updateTime") or 0)
+        if closed_ms < int(opened):
+            return None
+        orders = await self._history(self._exchange.contractPrivateGetOrderListHistoryOrders, record["symbol"], opened)
+        fills = [o for o in orders if str(o.get("positionId")) == pid
+                 and self.futures_symbol(o["symbol"]) == record["symbol"]
+                 and int(o.get("side") or 0) == (4 if record["side"] == "long" else 2)
+                 and float(o.get("dealVol") or 0) > 0 and float(o.get("dealAvgPrice") or 0) > 0
+                 and int(opened) <= int(o.get("updateTime") or 0) <= closed_ms]
+        reason = "unknown"
+        last_time = max((int(o.get("updateTime") or 0) for o in fills), default=0)
+        latest = [o for o in fills if int(o.get("updateTime") or 0) == last_time]
+        if len(latest) == 1:
+            last = latest[0]
+            category = int(last.get("category") or 0)
+            if category == 2:
+                reason = "liquidation"
+            elif category == 4:
+                reason = "adl"
+            else:
+                regular = {o["order_id"]: o for o in db.get_bot_orders(record["id"], "regular")}
+                if str(last["orderId"]) in regular:
+                    reason = regular[str(last["orderId"])]["kind"]
+                else:
+                    plans = await self._plan_orders(record["symbol"], start_time=int(opened),
+                                                  end_time=closed_ms)
+                    saved = {o["order_id"]: o for o in db.get_bot_orders(record["id"])}
+                    plan = next((o for o in plans if str(o.get("orderId")) == str(last["orderId"])
+                                 and str(o.get("state")) == "3" and str(o.get("id")) in saved), None)
+                    if plan:
+                        reason = saved[str(plan["id"])]["kind"].lower()
+        # Exchange position realised is the metric; never add fees/funding to it again.
+        pnl = float(closed["realised"]) if closed.get("realised") is not None else None
+        price = float(closed["closeAvgPrice"]) if closed.get("closeAvgPrice") else None
+        return {"reason": reason, "pnl": pnl, "exit_price": price,
+                "closed_at": dt.datetime.fromtimestamp(closed_ms / 1000, dt.timezone.utc).isoformat(),
+                "order_ids": [str(o["orderId"]) for o in fills]}
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -811,11 +835,7 @@ class ExchangeClient:
             return 0.0
 
     async def get_free_futures_balance(self) -> float:
-        try:
-            bal = await self.get_futures_balance()
-            return float(bal["free"]["USDT"])
-        except Exception:
-            return 0.0
+        return available_margin(await self.get_futures_balance())
 
     async def get_funding_rate(self, symbol: str) -> dict:
         """Return current funding rate for symbol.

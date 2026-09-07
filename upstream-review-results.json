@@ -1,0 +1,20 @@
+{
+  "main_syntax": {
+    "status": "PASS",
+    "files": 27
+  },
+  "BinanceTest_syntax": {
+    "status": "PASS",
+    "files": 94
+  },
+  "main_incorrect_close_side_zero_volume_accepted": "REPRODUCED",
+  "main_unknown_close_inferred_as_tp_from_ticker": "REPRODUCED",
+  "main_zero_available_replaced_by_free": "REPRODUCED",
+  "BinanceTest_unknown_close_inferred_as_tp_from_ticker": "REPRODUCED",
+  "BinanceTest_zero_available_replaced_by_free": "REPRODUCED",
+  "main_eth_asset_dropped": "REPRODUCED",
+  "BinanceTest_selected_tests": {
+    "exit_code": 0,
+    "output": "test_classifies_db_missing_and_duplicate (tests.test_protection_audit.ProtectionAuditTests.test_classifies_db_missing_and_duplicate) ... ok\ntest_classifies_missing_partial_single_and_ladder_protection (tests.test_protection_audit.ProtectionAuditTests.test_classifies_missing_partial_single_and_ladder_protection) ... ok\ntest_summary_line_is_specific (tests.test_protection_audit.ProtectionAuditTests.test_summary_line_is_specific) ... ok\ntest_accepts_three_long_tps_and_one_sl_on_correct_sides (tests.test_tpsl_validation.TpslValidationTests.test_accepts_three_long_tps_and_one_sl_on_correct_sides) ... ok\ntest_rejects_long_tp_below_or_equal_reference (tests.test_tpsl_validation.TpslValidationTests.test_rejects_long_tp_below_or_equal_reference) ... ok\ntest_rejects_negative_long_sl_before_exchange_call (tests.test_tpsl_validation.TpslValidationTests.test_rejects_negative_long_sl_before_exchange_call) ... ok\ntest_fails_when_exchange_has_no_orders (tests.test_tpsl_validation.TpslVerificationTests.test_fails_when_exchange_has_no_orders) ... ok\ntest_requires_exact_three_tps_and_one_sl (tests.test_tpsl_validation.TpslVerificationTests.test_requires_exact_three_tps_and_one_sl) ... ok\n\n----------------------------------------------------------------------\nRan 8 tests in 0.131s\n\nOK\n"
+  }
+}

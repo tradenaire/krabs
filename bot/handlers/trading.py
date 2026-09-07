@@ -2,10 +2,9 @@
 import asyncio
 import json
 import logging
+import math
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-
-from bot.event_logger import log_event, snapshot_exchange_state
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +42,13 @@ def _funding_warning(rate: float, margin: float) -> str:
 def _calc_tp_price(entry: float, leverage: int, tp_pct: float, side: str) -> float:
     """entry + leverage move that gives tp_pct PnL on margin."""
     move = entry * tp_pct / 100 / leverage
-    return entry - move if side == "short" else entry + move
+    return entry - move if side in ("short", "sell") else entry + move
 
 
 def _calc_sl_price(entry: float, leverage: int, sl_pct: float, side: str) -> float:
     """entry + leverage move that gives -sl_pct PnL on margin."""
     move = entry * sl_pct / 100 / leverage
-    return entry + move if side == "short" else entry - move
+    return entry + move if side in ("short", "sell") else entry - move
 
 
 def _max_leverage_by_vol(vol_24h_usdt: float) -> int:
@@ -71,21 +70,12 @@ class MinOrderUpgradeNeeded(Exception):
 async def execute_open(client, app, symbol: str, side: str,
                        margin: float, leverage: int | None = None,
                        tp_pct: float = 500, sl_pct: float = 500,
-                       interactive: bool = False) -> dict:
+                       interactive: bool = False, cycle_count: int = 0) -> dict:
     """Open a futures position with TP/SL and register re-entry.
 
     interactive=True: raises MinOrderUpgradeNeeded instead of silently upgrading margin.
     """
     config = app.bot_data.get("config")
-    log_event(
-        "decisions", "execute_open_start", symbol=symbol, side=side,
-        requested_margin=margin, requested_leverage=leverage,
-        tp_pct=tp_pct, sl_pct=sl_pct, interactive=interactive,
-    )
-    await snapshot_exchange_state(
-        client, "before_open", symbol=symbol, requested_side=side,
-        requested_margin=margin, requested_leverage=leverage,
-    )
 
     user_set = leverage is not None and leverage > 0
 
@@ -149,92 +139,47 @@ async def execute_open(client, app, symbol: str, side: str,
 
     order = await client.place_futures_order(symbol, side, margin, leverage)
     actual_lev = order.get("leverage", leverage) or leverage
-    log_event("decisions", "execute_open_order_result", symbol=symbol, order=order)
 
-    # Wait for MEXC to settle the position
-    await asyncio.sleep(2)
-    pos = await client.get_position(symbol)
-    await snapshot_exchange_state(client, "after_open_order", symbol=symbol, order=order)
-
-    tp_price = sl_price = None
-    entry = order.get("price", 0)
-    liq = 0
-
-    if pos:
-        entry = pos["entry_price"]
-        liq = pos.get("liquidation_price", 0)
-        pos_side = pos["side"]
-        tp_price = _calc_tp_price(entry, actual_lev, tp_pct, pos_side)
-        sl_price = _calc_sl_price(entry, actual_lev, sl_pct, pos_side)
-        try:
-            await snapshot_exchange_state(
-                client, "before_tpsl_set", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price,
-            )
-            await client.cancel_tp_sl_orders(symbol)
-            await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price)
-            await snapshot_exchange_state(
-                client, "after_tpsl_set", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price,
-            )
-        except Exception as e:
-            log_event(
-                "errors", "execute_open_tpsl_failed", symbol=symbol,
-                tp_price=tp_price, sl_price=sl_price, error=str(e),
-            )
-            logger.warning("TP/SL set failed for %s: %s", symbol, e)
-
-    # Persist in DB
     from bot import db as db_mod
-    fsym = client.futures_symbol(symbol)
-    max_avg_count = int(getattr(config, "max_averaging_count", 100)) if config else 100
-    avg_amount = float(getattr(config, "averaging_amount", 0.5)) if config else 0.5
-    budget = max_avg_count * avg_amount
-    db_mod.upsert_position(
-        symbol=fsym, side=side if side in ("long", "short") else ("short" if side == "sell" else "long"),
-        entry_price=entry, leverage=actual_lev, margin=margin,
-        tp_pct=tp_pct, sl_pct=sl_pct, budget=budget,
-    )
-
-    # Log to stats
-    db_mod.log_trade(fsym, "open", amount=margin, note=f"lev={actual_lev}")
-
-    # Full position history
-    hist_side = "short" if side == "sell" else "long"
-    db_mod.open_position_history(
-        fsym, hist_side, actual_lev, entry, margin,
-        tp_pct=tp_pct, sl_pct=sl_pct,
-        avg_threshold=float(getattr(config, "averaging_threshold", -100)) if config else -100,
-        avg_amount=float(getattr(config, "averaging_amount", 0)) if config else 0,
-        avg_budget=budget,
-        avg_max_count=max_avg_count,
-        avg_interval=int(getattr(config, "averaging_interval", 0)) if config else 0,
-    )
-
-    # Register re-entry (skip if disabled)
-    max_cycles = int(getattr(config, "max_reentry_cycles", 3)) if config else 3
-    if max_cycles == 0:
-        db_mod.delete_reentry(fsym)
+    from bot.lifecycle import register_position, reset_runtime
+    pos = None
+    for _ in range(5):
+        await asyncio.sleep(0.4)
+        pos = await client.get_position(symbol)
+        if pos and str(pos["position_id"]) == str(order["position_id"]):
+            break
+    if not pos or str(pos["position_id"]) != str(order["position_id"]):
+        raise RuntimeError(f"Order {order['id']} accepted; matching position not confirmed. Do not repeat opening.")
+    entry, actual_lev = pos["entry_price"], pos["leverage"]
+    liq = pos.get("liquidation_price", 0)
+    fsym = pos["symbol"]
+    record = register_position(pos, config, tp_pct=tp_pct, sl_pct=sl_pct)
+    db_mod.set_config(f"order_uncertain_{fsym}", "")
+    reset_runtime(app, fsym)
+    db_mod.log_trade(fsym, "open", amount=pos["margin"], note=f"lev={actual_lev}")
+    max_cycles = int(config.max_reentry_cycles)
+    if max_cycles > 0:
+        db_mod.upsert_reentry(fsym, pos["side"], margin, actual_lev, tp_pct, sl_pct,
+                             max_cycles=max_cycles, cycle_count=cycle_count, position_key=record["id"])
     else:
-        db_mod.upsert_reentry(
-            symbol=fsym,
-            side=side,
-            margin=margin,
-            leverage=actual_lev,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            max_cycles=max_cycles,
-            cycle_count=0,
-        )
+        db_mod.delete_reentry(fsym)
+    tp_price = sl_price = 0.0
+    protection_status = "не подтверждена"
+    try:
+        protections = await client.set_tp_sl(symbol,
+            tp_price=_calc_tp_price(entry, actual_lev, tp_pct, pos["side"]),
+            sl_price=_calc_sl_price(entry, actual_lev, sl_pct, pos["side"]), pos_data=pos)
+        prices = {r["type"]: r["price"] for r in protections}
+        tp_price, sl_price = prices["TP"], prices["SL"]
+        protection_status = "TP и SL подтверждены"
+    except Exception as error:
+        from bot.jobs.main import _notify_all
+        await _notify_all(app, f"⚠️ {fsym}: позиция открыта, защита НЕ подтверждена: {error}")
+        logger.error("Opened position %s without confirmed protection: %s", fsym, error)
 
     # Store tp_sl_pcts for averaging recalc
     tp_sl_pcts = app.bot_data.setdefault("tp_sl_pcts", {})
     tp_sl_pcts[fsym] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
-    log_event(
-        "decisions", "execute_open_persisted", symbol=fsym,
-        entry_price=entry, leverage=actual_lev, margin=margin,
-        tp_price=tp_price, sl_price=sl_price, tp_pct=tp_pct, sl_pct=sl_pct,
-    )
 
     return {
         "symbol": symbol,
@@ -242,6 +187,7 @@ async def execute_open(client, app, symbol: str, side: str,
         "margin": margin,
         "leverage": actual_lev,
         "entry_price": entry,
+        "protection_status": protection_status,
         "tp_price": tp_price,
         "sl_price": sl_price,
         "liquidation_price": liq,
@@ -322,7 +268,7 @@ async def short_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.get("tp_price"):
             lines.append(f"✅ TP: `{result['tp_price']:.6g}` (+{tp_pct:.0f}%)")
         if result.get("sl_price"):
-            lines.append(f"🛑 SL: `-{sl_pct:.0f}%` (`{result['sl_price']:.6g}`)")
+            lines.append(f"🛑 SL: `{result['sl_price']:.6g}` (-{sl_pct:.0f}%)")
         lines.append(_funding_line(rate, result["leverage"]))
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
@@ -356,49 +302,22 @@ async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _do_close(client, context, symbol: str, keep_reentry: bool):
-    """Shared close logic. Returns (coin, pnl, cycles_left_or_none)."""
     from bot import db as db_mod
     pos = await client.get_position(symbol)
-    pnl = float(pos.get("unrealized_pnl", 0)) if pos else 0.0
-    margin = float(pos.get("margin", 0)) if pos else 0.0
-    exit_price = float(pos.get("mark_price", 0)) if pos else 0.0
-
-    if keep_reentry:
-        # Ensure reentry record exists before closing DB position
-        re_rec = db_mod.get_reentry(symbol)
-        if not re_rec:
-            db_rec = db_mod.get_open_position(symbol)
-            config = context.bot_data.get("config")
-            max_cycles = int(getattr(config, "max_reentry_cycles", 3)) if config else 3
-            if db_rec and max_cycles > 0:
-                db_mod.upsert_reentry(
-                    symbol=symbol,
-                    side="sell" if db_rec.get("side") == "short" else "buy",
-                    margin=margin or float(db_rec.get("margin", 0.2)),
-                    leverage=int(db_rec.get("leverage", 1)),
-                    tp_pct=float(db_rec.get("tp_pct", 500)),
-                    sl_pct=float(db_rec.get("sl_pct", 500)),
-                    max_cycles=max_cycles,
-                )
-
-    await client.cancel_tp_sl_orders(symbol)
-    await client.close_futures_position(symbol)
-    db_mod.close_position(symbol)
-    note = "manual_reentry" if keep_reentry else "manual"
-    db_mod.log_trade(symbol, "close", amount=margin, pnl=pnl, note=note)
-    db_mod.close_position_history(symbol, exit_price, pnl, note)
-
+    record = db_mod.get_managed_position(pos) if pos else None
+    if not record:
+        raise ValueError("Position is unmanaged or changed; /adopt SYMBOL first")
     if not keep_reentry:
         db_mod.delete_reentry(symbol)
-        return pnl, None
-
-    re_rec = db_mod.get_reentry(symbol)
-    cycles_left = 0
-    if re_rec:
-        mc = re_rec.get("max_cycles") or 0
-        cc = re_rec.get("cycle_count") or 0
-        cycles_left = max(0, int(mc) - int(cc))
-    return pnl, cycles_left
+    elif not db_mod.get_reentry(symbol):
+        config = context.bot_data["config"]
+        db_mod.upsert_reentry(symbol, pos["side"], pos["margin"], pos["leverage"],
+            record["tp_pct"], record["sl_pct"], max_cycles=config.max_reentry_cycles,
+            position_key=record["id"])
+    await client.close_futures_position(symbol, expected_position_id=pos["position_id"],
+        reason="manual_reentry" if keep_reentry else "manual")
+    # Submission is not execution. Reconciliation writes the result when history confirms it.
+    return None, None
 
 
 async def close_reentry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -410,10 +329,10 @@ async def close_reentry_callback(update: Update, context: ContextTypes.DEFAULT_T
     coin = symbol.split("/")[0]
     try:
         pnl, cycles_left = await _do_close(client, context, symbol, keep_reentry=True)
-        pnl_s = f"`{pnl:+.2f}$`" if pnl != 0 else ""
+        pnl_s = "PnL ожидает исполнения"
         await q.edit_message_text(
-            f"✅ *{coin}* закрыт{(' ' + pnl_s) if pnl_s else ''}\n"
-            f"🔄 Перезаход через ~30с (осталось: {cycles_left})",
+            f"Ордер закрытия *{coin}* отправлен{(' ' + pnl_s) if pnl_s else ''}\n"
+            "Перезаход — после подтверждения исполнения и проверки циклов",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -429,8 +348,8 @@ async def close_final_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     coin = symbol.split("/")[0]
     try:
         pnl, _ = await _do_close(client, context, symbol, keep_reentry=False)
-        pnl_s = f" `{pnl:+.2f}$`" if pnl != 0 else ""
-        await q.edit_message_text(f"✅ *{coin}* закрыт{pnl_s}.", parse_mode="Markdown")
+        pnl_s = " PnL ожидает исполнения"
+        await q.edit_message_text(f"Ордер закрытия *{coin}* отправлен{pnl_s}.", parse_mode="Markdown")
     except Exception as e:
         await q.edit_message_text(f"❌ Ошибка: {e}")
 
@@ -457,7 +376,8 @@ AVG_WIZARD_STEPS = [
     (7,  "maxavg",    "max_averaging_count",           int,   "Макс",            "#"),
     (8,  "interval",  "averaging_interval",            int,   "Интервал",        "s"),
     (10, "scan_cap",        "auto_scan_capital_pct",            float, "Авто-капитал",    "%"),
-    (15, "margin_emergency", "margin_emergency_threshold_pct",  float, "Аварийное закрытие", "%"),
+    (15, "margin_emergency", "margin_emergency_threshold_pct", float, "Порог доступной маржи", "%"),
+    (16, "margin_trim", "margin_emergency_trim_pct", float, "Размер сокращения", "%"),
 ]
 # Legacy steps not in numbered list (kept for backward compat):
 # ("reentry",      "max_reentry_cycles",              int,   "Перезаходов макс",  "#"),
@@ -578,6 +498,13 @@ def _parse_numbers(text: str) -> list[float]:
     return [float(p) for p in parts]
 
 
+def _validate_margin_setting(attr, value):
+    if attr in ("margin_emergency_threshold_pct", "margin_emergency_trim_pct"):
+        minimum = 0 if attr == "margin_emergency_threshold_pct" else 0.000001
+        if not math.isfinite(value) or not minimum <= value <= 100:
+            raise ValueError("Порог: 0–100%; размер сокращения: больше 0 и не более 100%")
+
+
 async def apply_avg_pending_value(context: ContextTypes.DEFAULT_TYPE,
                                   pending: dict, text: str) -> str:
     config = context.bot_data["config"]
@@ -588,6 +515,7 @@ async def apply_avg_pending_value(context: ContextTypes.DEFAULT_TYPE,
         cast = {"float": float, "int": int}.get(pending["cast"], float)
         raw = text.replace(",", ".").strip()
         val = cast(float(raw)) if cast is int else cast(raw)
+        _validate_margin_setting(pending["attr"], val)
         setattr(config, pending["attr"], val)
         db_mod.set_config(pending["attr"], str(val))
 
@@ -741,11 +669,12 @@ def _build_avg_text(config, free_balance: float | None = None, open_count: int =
         f"8. Интервал: `{config.averaging_interval}s`",
         lock_line,
         scan_risk_line,
-        f"15. Аварийное закрытие: `{float(getattr(config, 'margin_emergency_threshold_pct', 0)):.0f}%`"
+        f"15. Порог доступной маржи: `{float(getattr(config, 'margin_emergency_threshold_pct', 0)):.0f}%`"
         + (" _(выкл)_" if not float(getattr(config, 'margin_emergency_threshold_pct', 0)) else
-           " _(avail < X% free → закрыть 10% поз, пауза 5м)_"),
+           " _(доступно < X% свободного или доступно ≤ 0)_"),
+        f"16. Размер сокращения: `{config.margin_emergency_trim_pct:g}%` контрактов",
         "",
-        "_Напиши номер `1`-`15`, чтобы изменить конкретный пункт._",
+        "_Напиши номер `1`-`16`, чтобы изменить конкретный пункт._",
     ]
     dyn = _load_avg_dynamic_rules()
     lines.append("")
@@ -837,6 +766,8 @@ async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "lock_trigger": ("averaging_profit_lock_trigger", float),
         "lock_sl":      ("averaging_profit_lock_sl_pct", float),
         "scan_cap":     ("auto_scan_capital_pct", float),
+        "margin_emergency": ("margin_emergency_threshold_pct", float),
+        "margin_trim": ("margin_emergency_trim_pct", float),
     }
     if param not in field_map:
         await update.message.reply_text(
@@ -847,6 +778,7 @@ async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     attr, cast = field_map[param]
+    _validate_margin_setting(attr, cast(val))
     setattr(config, attr, cast(val))
     from bot import db as db_mod
     db_mod.set_config(attr, str(val))
@@ -882,6 +814,8 @@ async def _reapply_tpsl_all(app, config) -> None:
     except Exception:
         return
     for pos in positions:
+        if not db_mod.get_managed_position(pos):
+            continue
         symbol = pos["symbol"]
         entry = float(pos.get("entry_price", 0) or 0)
         lev = int(pos.get("leverage", 1) or 1)
@@ -891,7 +825,6 @@ async def _reapply_tpsl_all(app, config) -> None:
         tp_price = _calc_tp_price(entry, lev, tp_pct, side)
         sl_price = _calc_sl_price(entry, lev, sl_pct, side)
         try:
-            await client.cancel_tp_sl_orders(symbol)
             await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price, pos_data=pos)
             tp_sl_pcts[symbol] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
             db_mod.update_position_tpsl(symbol, tp_pct, sl_pct)
@@ -1084,7 +1017,10 @@ async def setkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             setattr(config, key, value)
     except Exception:
         setattr(config, key, value)
-    await update.message.reply_text(f"✅ Сохранено: `{key}` = `{value}`", parse_mode="Markdown")
+    from bot.event_logger import configure_audit, sanitize
+    configure_audit(config)
+    displayed = sanitize({key: value})[key]
+    await update.message.reply_text(f"✅ Сохранено: {key} = {displayed}")
 
 
 async def min_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1123,7 +1059,7 @@ async def min_open_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.get("tp_price"):
             lines.append(f"✅ TP: `{result['tp_price']:.6g}` (+{pending['tp_pct']:.0f}%)")
         if result.get("sl_price"):
-            lines.append(f"🛑 SL: `-{pending['sl_pct']:.0f}%` (`{result['sl_price']:.6g}`)")
+            lines.append(f"🛑 SL: `{result['sl_price']:.6g}` (-{pending['sl_pct']:.0f}%)")
         await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка: {e}")
