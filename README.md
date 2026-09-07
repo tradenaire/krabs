@@ -16,7 +16,7 @@ Set these private environment variables in Railway; never commit their values:
 - `KRABS_DATA_DIR=/data` (mount a persistent volume here)
 - `AUTO_SCAN_ENABLED=false` (current deployment setting)
 
-The active deployment was uploaded with Railway CLI; this repository is not automatically linked to that service. Pushes alone do not replace its running deployment.
+Railway `t3-remote / krabs` is connected directly to `tradenaire/krabs`, branch `main`, and builds this repository. Automatic deployments on push still require the project's Railway GitHub integration to have access to this repository; until then, explicitly deploy the latest main commit from Railway. Do not upload a local folder with `railway up`.
 
 ## Validation and limits
 
