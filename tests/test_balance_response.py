@@ -22,13 +22,29 @@ class BalanceResponseTests(unittest.IsolatedAsyncioTestCase):
             get_futures_balance=lambda: request('futures', {'total': {'USDT': 10}}),
             get_spot_balance=lambda: request('spot', {'total': {'USDT': 5}}),
             get_positions=lambda: request('positions', []),
-            get_asset_prices=lambda: request('prices', {'USDT': 1}))
+            get_asset_prices=lambda: request('prices', {'USDT': 1}),
+            get_futures_margin_summary=AsyncMock(return_value={'mode': 'single'}))
         with patch('bot.db.get_all_reentry', return_value=[]), patch('bot.db.get_daily_stats', return_value={}):
             result = await _fetch_all(client, SimpleNamespace(bot_data={}))
         text = _build_balance_text(*result)
         self.assertIn('Всего: ≈ 15.00 USDT', text)
         self.assertLess(len(text), 450)
         self.assertNotIn('Монеты', text)
+
+    async def test_margin_summary_failure_does_not_hide_the_balance_or_report_zero(self):
+        client = SimpleNamespace(
+            get_futures_balance=AsyncMock(return_value={'total': {'USDT': 10},
+                '_raw': {'availableOpen': 0}}),
+            get_spot_balance=AsyncMock(return_value={'total': {'USDT': 5}}),
+            get_positions=AsyncMock(return_value=[]),
+            get_asset_prices=AsyncMock(return_value={'USDT': 1}),
+            get_futures_margin_summary=AsyncMock(side_effect=RuntimeError('unavailable')))
+        with patch('bot.db.get_all_reentry', return_value=[]), patch('bot.db.get_daily_stats', return_value={}):
+            result = await _fetch_all(client, SimpleNamespace(bot_data={}))
+        text = _build_balance_text(*result)
+        self.assertIn('Всего: ≈ 15.00 USDT', text)
+        self.assertIn('Доступная маржа MEXC: нет данных', text)
+        self.assertNotIn('0.0000 USDT', text)
 
     async def test_typing_starts_during_fetch_and_stops_on_error(self):
         entered = asyncio.Event()
