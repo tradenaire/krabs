@@ -35,17 +35,25 @@ def _build_balance_text(futures_raw: dict, positions: list[dict],
         "Всего: " + (_value_assets({"total": combined}, prices) if spot_raw is not None else "нет данных спота"),
         "Фьючерсы: " + _value_assets({"total": net}, prices),
         "Спот: " + (_value_assets(spot_raw, prices) if spot_raw is not None else "нет данных")]
+    margin_summary = futures_raw.get("_margin_summary")
+    shared_margin = margin_summary and margin_summary["mode"] == "multi"
     contributions = [a.get("contributeMarginAmount") for a in assets.values()]
-    if contributions and all(v is not None for v in contributions):
+    if shared_margin:
+        lines.append(f"Обеспечение MEXC: {margin_summary['collateral']:.2f} {margin_summary['currency']}")
+    elif contributions and all(v is not None for v in contributions):
         lines.append(f"Обеспечение MEXC: {sum(float(v) for v in contributions):.2f} USDT")
     multi_asset = any(c != "USDT" and float(a.get("equity") or 0) for c, a in assets.items())
-    if multi_asset:
+    if shared_margin:
+        lines.append(f"Доступная маржа MEXC: {margin_summary['available']:.4f} {margin_summary['currency']}")
+    elif "_margin_summary" in futures_raw and margin_summary is None:
+        lines.append("Доступная маржа MEXC: нет данных")
+    elif not margin_summary and multi_asset:
         lines.append("Свободная маржа: нет подтверждённых данных")
     else:
         try:
-            lines.append(f"Доступно для новых сделок: {available_margin(futures_raw):.2f} USDT")
+            lines.append(f"Доступная маржа MEXC: {available_margin(futures_raw):.4f} USDT")
         except ValueError:
-            lines.append("Доступная маржа: нет данных")
+            lines.append("Доступная маржа MEXC: нет данных")
     lines.append("≈ с учётом долга; обеспечение ≠ свободная маржа.")
     total_pnl = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
     lines.append(f"Позиции: {len(positions)} · PnL: {fmt_usd(total_pnl)}")
@@ -103,11 +111,12 @@ def _build_close_kb(positions: list[dict], config=None) -> InlineKeyboardMarkup:
 async def _fetch_all(client, context):
     from bot import db as db_mod
 
-    futures_bal, spot_bal, positions, prices = await asyncio.gather(
+    futures_bal, spot_bal, positions, prices, margin_summary = await asyncio.gather(
         client.get_futures_balance(),
         client.get_spot_balance(),
         client.get_positions(),
         client.get_asset_prices(),
+        client.get_futures_margin_summary(),
         return_exceptions=True,
     )
     if isinstance(futures_bal, Exception):
@@ -121,6 +130,7 @@ async def _fetch_all(client, context):
     positions = sorted(positions, key=lambda p: float(p.get("percentage") or 0), reverse=True)
 
     futures_bal["_prices"] = {"USDT": 1.0} if isinstance(prices, Exception) else prices
+    futures_bal["_margin_summary"] = None if isinstance(margin_summary, Exception) else margin_summary
 
     db_recs = {p["symbol"]: r for p in positions if (r := db_mod.get_managed_position(p))}
     re_recs = {r["symbol"]: r for r in db_mod.get_all_reentry()}
