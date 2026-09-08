@@ -198,6 +198,33 @@ class ExchangeClient:
     async def get_spot_balance(self) -> dict:
         return await self._spot.fetch_balance()
 
+    async def get_futures_margin_summary(self) -> dict:
+        """Display-only margin from the endpoints used by MEXC's futures wallet.
+
+        Per-currency availableOpen is not the shared multi-asset buying power.
+        Keep this separate from the collateral checks used by trading jobs.
+        """
+        mode = _checked(await self._exchange.request(
+            "multiAssets/getMultiAssetMode", ["contract", "private"], "GET")).get("data")
+        if mode in ("NOT_OPEN", "FUNCTION_NOT_ALLOWED"):
+            return {"mode": "single"}
+        if mode != "OPEN":
+            raise ValueError("Unknown MEXC asset mode")
+        data = _checked(await self._exchange.request(
+            "multiAssets/getMultiAssets", ["contract", "private"], "GET")).get("data")
+        if not isinstance(data, dict) or data.get("currency") not in ("USDT", "USDC", "USD"):
+            raise ValueError("Invalid MEXC margin summary")
+        result = {"mode": "multi", "currency": data["currency"]}
+        for source, target in (("availableBalance", "available"), ("adjEquity", "collateral")):
+            try:
+                value = float(data[source])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("Missing MEXC margin amount") from None
+            if not math.isfinite(value):
+                raise ValueError("Invalid MEXC margin amount")
+            result[target] = value
+        return result
+
     async def get_asset_prices(self) -> dict:
         rows = await self._spot.spotPublicGetTickerPrice()
         return {r["symbol"][:-4]: float(r["price"]) for r in rows
