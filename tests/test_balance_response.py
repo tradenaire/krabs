@@ -67,3 +67,28 @@ class BalanceResponseTests(unittest.IsolatedAsyncioTestCase):
                 await _fetch_with_typing(None, context, SimpleNamespace(chat_id=42))
         self.assertTrue(stopped.is_set())
         context.bot.send_chat_action.assert_awaited_once_with(chat_id=42, action='typing')
+
+
+class SpotAccountTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_account_preserves_free_locked_and_rejects_missing_balances(self):
+        from bot.exchange.client import ExchangeClient
+        client = ExchangeClient("", "")
+        try:
+            client._spot.load_markets = AsyncMock(side_effect=AssertionError("metadata must not load"))
+            client._spot.spotPrivateGetAccount = AsyncMock(return_value={"balances": [
+                {"asset": "USDT", "free": "1.25", "locked": "2.75"},
+                {"asset": "BTC", "free": "0", "locked": "0"}]})
+            balance = await client.get_spot_balance()
+            self.assertEqual(balance["free"]["USDT"], 1.25)
+            self.assertEqual(balance["used"]["USDT"], 2.75)
+            self.assertEqual(balance["total"]["USDT"], 4)
+            self.assertEqual(balance["total"]["BTC"], 0)
+            client._spot.load_markets.assert_not_awaited()
+            client._spot.spotPrivateGetAccount.return_value = {}
+            with self.assertRaises(ValueError):
+                await client.get_spot_balance()
+            client._spot.spotPrivateGetAccount.side_effect = RuntimeError("denied")
+            with self.assertRaises(RuntimeError):
+                await client.get_spot_balance()
+        finally:
+            await client.close()

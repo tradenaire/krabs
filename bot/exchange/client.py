@@ -206,7 +206,11 @@ class ExchangeClient:
         return result
 
     async def get_spot_balance(self) -> dict:
-        return await self._spot.fetch_balance()
+        # Spot account balances need no market/currency metadata bootstrap.
+        raw = await self._spot.spotPrivateGetAccount()
+        if not isinstance(raw, dict) or not isinstance(raw.get("balances"), list):
+            raise ValueError("Invalid spot account balance response")
+        return self._spot.custom_parse_balance(raw, "spot")
 
     async def get_futures_margin_summary(self) -> dict:
         """Display-only margin from the endpoints used by MEXC's futures wallet.

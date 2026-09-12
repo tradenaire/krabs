@@ -1,5 +1,6 @@
 """/positions — список с эмодзи-кнопками, детальный вид, закрытие."""
 import json
+import hashlib
 import logging
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -122,6 +123,23 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 _SEP = "─" * 20
+
+
+def _split_position_text(text: str, limit: int = 4000) -> list[str]:
+    """Split position output between cards, keeping each card intact."""
+    sections = text.split(_SEP)
+    chunks: list[str] = []
+    current = sections[0]
+    for section in sections[1:]:
+        section = _SEP + section
+        if current and len(current) + len(section) > limit:
+            chunks.append(current)
+            current = section
+        else:
+            current += section
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def _fetch_native_stop_orders(client) -> list[dict] | None:
@@ -282,21 +300,32 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
 
     kb = InlineKeyboardMarkup(btn_rows)
     text = "\n".join(lines)
-    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    chunks = _split_position_text(text)
+    from bot.event_logger import log_event
+    log_event("positions_snapshot", positions=[{k: p.get(k) for k in (
+        "position_id", "symbol", "side", "mark_price", "unrealized_pnl",
+        "percentage", "contracts", "snapshot_received_at_ms")} for p in positions],
+        chunk_count=len(chunks))
     for idx, chunk in enumerate(chunks):
         is_last = idx == len(chunks) - 1
         try:
             if edit and idx == 0:
-                await message.edit_text(chunk, parse_mode="Markdown",
+                sent = await message.edit_text(chunk, parse_mode="Markdown",
                                         reply_markup=kb if is_last else None)
             else:
-                await message.reply_text(chunk, parse_mode="Markdown",
+                sent = await message.reply_text(chunk, parse_mode="Markdown",
                                          reply_markup=kb if is_last else None)
         except Exception:
             if edit and idx == 0:
-                await message.edit_text(chunk, reply_markup=kb if is_last else None)
+                sent = await message.edit_text(chunk, reply_markup=kb if is_last else None)
             else:
-                await message.reply_text(chunk, reply_markup=kb if is_last else None)
+                sent = await message.reply_text(chunk, reply_markup=kb if is_last else None)
+
+        delivered_text = getattr(sent, "text", None)
+        log_event("positions_delivered", chunk_index=idx,
+            message_id=getattr(sent, "message_id", None),
+            text_sha256=hashlib.sha256(delivered_text.encode()).hexdigest()
+                if isinstance(delivered_text, str) else None)
 
 
 async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

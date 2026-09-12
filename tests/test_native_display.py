@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bot.handlers.positions import _format_native_protection, _send_positions
+from bot.handlers.positions import _format_native_protection, _send_positions, _split_position_text
 
 
 def _position(**overrides):
@@ -37,6 +37,18 @@ def _native(**overrides):
 
 
 class NativeDisplayTests(unittest.IsolatedAsyncioTestCase):
+    def test_position_chunks_keep_cards_intact(self):
+        first_card = "first\n" + "x" * 3940
+        second_card = "second\nЦель SL: 100\nЦель TP: 200"
+        text = ("header\n" + "─" * 20 + "\n" + first_card + "\n"
+                + "─" * 20 + "\n" + second_card)
+
+        chunks = _split_position_text(text)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[1], "─" * 20 + "\n" + second_card)
+        self.assertTrue(all(len(chunk) <= 4000 for chunk in chunks))
+
     def test_matches_position_identity_and_keeps_zero_volume(self):
         text = _format_native_protection(_position(), [_native()])
         self.assertIn("TP `105` | SL `95` | id `stop-1`", text)
@@ -72,17 +84,25 @@ class NativeDisplayTests(unittest.IsolatedAsyncioTestCase):
             get_position_limit_usdt=AsyncMock(return_value=100),
             get_funding_rate=AsyncMock(return_value={"rate": 0}),
         )
-        message = SimpleNamespace(reply_text=AsyncMock(), edit_text=AsyncMock())
+        message = SimpleNamespace(reply_text=AsyncMock(return_value=SimpleNamespace(message_id=123, text="delivered")), edit_text=AsyncMock())
         context = SimpleNamespace(bot_data={"exchange": client, "tp_sl_pcts": {}})
         with patch("bot.db.get_managed_position", return_value=None), \
              patch("bot.db.get_all_reentry", return_value=[]), \
-             patch("bot.pos_format.format_position_block", return_value="POSITION"):
+             patch("bot.pos_format.format_position_block", return_value="POSITION"), \
+             patch("bot.event_logger.log_event") as audit:
             await _send_positions(message, context)
 
         client.get_native_stop_orders.assert_awaited_once_with()
         text = message.reply_text.await_args.args[0]
         self.assertEqual(text.count("Native TP/SL"), 2)
         self.assertIn("активные native записи не найдены", text)
+
+        import hashlib
+        snapshot = audit.call_args_list[0]
+        self.assertEqual(snapshot.args, ("positions_snapshot",))
+        self.assertEqual(snapshot.kwargs["positions"][0]["position_id"], 42)
+        audit.assert_called_with("positions_delivered", chunk_index=0, message_id=123,
+            text_sha256=hashlib.sha256(b"delivered").hexdigest())
 
     async def test_native_fetch_failure_is_shown_in_positions(self):
         client = SimpleNamespace(
