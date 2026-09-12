@@ -148,8 +148,6 @@ class ExchangeClient:
             "enableRateLimit": True,
             "options": {"defaultType": "spot"},
         })
-        self._mark_ticker_cache: dict[str, tuple[float, float]] = {}
-        self._mark_ticker_errts: dict[str, float] = {}
         self._mutation_lock = asyncio.Lock()
 
     def futures_symbol(self, symbol: str) -> str:
@@ -267,7 +265,23 @@ class ExchangeClient:
         if not isinstance(positions, list):
             raise RuntimeError("Invalid MEXC positions payload")
 
-        _now_ts = time.time()
+        received_at_ms = int(time.time() * 1000)
+        def position_mark(p):
+            try:
+                value = float(p.get("markPrice") or 0)
+                return value if math.isfinite(value) and value > 0 else 0
+            except (TypeError, ValueError):
+                return 0
+
+        # One fresh bulk read instead of N sequential last-price reads per caller.
+        # Keep position reads uncached: mutation guards need the current identity/size.
+        tickers = {}
+        if any(float(p.get("holdVol") or 0) != 0 and not position_mark(p) for p in positions):
+            rows = _checked(await self._exchange.contractPublicGetTicker()).get("data")
+            if not isinstance(rows, list):
+                raise RuntimeError("Invalid MEXC bulk ticker payload")
+            tickers = {r["symbol"]: r for r in rows}
+        mark_received_at_ms = int(time.time() * 1000)
         result = []
 
         # Need markets loaded to convert MEXC symbol (BTC_USDT) → ccxt symbol (BTC/USDT:USDT)
@@ -301,20 +315,14 @@ class ExchangeClient:
             raw_liq = float(p.get("liquidatePrice", 0) or 0)
             contracts = vol
 
-            # Mark price with cache
-            mark = float(p.get("markPrice", 0) or 0)
-            if mark == 0 and ccxt_sym:
-                cached = self._mark_ticker_cache.get(ccxt_sym)
-                if cached and cached[1] > _now_ts:
-                    mark = cached[0]
-                elif self._mark_ticker_errts.get(ccxt_sym, 0) <= _now_ts:
-                    try:
-                        ticker = await self.get_ticker(ccxt_sym)
-                        mark = float(ticker["last"])
-                        self._mark_ticker_cache[ccxt_sym] = (mark, _now_ts + 60)
-                    except Exception as e:
-                        self._mark_ticker_errts[ccxt_sym] = _now_ts + 30
-                        logger.warning("mark price for %s: %s", ccxt_sym, e)
+            # A last trade is not a mark price; never present missing prices as zero PnL.
+            mark = position_mark(p)
+            ticker = tickers.get(mexc_sym, {})
+            mark_source = "position.markPrice" if mark else "ticker.fairPrice"
+            if not mark:
+                mark = float(ticker.get("fairPrice") or 0)
+            if not math.isfinite(mark) or mark <= 0:
+                raise RuntimeError(f"MEXC mark price unavailable for {mexc_sym}")
 
             # Contract size from market data (raw pos doesn't include it)
             try:
@@ -323,15 +331,23 @@ class ExchangeClient:
             except Exception:
                 contract_size = 0
             if not contract_size:
-                contract_size = float(p.get("contractSize", 0.0001) or 0.0001)
+                contract_size = float(p.get("contractSize") or 0)
+            if not math.isfinite(contract_size) or contract_size <= 0:
+                raise RuntimeError(f"MEXC contract size unavailable for {mexc_sym}")
 
             pos_size = contracts * contract_size  # in base currency
 
-            # PnL via mark price (unrealisedPnl not in MEXC position response)
-            if mark > 0 and entry > 0:
+            # Preserve the exchange's PnL from this position snapshot, including zero.
+            if p.get("unRealizedPnl") is not None:
+                pnl = float(p["unRealizedPnl"])
+                pnl_source = "position.unRealizedPnl"
+            elif entry > 0:
                 pnl = (mark - entry) * pos_size if side == "long" else (entry - mark) * pos_size
+                pnl_source = "calculated.fairPrice"
             else:
-                pnl = 0.0
+                raise RuntimeError(f"MEXC entry price unavailable for {mexc_sym}")
+            if not math.isfinite(pnl):
+                raise RuntimeError(f"Invalid MEXC PnL for {mexc_sym}")
 
             # Margin: use im from MEXC; recalculate if missing
             if margin == 0 and entry > 0 and lev > 0:
@@ -348,6 +364,11 @@ class ExchangeClient:
                 "contracts": contracts,
                 "entry_price": entry,
                 "mark_price": mark,
+                "mark_price_source": mark_source,
+                "mark_price_timestamp_ms": ticker.get("timestamp") if mark_source == "ticker.fairPrice" else None,
+                "mark_received_at_ms": mark_received_at_ms if mark_source == "ticker.fairPrice" else received_at_ms,
+                "snapshot_received_at_ms": received_at_ms,
+                "pnl_source": pnl_source,
                 "liquidation_price": round(raw_liq, 4),
                 "unrealized_pnl": round(pnl, 6),
                 "margin": margin,
