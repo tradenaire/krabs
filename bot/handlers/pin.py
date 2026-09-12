@@ -41,6 +41,10 @@ async def pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                            disable_notification=True)
     except Exception as e:
         logger.warning("pin_chat_message failed: %s", e)
+        await update.message.reply_text(
+            "⚠️ Сообщение создано, но закрепление не подтверждено. "
+            "Настройки автообновления не изменены.")
+        return
 
     # Persist
     context.bot_data[_PIN_CHAT_KEY] = chat_id

@@ -6,11 +6,47 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from bot.config import Config
 from bot.handlers.ask import ask_handler
 from bot.handlers.balance import _fetch_all, _build_balance_text
-from bot.handlers.pin import pin_update_job
+from bot.handlers.pin import pin_handler, pin_update_job
 from bot.jobs.main import setup_scheduler
 
 
 class StateVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pin_success_persists_new_ids(self):
+        sent = SimpleNamespace(message_id=7)
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=42),
+            message=SimpleNamespace(reply_text=AsyncMock(return_value=sent)),
+        )
+        bot = SimpleNamespace(pin_chat_message=AsyncMock())
+        context = SimpleNamespace(bot_data={'exchange': object()}, bot=bot)
+        with patch('bot.handlers.pin._build_pin_text', new=AsyncMock(return_value='fresh')), \
+             patch('bot.handlers.pin.db_mod.get_config', return_value=''), \
+             patch('bot.handlers.pin.db_mod.set_config') as set_config:
+            await pin_handler(update, context)
+        self.assertEqual(context.bot_data['pin_chat_id'], 42)
+        self.assertEqual(context.bot_data['pin_message_id'], 7)
+        self.assertEqual(set_config.call_args_list[0].args, ('pin_chat_id', '42'))
+        self.assertEqual(set_config.call_args_list[1].args, ('pin_message_id', '7'))
+
+    async def test_pin_failure_keeps_previous_ids_and_reports_failure(self):
+        sent = SimpleNamespace(message_id=7)
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=42),
+            message=SimpleNamespace(reply_text=AsyncMock(return_value=sent)),
+        )
+        bot = SimpleNamespace(pin_chat_message=AsyncMock(side_effect=RuntimeError('forbidden')))
+        context = SimpleNamespace(bot_data={
+            'exchange': object(), 'pin_chat_id': 9, 'pin_message_id': 8,
+        }, bot=bot)
+        with patch('bot.handlers.pin._build_pin_text', new=AsyncMock(return_value='fresh')), \
+             patch('bot.handlers.pin.db_mod.set_config') as set_config:
+            await pin_handler(update, context)
+        self.assertEqual((context.bot_data['pin_chat_id'], context.bot_data['pin_message_id']), (9, 8))
+        set_config.assert_not_called()
+        self.assertEqual(update.message.reply_text.await_count, 2)
+        self.assertIn('закрепление не подтверждено', update.message.reply_text.await_args_list[1].args[0])
+        self.assertIn('Настройки автообновления не изменены', update.message.reply_text.await_args_list[1].args[0])
+
     async def test_ask_uses_fresh_snapshot_or_explicit_unknown_never_stale_cache(self):
         ai = MagicMock()
         ai.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
