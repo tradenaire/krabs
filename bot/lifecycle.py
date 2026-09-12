@@ -1,6 +1,7 @@
 """Position identity, close accounting and explicit adoption."""
 import datetime as dt
 import logging
+import os
 from bot import db
 from bot.event_logger import log_event
 
@@ -11,7 +12,24 @@ async def authorize_update(update, context):
     from telegram.ext import ApplicationHandlerStop
     config = context.bot_data.get("config")
     user = update.effective_user
-    if not config or not user or user.id not in config.allowed_user_ids:
+    if not config or not user:
+        raise ApplicationHandlerStop
+    diagnostic_bot_id = os.getenv("KRABS_DIAGNOSTIC_BOT_ID")
+    if diagnostic_bot_id and str(user.id) == diagnostic_bot_id:
+        message = getattr(update, "message", None)
+        chat = getattr(message, "chat", None)
+        text = getattr(message, "text", None)
+        entities = getattr(message, "entities", ()) or ()
+        if (getattr(user, "is_bot", False)
+                and getattr(chat, "type", None) == "private"
+                and text in {"/positions", "/balance"}
+                and any(getattr(entity, "type", None) == "bot_command"
+                        and getattr(entity, "offset", None) == 0
+                        and getattr(entity, "length", None) == len(text)
+                        for entity in entities)):
+            return
+        raise ApplicationHandlerStop
+    if user.id not in config.allowed_user_ids:
         raise ApplicationHandlerStop
 
 
