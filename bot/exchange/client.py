@@ -330,6 +330,15 @@ class ExchangeClient:
             # A last trade is not a mark price; never present missing prices as zero PnL.
             mark = position_mark(p)
             ticker = tickers.get(mexc_sym, {})
+            funding_fields = {}
+            try:
+                funding_rate = float(ticker.get("fundingRate"))
+                if math.isfinite(funding_rate):
+                    funding_fields = {
+                        "funding_rate": funding_rate,
+                    }
+            except (TypeError, ValueError):
+                pass
             mark_source = "position.markPrice" if mark else "ticker.fairPrice"
             if not mark:
                 mark = float(ticker.get("fairPrice") or 0)
@@ -392,6 +401,7 @@ class ExchangeClient:
                 "settle_currency": self._exchange.markets.get(ccxt_sym, {}).get("settle") or ccxt_sym.split(":")[-1],
                 "hold_fee": float(p.get("holdFee", 0) or 0),
                 "hold_avg_price": entry,
+                **funding_fields,
             })
 
         return result

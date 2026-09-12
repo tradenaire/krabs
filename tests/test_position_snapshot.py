@@ -12,6 +12,7 @@ class PositionSnapshotTests(unittest.IsolatedAsyncioTestCase):
                                leverage=10, im=10, positionType=1, positionId=i,
                                unRealizedPnl=0 if i == 0 else -1.25) for i in range(23)]
         self.tickers = [dict(symbol=p['symbol'], fairPrice=101, lastPrice=200,
+                             fundingRate=0.000123,
                              timestamp=123456789) for p in self.positions]
         self.client = ExchangeClient.__new__(ExchangeClient)
         self.gateway = SimpleNamespace(
@@ -37,6 +38,7 @@ class PositionSnapshotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot[0]['mark_price_source'], 'ticker.fairPrice')
             self.assertEqual(snapshot[0]['pnl_source'], 'position.unRealizedPnl')
             self.assertEqual(snapshot[0]['mark_price_timestamp_ms'], 123456789)
+            self.assertEqual(snapshot[0]['funding_rate'], 0.000123)
             self.assertGreater(snapshot[0]['snapshot_received_at_ms'], 0)
 
     async def test_second_call_reads_changed_identity_size_and_price_without_cache(self):
@@ -81,6 +83,10 @@ class PositionSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 self.positions[0]['markPrice'] = value
                 snapshot = await self.client.get_positions()
                 self.assertEqual(snapshot[0]['mark_price'], 101)
+        self.tickers[0]['fundingRate'] = 'NaN'
+        self.assertNotIn('funding_rate', (await self.client.get_positions())[0])
+        self.tickers[0]['fundingRate'] = 0
+        self.assertEqual((await self.client.get_positions())[0]['funding_rate'], 0)
         self.gateway.markets.clear()
         with self.assertRaisesRegex(RuntimeError, 'contract size unavailable'):
             await self.client.get_positions()

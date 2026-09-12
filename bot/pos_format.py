@@ -12,31 +12,12 @@ def _calc_sl_price(entry: float, lev: int, sl_pct: float, side: str) -> float:
     return entry + move if side == "short" else entry - move
 
 
-def _fmt_funding(rate: float, lev: int, margin: float, next_ts: str | None = None) -> str:
-    if rate == 0:
-        return ""
-    from datetime import datetime, timezone
+def _fmt_funding(rate: float | None, lev: int, margin: float, next_ts: str | None = None) -> str:
+    if rate is None:
+        return "ℹ️ Фандинг: нет данных"
     pct = rate * 100
-    daily_usdt = abs(rate) * 3 * lev * margin  # 3 periods × leverage × margin
     sign = "+" if rate > 0 else ""
-    icon = "💰" if rate > 0 else ("⚠️" if rate > -0.001 else "🚨")
-    line = f"{icon} Фандинг `{sign}{pct:.4f}%`/8h · ~`${daily_usdt:.4f}`/день"
-    if next_ts:
-        try:
-            if isinstance(next_ts, (int, float)):
-                dt = datetime.fromtimestamp(next_ts / 1000, tz=timezone.utc)
-            else:
-                dt = datetime.fromisoformat(str(next_ts).replace("Z", "+00:00"))
-            diff = dt - datetime.now(tz=timezone.utc)
-            mins = int(diff.total_seconds() / 60)
-            if mins >= 0:
-                if mins >= 60:
-                    line += f" · через `{mins // 60}ч {mins % 60}м`"
-                else:
-                    line += f" · через `{mins}м`"
-        except Exception:
-            pass
-    return line
+    return f"ℹ️ Фандинг `{sign}{pct:.4f}%`"
 
 
 def format_position_block(pos: dict, db_rec: dict | None, re_rec: dict | None,

@@ -216,10 +216,9 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
     config = context.bot_data.get("config")
     tp_sl_pcts = context.bot_data.get("tp_sl_pcts", {})
 
-    # Fetch max_lev / pos limit / funding per symbol in parallel (best-effort)
+    # Fetch max_lev / pos limit per symbol in parallel (best-effort)
     import asyncio as _asyncio
     lev_cache: dict = {}
-    funding_cache: dict = {}
 
     async def _fetch_sym_data(pos):
         sym = pos["symbol"]
@@ -230,11 +229,6 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
                 client.get_position_limit_usdt(sym, lev),
             )
             lev_cache[sym] = {"max_lev": ml, "max_pos_usdt": mp}
-        except Exception:
-            pass
-        try:
-            fr = await client.get_funding_rate(sym)
-            funding_cache[sym] = fr
         except Exception:
             pass
 
@@ -256,8 +250,7 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
             tp_sl_pcts=tp_sl_pcts,
             max_lev=cached.get("max_lev", 0),
             max_pos_usdt=cached.get("max_pos_usdt", 0),
-            funding_rate=funding_cache.get(symbol, {}).get("rate", 0.0),
-            funding_next_ts=funding_cache.get(symbol, {}).get("next_funding_time"),
+            funding_rate=pos.get("funding_rate"),
         )
         lines.append(block + "\n" + _format_native_protection(pos, native_orders))
 

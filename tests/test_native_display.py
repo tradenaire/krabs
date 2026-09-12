@@ -101,6 +101,36 @@ class NativeDisplayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("native TP/SL данные недоступны", message.reply_text.await_args.args[0])
 
+    async def test_bulk_funding_snapshot_skips_per_symbol_fetch(self):
+        positions = [_position(funding_rate=0.000123)]
+        client = SimpleNamespace(
+            get_positions=AsyncMock(return_value=positions),
+            get_native_stop_orders=AsyncMock(return_value=[]),
+            get_max_leverage=AsyncMock(return_value=20),
+            get_position_limit_usdt=AsyncMock(return_value=100),
+            get_funding_rate=AsyncMock(side_effect=AssertionError("stale per-symbol funding")),
+        )
+        message = SimpleNamespace(reply_text=AsyncMock(), edit_text=AsyncMock())
+        context = SimpleNamespace(bot_data={"exchange": client, "tp_sl_pcts": {}})
+        formatted = []
+
+        def capture_format(*_args, **kwargs):
+            formatted.append(kwargs)
+            return "POSITION"
+
+        with patch("bot.db.get_managed_position", return_value=None), \
+             patch("bot.db.get_all_reentry", return_value=[]), \
+             patch("bot.pos_format.format_position_block", side_effect=capture_format):
+            await _send_positions(message, context)
+
+        client.get_funding_rate.assert_not_awaited()
+        self.assertEqual(formatted[0]["funding_rate"], 0.000123)
+        from bot.pos_format import _fmt_funding
+        self.assertEqual(_fmt_funding(None, 10, 1), "ℹ️ Фандинг: нет данных")
+        self.assertIn("0.0000%", _fmt_funding(0, 10, 1))
+        self.assertNotIn("/8h", _fmt_funding(0.000123, 10, 1))
+        self.assertNotIn("/день", _fmt_funding(0.000123, 10, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
