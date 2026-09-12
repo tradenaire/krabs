@@ -863,7 +863,10 @@ class ExchangeClient:
         orders = await self._history(self._exchange.contractPrivateGetOrderListHistoryOrders, record["symbol"], opened)
         fills = [o for o in orders if str(o.get("positionId")) == pid
                  and self.futures_symbol(o["symbol"]) == record["symbol"]
-                 and int(o.get("side") or 0) == (4 if record["side"] == "long" else 2)
+                 and (int(o.get("side") or 0) == (4 if record["side"] == "long" else 2)
+                      or (int(o.get("side") or 0) == (3 if record["side"] == "long" else 1)
+                          and int(o.get("positionMode") or 0) == 2
+                          and o.get("reduceOnly") is True))
                  and float(o.get("dealVol") or 0) > 0 and float(o.get("dealAvgPrice") or 0) > 0
                  and int(opened) <= int(o.get("updateTime") or 0) <= closed_ms]
         reason = "unknown"

@@ -349,6 +349,23 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["pnl"], 1.5379)
             self.assertEqual(result["exit_price"], 92.123)
 
+    async def test_one_way_reduce_only_history_side_is_a_close_fill(self):
+        self.gateway.closed = [{"positionId": "7001", "symbol": "ALLO_USDT", "positionType": 1,
+            "createTime": NOW - 600_000, "updateTime": NOW - 120_000, "state": 3,
+            "realised": 1.25, "closeAvgPrice": 102.0}]
+        self.gateway.history = [{"orderId": "close-7001", "positionId": "7001", "symbol": "ALLO_USDT",
+            "side": 3, "positionMode": 2, "reduceOnly": True, "dealVol": 100,
+            "dealAvgPrice": 102.0, "updateTime": NOW - 120_000, "category": 1}]
+        self.record = register_position(position(pid="7001", side="long"), self.config, tp_pct=100, sl_pct=100)
+
+        result = await self.client.get_closed_position_result(self.record)
+        self.assertEqual(result["order_ids"], ["close-7001"])
+
+        for side, reduce_only in ((1, True), (3, False)):
+            self.gateway.history[0].update(side=side, reduceOnly=reduce_only)
+            result = await self.client.get_closed_position_result(self.record)
+            self.assertEqual(result["order_ids"], [])
+
     async def test_other_position_history_cannot_close_current_position(self):
         self.closed_history(pid="other")
         self.assertIsNone(await self.client.get_closed_position_result(self.record))
