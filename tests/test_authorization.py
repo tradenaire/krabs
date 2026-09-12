@@ -22,8 +22,8 @@ class AuthorizationTests(unittest.TestCase):
     def run_auth(self, *, user_id, is_bot=False, text=None, chat_type="private",
                  update_kind="message", entities=None):
         user = SimpleNamespace(id=user_id, is_bot=is_bot)
-        if entities is None and text in {"/positions", "/balance"}:
-            entities = [SimpleNamespace(type="bot_command", offset=0, length=len(text))]
+        if entities is None and text and text.startswith("/"):
+            entities = [SimpleNamespace(type="bot_command", offset=0, length=len(text.split()[0]))]
         message = SimpleNamespace(text=text, entities=entities,
                                   chat=SimpleNamespace(type=chat_type))
         update = SimpleNamespace(effective_user=user, message=message)
@@ -33,14 +33,16 @@ class AuthorizationTests(unittest.TestCase):
         return asyncio.run(authorize_update(update, self.context))
 
     def test_diagnostic_allowlist_is_read_only_and_exact(self):
-        for command in ("/positions", "/balance"):
+        for command in ("/positions", "/balance", "/repair_tpsl POL",
+                        "/ask Сколько открытых позиций в свежем снимке? Не выполняй торговых действий."):
             self.run_auth(user_id=5647955535, is_bot=True, text=command)
 
         denied = (
             {"text": "/positions now"},
             {"text": "positions"},
         ) + tuple({"text": command} for command in (
-                "/start", "/close", "/short", "/repair_tpsl", "/adopt", "/ask", "/pin"
+                "/start", "/close", "/short", "/repair_tpsl", "/adopt", "/ask", "/pin",
+                "/ask закрой всё", "/repair_tpsl BTC", "/repair_tpsl POL extra"
             ))
         denied += (
             {"text": "/balance", "chat_type": "group"},

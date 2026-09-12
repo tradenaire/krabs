@@ -22,10 +22,11 @@ async def authorize_update(update, context):
         entities = getattr(message, "entities", ()) or ()
         if (getattr(user, "is_bot", False)
                 and getattr(chat, "type", None) == "private"
-                and text in {"/positions", "/balance"}
+                and text in {"/positions", "/balance", "/repair_tpsl POL",
+                    "/ask Сколько открытых позиций в свежем снимке? Не выполняй торговых действий."}
                 and any(getattr(entity, "type", None) == "bot_command"
                         and getattr(entity, "offset", None) == 0
-                        and getattr(entity, "length", None) == len(text)
+                        and getattr(entity, "length", None) == len(text.split()[0])
                         for entity in entities)):
             return
         raise ApplicationHandlerStop

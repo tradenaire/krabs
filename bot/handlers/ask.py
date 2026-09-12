@@ -14,6 +14,7 @@ import asyncio
 import datetime as dt
 import re
 from pathlib import Path
+from bot.event_logger import log_event
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -124,6 +125,9 @@ async def ask_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         from bot import db as db_mod
         positions = await asyncio.wait_for(context.bot_data["exchange"].get_positions(), timeout=5)
+        log_event("ask_positions_snapshot", count=len(positions),
+            received_at_ms=[p.get("snapshot_received_at_ms") for p in positions],
+            symbols=[p.get("symbol") for p in positions])
         db_recs = {p["symbol"]: r for p in positions
                    if (r := db_mod.get_managed_position(p, allow_closing=True))}
         ctx_blocks.append("Снимок позиций получен " + dt.datetime.now(dt.timezone.utc).isoformat()
@@ -152,6 +156,7 @@ async def ask_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             ctx_blocks.append("=== Позиции ===\n" + "\n".join(lines))
     except Exception:
+        log_event("ask_positions_unavailable")
         ctx_blocks.append("Позиции: свежие данные недоступны. Не выводи текущее состояние из старых логов.")
 
     system_content = _SYSTEM
@@ -188,8 +193,13 @@ async def ask_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = answer[:3800] + "\n…_(обрезано)_"
 
         used_model = model.split("/")[-1]
-        await msg.edit_text(f"ℹ️ AI-консультация; торговые команды не выполнялись.\n\n{answer}\n\n_— {used_model}_",
+        sent = await msg.edit_text(f"ℹ️ AI-консультация; торговые команды не выполнялись.\n\n{answer}\n\n_— {used_model}_",
                             parse_mode="Markdown")
+        import hashlib
+        delivered = getattr(sent, "text", None)
+        log_event("ask_delivered", message_id=getattr(sent, "message_id", None),
+            text_sha256=hashlib.sha256(delivered.encode()).hexdigest()
+                if isinstance(delivered, str) else None)
 
     except Exception as e:
         logger.error("ask_handler: %s", e)
