@@ -271,12 +271,13 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_mod.set_config(attr, str(val))
                 label = f"${val:.2f}" if unit == "$" else f"{val:.0f}%"
                 labels = {"bet": "Ставка", "tp": "Тейкпрофит", "sl": "Стоплосс"}
-                await update.message.reply_text(
-                    f"✅ *{labels[pending]}* применён: `{label}`", parse_mode="Markdown"
-                )
+                message = f"✅ *{labels[pending]}* сохранён: `{label}`"
                 if pending in ("tp", "sl"):
-                    from bot.handlers.trading import _reapply_tpsl_all
-                    await _reapply_tpsl_all(context.application, config)
+                    from bot.handlers.trading import _reapply_tpsl_all, format_tpsl_results
+                    message += "\n\n" + format_tpsl_results(
+                        await _reapply_tpsl_all(context.application, config)
+                    )
+                await update.message.reply_text(message, parse_mode="Markdown")
             context.user_data.pop("pending_set", None)
             return
 
@@ -349,12 +350,28 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 confirmed = await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price,
                                        pos_data=pos)
-                prices = {r["type"]: r["price"] for r in confirmed}
-                tp_price, sl_price = prices["TP"], prices["SL"]
+                legs = {
+                    leg.get("type"): leg for leg in (confirmed or [])
+                    if isinstance(leg, dict)
+                    and leg.get("type") in ("TP", "SL")
+                    and leg.get("confirmed") is True
+                    and leg.get("id")
+                }
+                if set(legs) != {"TP", "SL"}:
+                    raise RuntimeError("биржа не подтвердила обе ноги TP/SL с order ID")
+                tp_price = float(legs["TP"]["price"])
+                sl_price = float(legs["SL"]["price"])
                 tp_sl_pcts[symbol] = {"tp_pct": new_tp_pct, "sl_pct": new_sl_pct}
+                from bot import db as db_mod
+                db_mod.update_position_tpsl(symbol, new_tp_pct, new_sl_pct)
+                with db_mod._connect() as conn:
+                    conn.execute(
+                        "UPDATE reentry SET tp_pct=?, sl_pct=? WHERE symbol=?",
+                        (new_tp_pct, new_sl_pct, symbol),
+                    )
                 results.append(
-                    f"✅ `{coin}`: TP `{tp_price:.6g}` (+{new_tp_pct:.0f}%) "
-                    f"SL `{sl_price:.6g}` (-{new_sl_pct:.0f}%)"
+                    f"✅ `{coin}`: TP `{tp_price:.6g}` (ID `{legs['TP']['id']}`) и "
+                    f"SL `{sl_price:.6g}` (ID `{legs['SL']['id']}`) подтверждены"
                 )
             except Exception as e:
                 results.append(f"❌ `{coin}`: {e}")
@@ -381,12 +398,21 @@ async def assistant_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await execute_open(client, context.application, symbol, "sell",
                                         margin, leverage, tp_pct=tp_pct, sl_pct=sl_pct)
             coin = symbol.split("/")[0]
-            await update.message.reply_text(
-                f"✅ *Шорт открыт* `{coin}`\n"
-                f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']}\n"
-                f"Маржа: `${margin:.2f}` | TP `+{tp_pct:.0f}%` SL `-{sl_pct:.0f}%`",
-                parse_mode="Markdown"
-            )
+            actual_margin = result.get("margin", margin)
+            lines = [
+                f"✅ *Шорт открыт* `{coin}`",
+                f"Entry: `{result['entry_price']:.6g}` | ×{result['leverage']}",
+                f"Маржа: `${actual_margin:.2f}`",
+            ]
+            if actual_margin > margin + 0.001:
+                lines.append(f"⚠️ Маржа поднята до MEXC minimum: `${margin:.2f}` → `${actual_margin:.2f}`")
+            if result.get("protection_status") == "TP и SL подтверждены":
+                lines.append(
+                    f"✅ TP `{result['tp_price']:.6g}` | SL `{result['sl_price']:.6g}` подтверждены"
+                )
+            else:
+                lines.append(f"⚠️ TP/SL НЕ подтверждены: {result.get('protection_status', 'неизвестный статус')}")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка открытия: {e}")
         return

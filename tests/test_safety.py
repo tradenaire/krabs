@@ -179,6 +179,73 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
                 await self.client.set_tp_sl(SYMBOL, None, 110)
         self.assertEqual(len(self.gateway.placed), 1)
 
+    async def test_invisible_accepted_protection_recovers_same_id_without_duplicate(self):
+        self.gateway.invisible = True
+        with patch("bot.exchange.client.asyncio.sleep", new=AsyncMock()):
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    await self.client.set_tp_sl(SYMBOL, None, 110)
+        self.assertEqual(len(self.gateway.placed), 1)
+        order_id = db.get_bot_orders()[0]["order_id"]
+        pending_key = f"plan_uncertain_{self.record['id']}_SL"
+        self.assertEqual(db.get_config(pending_key), order_id)
+        self.gateway.invisible = False
+        original_volume = self.gateway.plans[0]["vol"]
+        self.gateway.plans[0]["vol"] = 99
+        with self.assertRaises(RuntimeError):
+            await self.client.set_tp_sl(SYMBOL, None, 110)
+        self.assertEqual(len(self.gateway.placed), 1)
+        self.gateway.plans[0]["vol"] = original_volume
+        result = await self.client.set_tp_sl(SYMBOL, None, 110)
+        self.assertEqual(result[0]["id"], order_id)
+        self.assertTrue(result[0]["confirmed"])
+        self.assertEqual(db.get_config(pending_key), "")
+        self.assertEqual(len(self.gateway.placed), 1)
+
+    async def test_close_timeout_keeps_live_protection_without_reopening_mutations(self):
+        self.gateway.contractPrivatePostOrderSubmit = AsyncMock(side_effect=TimeoutError("unknown"))
+        with self.assertRaises(TimeoutError):
+            await self.client.close_futures_position(SYMBOL, expected_position_id="100")
+        self.assertIsNone(db.get_managed_position(position()))
+        self.assertIsNone(db.get_managed_position(position(pid="other"), allow_closing=True))
+        self.assertIsNone(db.get_managed_position(position(opened_at_ms=NOW), allow_closing=True))
+        await tpsl_enforce_job(self.app)
+        self.assertEqual((await self.client.audit_protection(SYMBOL))["status"], "CONFIRMED")
+        with self.assertRaises(ValueError):
+            await self.client.close_futures_position(SYMBOL, expected_position_id="100")
+        with self.assertRaises(ValueError):
+            await self.client.place_futures_order(SYMBOL, "sell", 1, 10, expected_position_id="100")
+        with self.assertRaises(ValueError):
+            await self.client.partial_close_futures_position(SYMBOL, 10, expected_position_id="100")
+        self.gateway.contractPrivatePostOrderSubmit.assert_awaited_once()
+        self.closed_history(reason="manual")
+        await reconcile_closures(self.app)
+        self.assertEqual(db.get_position_by_id(self.record["id"])["status"], "closed")
+
+    async def test_protection_changed_during_update_never_confirms_or_cancels_old(self):
+        self.saved_plan("SL", price=120)
+        original = self.gateway.contractPrivatePostPlanorderPlace
+        async def change_position(params):
+            result = await original(params)
+            self.gateway.live[0]["contracts"] = 101
+            return result
+        self.gateway.contractPrivatePostPlanorderPlace = change_position
+        with self.assertRaisesRegex(RuntimeError, "Position changed"):
+            await self.client.set_tp_sl(SYMBOL, None, 110)
+        self.assertEqual(self.gateway.cancelled, [])
+        self.assertTrue(any(not o["confirmed"] for o in db.get_bot_orders()))
+
+    async def test_protection_disappearing_after_cancel_never_reports_success(self):
+        self.saved_plan("SL", price=120)
+        original = self.gateway.contractPrivatePostPlanorderCancel
+        async def disappear(params):
+            result = await original(params)
+            self.gateway.plans = []
+            return result
+        self.gateway.contractPrivatePostPlanorderCancel = disappear
+        with self.assertRaisesRegex(RuntimeError, "not active at final"):
+            await self.client.set_tp_sl(SYMBOL, None, 110)
+
     async def test_wrong_side_volume_direction_price_replaced_individually(self):
         for override in ({"side": 4}, {"vol": 99}, {"triggerType": 1}, {"triggerPrice": "89"}):
             self.gateway.plans, self.gateway.cancelled, self.gateway.placed = [], [], []

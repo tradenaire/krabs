@@ -250,15 +250,16 @@ def get_open_position(symbol: str) -> dict | None:
     return dict(row) if row else None
 
 
-def get_managed_position(live: dict) -> dict | None:
+def get_managed_position(live: dict, *, allow_closing: bool = False) -> dict | None:
     """Never infer ownership from a symbol, runtime cache, or an old DB record."""
     exchange_id = live.get("position_id")
     if not exchange_id:
         return None
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM positions WHERE exchange_position_id=? AND symbol=? AND status='open'",
-            (str(exchange_id), live["symbol"]),
+            "SELECT * FROM positions WHERE exchange_position_id=? AND symbol=? "
+            "AND (status='open' OR (? AND status='closing'))",
+            (str(exchange_id), live["symbol"], allow_closing),
         ).fetchone()
     if (row and row["side"] == live["side"]
             and live.get("opened_at_ms") is not None

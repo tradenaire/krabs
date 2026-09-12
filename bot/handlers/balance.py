@@ -112,11 +112,11 @@ async def _fetch_all(client, context):
     from bot import db as db_mod
 
     futures_bal, spot_bal, positions, prices, margin_summary = await asyncio.gather(
-        client.get_futures_balance(),
-        client.get_spot_balance(),
-        client.get_positions(),
-        client.get_asset_prices(),
-        client.get_futures_margin_summary(),
+        asyncio.wait_for(client.get_futures_balance(), timeout=10),
+        asyncio.wait_for(client.get_spot_balance(), timeout=3),
+        asyncio.wait_for(client.get_positions(), timeout=10),
+        asyncio.wait_for(client.get_asset_prices(), timeout=3),
+        asyncio.wait_for(client.get_futures_margin_summary(), timeout=3),
         return_exceptions=True,
     )
     if isinstance(futures_bal, Exception):

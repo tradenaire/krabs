@@ -1,4 +1,4 @@
-"""/pin — закрепить баланс и обновлять раз в минуту."""
+"""/pin — закрепить баланс и обновлять каждые 30 секунд."""
 import logging
 from datetime import datetime, timezone
 
@@ -21,9 +21,9 @@ async def _build_pin_text(client, context) -> str:
         text = _build_balance_text(futures_bal, positions, tp_sl_pcts, db_recs, re_recs,
                                    config, daily_stats, lev_cache, spot_bal)
     except Exception as e:
-        text = f"❌ Ошибка загрузки баланса: {e}"
-    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    return text[:3900] + f"\n\n🕐 _обновлено {now}_"
+        return f"❌ Свежий баланс не получен: {type(e).__name__}. Повторная проверка по расписанию."
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    return text[:3900] + f"\n\n🕐 _снимок получен {now}_"
 
 
 async def pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,7 +50,7 @@ async def pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pin_update_job(app):
-    """Каждую минуту обновляет закреплённое сообщение с балансом."""
+    """Обновляет закреплённое сообщение по расписанию."""
     chat_id    = app.bot_data.get(_PIN_CHAT_KEY)
     message_id = app.bot_data.get(_PIN_MSG_KEY)
 

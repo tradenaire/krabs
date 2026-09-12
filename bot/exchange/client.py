@@ -620,7 +620,7 @@ class ExchangeClient:
         pos = await self.get_position(symbol)
         if not pos:
             raise ValueError("Open position not found")
-        record = db.get_managed_position(pos)
+        record = db.get_managed_position(pos, allow_closing=True)
         if not record:
             return {"status": "UNMANAGED", "symbol": pos["symbol"], "position_id": pos["position_id"]}
         sym, side = pos["symbol"], pos["side"]
@@ -657,11 +657,12 @@ class ExchangeClient:
         pos = await self.get_position(sym)
         if not pos or (pos_data and str(pos["position_id"]) != str(pos_data.get("position_id"))):
             raise ValueError("Position changed before protection update")
-        record = db.get_managed_position(pos)
+        record = db.get_managed_position(pos, allow_closing=True)
         if not record:
             raise ValueError("Position is unmanaged; use /adopt SYMBOL confirm first")
         if expected_snapshot is not None and expected_snapshot != _protection_snapshot(pos, record):
             raise ValueError("Position or protection settings changed; request a new repair preview")
+        initial_snapshot = _protection_snapshot(pos, record)
         side = pos["side"]
         close_side = 4 if side == "long" else 2
         open_type = 2 if pos.get("margin_mode") == "cross" else 1
@@ -694,7 +695,11 @@ class ExchangeClient:
                                                contracts=contracts, open_type=open_type, price=price)
                 found = next((o for o in old if matches(o)), None)
                 if not found:
-                    if db.get_config(pending_key):
+                    pending = db.get_config(pending_key)
+                    visible_ids = {o["id"] for o in active}
+                    unresolved = [o for o in saved.values() if not o["confirmed"]
+                                  and o["kind"] in (("SL", "profit_lock") if kind == "SL" else ("TP",))]
+                    if unresolved or (pending and pending not in visible_ids):
                         raise RuntimeError("Previous placement outcome is unknown; reconcile order ID before retry")
                     db.set_config(pending_key, "pending")
                     response = await self._exchange.contractPrivatePostPlanorderPlace({
@@ -710,7 +715,7 @@ class ExchangeClient:
                         order_id = order_id.get("orderId") or order_id.get("id")
                     is_lock = kind == "SL" and (profit_lock_step is not None or record.get("locked_sl") is not None)
                     db.save_bot_order(order_id, record["id"], sym, "profit_lock" if is_lock else kind, price)
-                    db.set_config(pending_key, "")
+                    db.set_config(pending_key, str(order_id))
                     for attempt in range(4):
                         fresh = await self.get_tp_sl_orders(sym)
                         found = next((o for o in fresh if o["id"] == str(order_id) and matches(o)), None)
@@ -719,8 +724,14 @@ class ExchangeClient:
                         await asyncio.sleep(0.25)
                     if not found:
                         raise RuntimeError(f"{kind} accepted but active protection not confirmed")
+                current = await self.get_position(sym)
+                if not current or _protection_snapshot(current, record) != initial_snapshot:
+                    errors.append(f"{kind}: Position changed during protection update; confirmation refused")
+                    break
                 lock_price = price if kind == "SL" and (profit_lock_step is not None or record.get("locked_sl") is not None) else None
                 db.confirm_protection(record["id"], found["id"], lock_price, profit_lock_step if kind == "SL" else None)
+                if db.get_config(pending_key) == found["id"]:
+                    db.set_config(pending_key, "")
                 # Replacement is confirmed before cancelling only our obsolete leg(s).
                 await self._cancel_owned([o for o in old if o["id"] != found["id"]])
                 results.append({"type": kind, "price": price, "id": found["id"], "confirmed": True})
@@ -729,6 +740,17 @@ class ExchangeClient:
         if errors:
             confirmed = ", ".join(r["type"] for r in results) or "none"
             raise RuntimeError(f"Protection incomplete (confirmed: {confirmed}); " + "; ".join(errors))
+        if results:
+            current = await self.get_position(sym)
+            if not current or _protection_snapshot(current, record) != initial_snapshot:
+                raise RuntimeError("Position changed before final protection confirmation")
+            active = await self.get_tp_sl_orders(sym)
+            for leg in results:
+                trigger = (1 if side == "long" else 2) if leg["type"] == "TP" else (2 if side == "long" else 1)
+                if not any(o["id"] == leg["id"] and _protection_matches(o,
+                           side=close_side, trigger=trigger, contracts=contracts,
+                           open_type=open_type, price=leg["price"]) for o in active):
+                    raise RuntimeError(f"{leg['type']} not active at final protection confirmation")
         return results
 
     async def _history(self, method, symbol: str, opened_at_ms: int) -> list[dict]:

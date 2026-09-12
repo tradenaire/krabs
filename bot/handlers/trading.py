@@ -520,8 +520,9 @@ async def apply_avg_pending_value(context: ContextTypes.DEFAULT_TYPE,
         db_mod.set_config(pending["attr"], str(val))
 
         key = pending["key"]
+        protection_results = None
         if key in ("tp", "sl"):
-            await _reapply_tpsl_all(context.application, config)
+            protection_results = await _reapply_tpsl_all(context.application, config)
         if key == "interval":
             from bot.jobs.main import reschedule_averaging
             reschedule_averaging(context.application, int(val))
@@ -529,7 +530,10 @@ async def apply_avg_pending_value(context: ContextTypes.DEFAULT_TYPE,
             new_budget = config.max_averaging_count * config.averaging_amount
             with db_mod._connect() as conn:
                 conn.execute("UPDATE positions SET averaging_budget=? WHERE status='open'", (new_budget,))
-        return f"{pending['num']}. {pending['label']} → `{_avg_fmt(config, pending['attr'], pending['unit'])}`"
+        result = f"{pending['num']}. {pending['label']} → `{_avg_fmt(config, pending['attr'], pending['unit'])}`"
+        if protection_results is not None:
+            result += "\n\n" + format_tpsl_results(protection_results)
+        return result
 
     lo = text.strip().lower()
     if kind == "lock":
@@ -784,10 +788,10 @@ async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_mod.set_config(attr, str(val))
 
     label = {"bet": f"${val:.2f}", "tp": f"{val:.0f}%", "sl": f"{val:.0f}%"}.get(param, str(val))
-    await update.message.reply_text(f"✅ `{param}` = `{label}`", parse_mode="Markdown")
-
+    await update.message.reply_text(f"✅ Настройка сохранена: `{param}` = `{label}`", parse_mode="Markdown")
     if param in ("tp", "sl"):
-        await _reapply_tpsl_all(context.application, config)
+        results = await _reapply_tpsl_all(context.application, config)
+        await update.message.reply_text(format_tpsl_results(results), parse_mode="Markdown")
 
     if param == "interval":
         from bot.jobs.main import reschedule_averaging
@@ -799,20 +803,21 @@ async def avg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE positions SET averaging_budget=? WHERE status='open'", (new_budget,))
 
 
-async def _reapply_tpsl_all(app, config) -> None:
-    """Re-apply TP/SL to all open positions after tp_pct/sl_pct change."""
+async def _reapply_tpsl_all(app, config) -> list[dict]:
+    """Re-apply TP/SL and return the confirmed/failed result per position."""
     from bot import db as db_mod
     from bot.jobs.main import _calc_tp_price, _calc_sl_price
     client = app.bot_data.get("exchange")
     if not client:
-        return
+        return [{"symbol": "*", "ok": False, "error": "биржевой клиент недоступен"}]
     tp_pct = float(getattr(config, "tp_pct", 500))
     sl_pct = float(getattr(config, "sl_pct", 500))
     tp_sl_pcts: dict = app.bot_data.setdefault("tp_sl_pcts", {})
     try:
         positions = await client.get_positions()
-    except Exception:
-        return
+    except Exception as e:
+        return [{"symbol": "*", "ok": False, "error": f"позиции не получены: {e}"}]
+    results = []
     for pos in positions:
         if not db_mod.get_managed_position(pos):
             continue
@@ -821,11 +826,23 @@ async def _reapply_tpsl_all(app, config) -> None:
         lev = int(pos.get("leverage", 1) or 1)
         side = pos.get("side", "short")
         if not entry:
+            results.append({"symbol": symbol, "ok": False, "error": "entry недоступен"})
             continue
         tp_price = _calc_tp_price(entry, lev, tp_pct, side)
         sl_price = _calc_sl_price(entry, lev, sl_pct, side)
         try:
-            await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price, pos_data=pos)
+            confirmed = await client.set_tp_sl(symbol, tp_price=tp_price, sl_price=sl_price, pos_data=pos)
+            legs = {
+                leg.get("type"): leg for leg in (confirmed or [])
+                if isinstance(leg, dict)
+                and leg.get("type") in ("TP", "SL")
+                and leg.get("confirmed") is True
+                and leg.get("id")
+            }
+            if set(legs) != {"TP", "SL"}:
+                raise RuntimeError("биржа не подтвердила обе ноги TP/SL с order ID")
+            tp_price = float(legs["TP"]["price"])
+            sl_price = float(legs["SL"]["price"])
             tp_sl_pcts[symbol] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
             db_mod.update_position_tpsl(symbol, tp_pct, sl_pct)
             with db_mod._connect() as conn:
@@ -833,8 +850,32 @@ async def _reapply_tpsl_all(app, config) -> None:
                     "UPDATE reentry SET tp_pct=?, sl_pct=? WHERE symbol=?",
                     (tp_pct, sl_pct, symbol),
                 )
+            results.append({
+                "symbol": symbol, "ok": True,
+                "tp_price": tp_price, "sl_price": sl_price,
+                "tp_id": str(legs["TP"]["id"]), "sl_id": str(legs["SL"]["id"]),
+            })
         except Exception as e:
             logger.warning("reapply tpsl %s: %s", symbol, e)
+            results.append({"symbol": symbol, "ok": False, "error": str(e)})
+    return results
+
+
+def format_tpsl_results(results: list[dict]) -> str:
+    """Tell the user which saved settings reached confirmed exchange orders."""
+    if not results:
+        return "ℹ️ Настройка сохранена; управляемых открытых позиций нет."
+    lines = ["🛡 Статус активной защиты:"]
+    for result in results:
+        symbol = result.get("symbol", "*").split("/")[0]
+        if result.get("ok"):
+            lines.append(
+                f"✅ `{symbol}`: TP `{result['tp_price']:.6g}` (ID `{result['tp_id']}`) и "
+                f"SL `{result['sl_price']:.6g}` (ID `{result['sl_id']}`) подтверждены"
+            )
+        else:
+            lines.append(f"⚠️ `{symbol}`: защита НЕ подтверждена — {result.get('error', 'неизвестная ошибка')}")
+    return "\n".join(lines)
 
 
 async def avg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -959,7 +1000,8 @@ async def _finish_wizard(chat_id: int, context, changed: dict, config) -> None:
     lines.append(_build_avg_text(config))
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
     if changed:
-        await _reapply_tpsl_all(context.application, config)
+        results = await _reapply_tpsl_all(context.application, config)
+        await context.bot.send_message(chat_id=chat_id, text=format_tpsl_results(results), parse_mode="Markdown")
     if "averaging_amount" in changed or "max_averaging_count" in changed:
         from bot import db as db_mod
         new_budget = config.max_averaging_count * config.averaging_amount

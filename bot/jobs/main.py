@@ -757,7 +757,7 @@ async def tpsl_enforce_job(app):
     try:
         positions = await client.get_positions()
         for pos in positions:
-            record = db_mod.get_managed_position(pos)
+            record = db_mod.get_managed_position(pos, allow_closing=True)
             if not record:
                 continue
             entry, lev, side = pos["entry_price"], pos["leverage"], pos["side"]
@@ -1113,6 +1113,9 @@ def setup_scheduler(app):
     from apscheduler.triggers.interval import IntervalTrigger
 
     config = app.bot_data.get("config")
+    from bot.handlers.pin import pin_update_job
+    SCHEDULER.add_job(pin_update_job, trigger=IntervalTrigger(seconds=30), args=[app],
+                      id="pin_update", max_instances=1, replace_existing=True)
     avg_interval = int(getattr(config, "averaging_interval", 3)) if config else 3
 
     SCHEDULER.add_job(
