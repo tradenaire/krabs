@@ -142,6 +142,13 @@ class ExchangeClient:
             return {}
         self._exchange.fetch_currencies = _no_currencies
 
+        # CCXT charges contract/detail 100 * 50 ms on the shared queue. Keep that
+        # public metadata budget separate from position/balance/order requests.
+        self._metadata = _MexcThreadedDNS({
+            "enableRateLimit": True, "options": {"defaultType": "swap"},
+        })
+        self._exchange.fetch_markets = self._metadata.fetch_swap_markets
+
         self._spot = _MexcThreadedDNS({
             "apiKey": api_key,
             "secret": secret,
@@ -171,8 +178,13 @@ class ExchangeClient:
         raise ValueError(f"Invalid side: {side}")
 
     async def close(self):
-        await self._exchange.close()
-        await self._spot.close()
+        try:
+            await self._exchange.close()
+        finally:
+            try:
+                await self._spot.close()
+            finally:
+                await self._metadata.close()
 
     # ── Balance ──────────────────────────────────────────────────────
 
@@ -623,6 +635,36 @@ class ExchangeClient:
                  "order_type": int(o.get("orderType") or 0), "trend": int(o.get("trend") or 0)}
                 for o in await self._plan_orders(symbol, states="1") if str(o.get("state")) == "1"]
 
+    async def get_native_stop_orders(self, symbol: str | None = None) -> list[dict]:
+        """Read-only native stop records in the API's maximum 90-day window.
+
+        These records never enter plan-order ownership, confirmation or cancellation.
+        vol=0/volType=2 is retained; it does not prove full-position coverage.
+        """
+        end = int(time.time() * 1000)
+        params = {"is_finished": 0, "page_size": 100,
+                  "start_time": end - 90 * 86400_000, "end_time": end}
+        if symbol:
+            params["symbol"] = self.futures_symbol(symbol).split(":")[0].replace("/", "_")
+        orders, seen = [], set()
+        for page in range(1, 101):
+            batch = _checked(await self._exchange.contractPrivateGetStoporderListOrders(
+                {**params, "page_num": page})).get("data")
+            if not isinstance(batch, list):
+                raise RuntimeError("Invalid native stop-order list")
+            for order in batch:
+                if not isinstance(order, dict) or order.get("id") in (None, "", 0, "0"):
+                    raise RuntimeError("Invalid native stop-order identity")
+                oid = str(order["id"])
+                if oid in seen:
+                    raise RuntimeError("Native stop-order pages overlap; snapshot incomplete")
+                seen.add(oid)
+                if str(order.get("state")) == "1" and str(order.get("isFinished")) == "0":
+                    orders.append(order)
+            if len(batch) < 100:
+                return orders
+        raise RuntimeError("Native stop-order pagination limit reached")
+
     async def _cancel_owned(self, orders: list[dict]) -> int:
         for order in orders:
             _checked(await self._exchange.contractPrivatePostPlanorderCancel([
@@ -843,7 +885,7 @@ class ExchangeClient:
 
     async def get_contract_details(self) -> list:
         try:
-            result = await self._exchange.contractPublicGetDetail()
+            result = await self._metadata.contractPublicGetDetail()
             return result.get("data", [])
         except Exception as e:
             logger.error("Contract details: %s", e)

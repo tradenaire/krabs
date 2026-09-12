@@ -1,6 +1,7 @@
 """/positions — список с эмодзи-кнопками, детальный вид, закрытие."""
 import json
 import logging
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ContextTypes
@@ -123,6 +124,68 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _SEP = "─" * 20
 
 
+async def _fetch_native_stop_orders(client) -> list[dict] | None:
+    """Read active native TP/SL rows once; None means the read failed."""
+    import asyncio
+    try:
+        rows = await asyncio.wait_for(client.get_native_stop_orders(), timeout=5)
+        return rows if isinstance(rows, list) else None
+    except Exception as error:
+        logger.warning("Native TP/SL display unavailable: %s", error)
+        return None
+
+
+def _native_symbol(symbol: str) -> str:
+    if "/" not in symbol:
+        return symbol.split(":", 1)[0]
+    base, quote = symbol.split("/", 1)
+    return f"{base}_{quote.split(':', 1)[0]}"
+
+
+def _native_row_matches(pos: dict, row: dict) -> bool:
+    try:
+        if pos.get("side") not in ("long", "short"):
+            return False
+        side_type = 1 if pos.get("side") == "long" else 2
+        return (int(row.get("state")) == 1 and int(row.get("isFinished")) == 0
+                and row.get("positionId") is not None
+                and str(row.get("positionId")) == str(pos.get("position_id"))
+                and row.get("symbol") == _native_symbol(pos["symbol"])
+                and int(row.get("positionType")) == side_type)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _native_value(value) -> str:
+    try:
+        number = Decimal(str(value))
+        return format(number, "f") if number.is_finite() and number > 0 else "нет данных"
+    except (TypeError, ValueError, InvalidOperation):
+        return "нет данных"
+
+
+def _format_native_protection(pos: dict, rows: list[dict] | None) -> str:
+    """Display exchange-native rows without attributing ownership or coverage."""
+    if rows is None:
+        return "🛡 Native TP/SL (последние 90 дней): native TP/SL данные недоступны"
+    matches = [row for row in rows if isinstance(row, dict) and _native_row_matches(pos, row)]
+    if not matches:
+        return "🛡 Native TP/SL (последние 90 дней): активные native записи не найдены"
+
+    lines = ["🛡 Native TP/SL (последние 90 дней):"]
+    for row in matches:
+        tp = row.get("takeProfitPrice")
+        sl = row.get("stopLossPrice")
+        tp_s = _native_value(tp) if tp not in (None, "", 0, "0") else "—"
+        sl_s = _native_value(sl) if sl not in (None, "", 0, "0") else "—"
+        native_id = row.get("id")
+        if native_id in (None, ""):
+            native_id = row.get("orderId")
+        lines.append(f"TP `{tp_s}` | SL `{sl_s}` | id `{native_id}`")
+        lines.append("Объём покрытия не подтверждён")
+    return "\n".join(lines)
+
+
 async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
                           edit: bool = False):
     from bot import db as db_mod
@@ -147,6 +210,7 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
             await message.reply_text(text)
         return
 
+    native_orders = await _fetch_native_stop_orders(client)
     db_map = {p["symbol"]: r for p in positions if (r := db_mod.get_managed_position(p))}
     re_map = {r["symbol"]: r for r in db_mod.get_all_reentry()}
     config = context.bot_data.get("config")
@@ -195,7 +259,7 @@ async def _send_positions(message: Message, context: ContextTypes.DEFAULT_TYPE,
             funding_rate=funding_cache.get(symbol, {}).get("rate", 0.0),
             funding_next_ts=funding_cache.get(symbol, {}).get("next_funding_time"),
         )
-        lines.append(block)
+        lines.append(block + "\n" + _format_native_protection(pos, native_orders))
 
     # Inline buttons: close + profit-lock toggle per position
     btn_rows = []
@@ -316,7 +380,8 @@ async def positions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             extra["reentry_count"] = re_rec.get("cycle_count", 0)
             extra["max_reentry"] = re_rec.get("max_cycles", 3)
 
-        detail = _format_pos_detail(pos, extra)
+        native_orders = await _fetch_native_stop_orders(client)
+        detail = _format_pos_detail(pos, extra) + "\n\n" + _format_native_protection(pos, native_orders)
         coin = symbol.split("/")[0]
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Закрыть", callback_data=f"pos_close_{symbol}")],
